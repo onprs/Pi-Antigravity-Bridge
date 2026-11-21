@@ -80,12 +80,22 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 		writer.appendThinkingDelta("Let me check ");
 		writer.appendThinkingDelta("the file.");
 		writer.appendTextDelta("Reading now.");
-		writer.beginPendingToolCall("placeholder_1", "read");
-		writer.appendToolCall({ id: "call_1", name: "read", arguments: { path: "a.ts" } });
+		await writer.appendToolCallStreaming(
+			{ id: "call_1", name: "read", arguments: { path: "a.ts" } },
+			3,
+		);
 		writer.finishWithToolUse();
 
 		const events: AssistantMessageEvent[] = [];
 		for await (const ev of writer.stream) {
+			if ("partial" in ev) {
+				for (const block of ev.partial.content) {
+					if (block.type === "toolCall") {
+						assert.equal(block.id, "call_1");
+						assert.deepEqual(block.arguments, { path: "a.ts" });
+					}
+				}
+			}
 			events.push(ev);
 		}
 

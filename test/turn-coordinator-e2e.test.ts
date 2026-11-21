@@ -110,13 +110,22 @@ rl.on("line", async (line) => {
     return;
   }
 
+  if (msg.method === "session/cancel") {
+    // 模拟后端繁忙时 session/cancel 迟迟不回包，验证前端 Esc 不受其阻塞
+    return;
+  }
+
   if (msg.method === "session/set_config_option" || msg.method === "session/close") {
     send({ jsonrpc: "2.0", id: msg.id, result: {} });
     return;
   }
 
   if (msg.method === "session/prompt") {
-    const { sessionId } = msg.params;
+    const { sessionId, prompt } = msg.params;
+    if (prompt?.[0]?.text === "HANG_FOREVER") {
+      // 模拟长耗时推理中等待用户按 Esc
+      return;
+    }
     const sess = sessions.get(sessionId);
 
     if (!isModeA && sess?.mcpHttp) {
@@ -325,9 +334,28 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.ok(toolCall);
 			assert.equal(toolCall.name, "read");
 			assert.deepEqual(toolCall.arguments, { path: "package.json" });
-			// 验证中间步输出了 2 次 toolcall_delta（激活实时 TPS），且写入非零 output 与当前真实窗口 40000
-			const step1ToolDeltas = eventsStep1.filter((e) => e.type === "toolcall_delta");
-			assert.equal(step1ToolDeltas.length, 2);
+			// 验证所有流式事件中只存在唯一稳定的 toolCall.id（无空参数占位幽灵卡片），且流式采样数 >= 2
+			const seenToolIds = new Set<string>();
+			let totalDeltas = 0;
+			for (const ev of eventsStep1) {
+				if (
+					ev.type === "thinking_delta" ||
+					ev.type === "text_delta" ||
+					ev.type === "toolcall_delta"
+				) {
+					totalDeltas++;
+				}
+				if ("partial" in ev) {
+					for (const b of ev.partial.content) {
+						if (b.type === "toolCall") {
+							seenToolIds.add(b.id);
+							assert.deepEqual(b.arguments, { path: "package.json" });
+						}
+					}
+				}
+			}
+			assert.equal(seenToolIds.size, 1);
+			assert.ok(totalDeltas >= 2);
 			assert.ok(msg1.usage.output > 0);
 			assert.equal(msg1.usage.totalTokens, 40000);
 
@@ -457,6 +485,46 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.map((c) => c.text)
 				.join("");
 			assert.equal(text2, "Native edit done!");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("按下 Esc (signal.abort) 时即使后端 session/cancel 无响应也在 30ms 内瞬时结束流", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-esc-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const ac = new AbortController();
+			const ctx = normalizeContext({
+				messages: [{ role: "user", content: "HANG_FOREVER", timestamp: 1 }],
+			});
+			const stream = coord.streamSimple(TEST_MODEL, ctx, {
+				sessionId: "pi-sess-esc",
+				signal: ac.signal,
+			});
+
+			// 等待请求已发往 mock-agy 进入挂起态
+			await new Promise((r) => setTimeout(r, 80));
+
+			const t0 = Date.now();
+			ac.abort();
+			const abortedMsg = await stream.result();
+			const elapsed = Date.now() - t0;
+
+			assert.equal(abortedMsg.stopReason, "aborted");
+			assert.ok(elapsed < 50, `Esc 中断耗时应小于 50ms，实际耗时 ${elapsed}ms`);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

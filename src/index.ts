@@ -279,6 +279,12 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
 	});
 
+	pi.on("agent_end", (_event, ctx) => {
+		// 若用户在本地工具执行间隙按下 Esc 中断退出，同步结算挂起的后台 MCP 请求并异步发送 session/cancel
+		coordinator.cancelActiveTurnForPiSession(ctx.sessionManager.getSessionId());
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+	});
+
 	pi.on("session_compact", async (_event, ctx) => {
 		// 上下文压缩完成后关闭旧 ACP 会话，使下一轮请求自动携带压缩摘要开启轻装新会话
 		await coordinator.invalidatePiSession(ctx.sessionManager.getSessionId());

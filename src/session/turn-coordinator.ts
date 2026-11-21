@@ -65,7 +65,6 @@ import {
 
 type PumpQueueItem =
 	| { kind: "acp_update"; update: AcpSessionUpdatePayload }
-	| { kind: "mcp_announced"; placeholderId: string; hintName: string }
 	| { kind: "mcp_parked"; call: ParkedToolCall }
 	| { kind: "prompt_done"; response: AcpPromptResponse }
 	| { kind: "prompt_error"; error: unknown };
@@ -127,6 +126,8 @@ interface ActiveTurnPump {
 	cancelledByHoldTimeout: boolean;
 	/** 本轮前序中间 `toolUse` 步已经记账的输出 Token 累计数 */
 	accountedOutputTokens: number;
+	/** 已收到 ACP 前置 `tool_call` 宣告但 HTTP MCP `POST /mcp` 仍在途的并发调用计数 */
+	pendingAnnouncedMcpCount: number;
 }
 
 interface ManagedSessionLedger {
@@ -337,6 +338,36 @@ export class TurnCoordinator {
 		return anchor;
 	}
 
+	/**
+	 * 当用户按下 `Esc` 中断流或在工具执行期间中断整个 Agent Run 时，
+	 * 0 毫秒同步清理挂起中的 MCP 工具调用与活跃队列，并在后台异步发送 `session/cancel`（绝不阻塞前端 UI 停止）。
+	 */
+	cancelActiveTurnForPiSession(piSessionId?: string): void {
+		const key = piSessionId || this.resolveCurrentPiSessionKey();
+		const ledger = this.ledgers.get(key);
+		if (!ledger) return;
+		if (!ledger.activePump && ledger.parkedCalls.size === 0) {
+			return;
+		}
+		this.abortLedgerTurnNonBlocking(ledger);
+	}
+
+	private abortLedgerTurnNonBlocking(ledger: ManagedSessionLedger): void {
+		this.httpMcpBridge.markSessionTurnCancelled(ledger.agySessionId);
+		this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "Aborted");
+		for (const [, parked] of ledger.parkedCalls) {
+			parked.settle({
+				isError: true,
+				content: [{ type: "text", text: "Cancelled" }],
+			});
+		}
+		ledger.parkedCalls.clear();
+		ledger.activePump = undefined;
+		void ledger.conn
+			.request("session/cancel", { sessionId: ledger.agySessionId }, { timeoutMs: 3_000 })
+			.catch(() => {});
+	}
+
 	/** Pi `registerProvider` 核心流式入口 */
 	streamSimple(
 		model: Model<Api>,
@@ -347,13 +378,32 @@ export class TurnCoordinator {
 			thinkingLevel: options?.reasoning,
 		});
 
-		void this.runStreamStep(writer, model, context, options).catch((error) => {
+		const signal = options?.signal;
+		if (signal?.aborted) {
+			this.cancelActiveTurnForPiSession(options?.sessionId);
+			writer.fail("aborted", "Request aborted by user");
+			return writer.stream;
+		}
+
+		const onImmediateAbort = () => {
+			this.cancelActiveTurnForPiSession(options?.sessionId);
 			if (!writer.isTerminated) {
-				const isAborted = Boolean(options?.signal?.aborted);
-				const msg = error instanceof Error ? error.message : String(error);
-				writer.fail(isAborted ? "aborted" : "error", msg);
+				writer.fail("aborted", "Request aborted by user");
 			}
-		});
+		};
+		signal?.addEventListener("abort", onImmediateAbort, { once: true });
+
+		void this.runStreamStep(writer, model, context, options)
+			.catch((error) => {
+				if (!writer.isTerminated) {
+					const isAborted = Boolean(signal?.aborted);
+					const msg = error instanceof Error ? error.message : String(error);
+					writer.fail(isAborted ? "aborted" : "error", msg);
+				}
+			})
+			.finally(() => {
+				signal?.removeEventListener("abort", onImmediateAbort);
+			});
 
 		return writer.stream;
 	}
@@ -465,12 +515,9 @@ export class TurnCoordinator {
 			if (isHostMcpAnnouncement) {
 				ledger.hostMcpAnnouncementIds.add(update.toolCallId);
 				this.httpMcpBridge.recordAcpToolAnnouncement(sessionId, update.title || "");
-				const hintName = this.extractHintToolNameFromAnnouncement(ledger, update.title);
-				ledger.activePump?.queue.push({
-					kind: "mcp_announced",
-					placeholderId: update.toolCallId,
-					hintName,
-				});
+				if (ledger.activePump && !ledger.activePump.finished) {
+					ledger.activePump.pendingAnnouncedMcpCount++;
+				}
 				return;
 			}
 
@@ -490,21 +537,6 @@ export class TurnCoordinator {
 		}
 
 		ledger.activePump?.queue.push({ kind: "acp_update", update });
-	}
-
-	private extractHintToolNameFromAnnouncement(
-		ledger: ManagedSessionLedger,
-		rawTitle: string | undefined,
-	): string {
-		if (!rawTitle) return ledger.hostMcpTools[0]?.name ?? "tool";
-		const lower = rawTitle.toLowerCase();
-		for (const tool of ledger.hostMcpTools) {
-			if (lower === tool.name.toLowerCase() || lower.endsWith(`_${tool.name.toLowerCase()}`)) {
-				return tool.name;
-			}
-		}
-		const stripped = rawTitle.replace(/^mcp_pi_tools_/i, "").trim();
-		return stripped || rawTitle;
 	}
 
 	private isHostMcpToolEvent(
@@ -818,7 +850,13 @@ export class TurnCoordinator {
 				onParkedCall: (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
 					fullLedger.parkedCalls.set(call.callId, call);
-					fullLedger.activePump?.queue.push({ kind: "mcp_parked", call });
+					if (fullLedger.activePump) {
+						fullLedger.activePump.pendingAnnouncedMcpCount = Math.max(
+							0,
+							fullLedger.activePump.pendingAnnouncedMcpCount - 1,
+						);
+						fullLedger.activePump.queue.push({ kind: "mcp_parked", call });
+					}
 				},
 				onHoldTimeout: async (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
@@ -828,8 +866,8 @@ export class TurnCoordinator {
 					}
 					if (fullLedger.agySessionId) {
 						this.httpMcpBridge.markSessionTurnCancelled(fullLedger.agySessionId);
-						await fullLedger.conn
-							.request("session/cancel", { sessionId: fullLedger.agySessionId })
+						void fullLedger.conn
+							.request("session/cancel", { sessionId: fullLedger.agySessionId }, { timeoutMs: 3_000 })
 							.catch(() => {});
 					}
 				},
@@ -1134,6 +1172,7 @@ export class TurnCoordinator {
 			finished: false,
 			cancelledByHoldTimeout: false,
 			accountedOutputTokens: 0,
+			pendingAnnouncedMcpCount: 0,
 		};
 		ledger.activePump = pump;
 
@@ -1178,28 +1217,22 @@ export class TurnCoordinator {
 	): Promise<void> {
 		const signal = options?.signal;
 
-		const abortCurrentTurn = async () => {
-			this.httpMcpBridge.markSessionTurnCancelled(ledger.agySessionId);
-			this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "Aborted");
-			for (const [, parked] of ledger.parkedCalls) {
-				parked.settle({
-					isError: true,
-					content: [{ type: "text", text: "Cancelled" }],
-				});
-			}
-			ledger.parkedCalls.clear();
-			ledger.activePump = undefined;
-			await ledger.conn
-				.request("session/cancel", { sessionId: ledger.agySessionId })
-				.catch(() => {});
+		const abortCurrentTurnSync = () => {
+			this.abortLedgerTurnNonBlocking(ledger);
 		};
 
 		while (!writer.isTerminated) {
+			if (signal?.aborted) {
+				abortCurrentTurnSync();
+				writer.fail("aborted", "Request aborted by user");
+				return;
+			}
+
 			let item: PumpQueueItem;
 			try {
 				item = await pump.queue.shift(signal);
 			} catch {
-				await abortCurrentTurn();
+				abortCurrentTurnSync();
 				writer.fail("aborted", "Request aborted by user");
 				return;
 			}
@@ -1223,7 +1256,7 @@ export class TurnCoordinator {
 					if (update.content.type === "text") {
 						const { quotaError } = writer.appendTextDelta(update.content.text);
 						if (quotaError) {
-							await abortCurrentTurn();
+							abortCurrentTurnSync();
 							writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
 							return;
 						}
@@ -1236,15 +1269,18 @@ export class TurnCoordinator {
 						ledger.agySessionId,
 						update,
 					);
-					writer.appendToolCall({
-						id: update.toolCallId,
-						name: classified.mirrorToolName,
-						arguments: classified.arguments,
-					});
+					await writer.appendToolCallStreaming(
+						{
+							id: update.toolCallId,
+							name: classified.mirrorToolName,
+							arguments: classified.arguments,
+						},
+						writer.hasEmittedAnyDelta ? 0 : 2,
+					);
 
 					// 短窗口合并同一帧并发到达的额外原生 tool_call
 					await new Promise((r) => setTimeout(r, 15));
-					while (true) {
+					while (!signal?.aborted) {
 						const nextPeek = pump.queue.peek();
 						if (
 							nextPeek?.kind === "acp_update" &&
@@ -1268,6 +1304,12 @@ export class TurnCoordinator {
 						}
 					}
 
+					if (signal?.aborted) {
+						abortCurrentTurnSync();
+						writer.fail("aborted", "Request aborted by user");
+						return;
+					}
+
 					writer.finishWithToolUse(this.buildIntermediateStepUsage(ledger, pump, writer));
 					return;
 				}
@@ -1275,34 +1317,61 @@ export class TurnCoordinator {
 				continue;
 			}
 
-			if (item.kind === "mcp_announced") {
-				writer.beginPendingToolCall(item.placeholderId, item.hintName);
-				continue;
-			}
-
 			if (item.kind === "mcp_parked") {
-				writer.appendToolCall({
-					id: item.call.callId,
-					name: item.call.toolName,
-					arguments: item.call.arguments,
-				});
+				await writer.appendToolCallStreaming(
+					{
+						id: item.call.callId,
+						name: item.call.toolName,
+						arguments: item.call.arguments,
+					},
+					writer.hasEmittedAnyDelta ? 0 : 2,
+				);
 
-				// 微批收集同一推理步内并发触发的多个 MCP 工具调用（跳过或吸收其前置宣告）
-				await new Promise((r) => setTimeout(r, 25));
-				while (
-					pump.queue.peek()?.kind === "mcp_parked" ||
-					pump.queue.peek()?.kind === "mcp_announced"
-				) {
-					const nextItem = await pump.queue.shift();
-					if (nextItem.kind === "mcp_announced") {
-						writer.beginPendingToolCall(nextItem.placeholderId, nextItem.hintName);
-					} else if (nextItem.kind === "mcp_parked") {
+				// 聚合同一推理步并发触发的其余 MCP 工具调用（若已有 ACP 前置宣告仍在 loopback 传输途中则短窗口收齐）
+				const batchDeadline = Date.now() + 180;
+				while (!signal?.aborted) {
+					if (pump.queue.peek()?.kind === "mcp_parked") {
+						const nextItem = (await pump.queue.shift()) as {
+							kind: "mcp_parked";
+							call: ParkedToolCall;
+						};
 						writer.appendToolCall({
 							id: nextItem.call.callId,
 							name: nextItem.call.toolName,
 							arguments: nextItem.call.arguments,
 						});
+						continue;
 					}
+
+					const waitWindowMs = pump.pendingAnnouncedMcpCount > 0 ? 20 : 20;
+					if (pump.pendingAnnouncedMcpCount <= 0 && Date.now() + 140 > batchDeadline) {
+						// 无额外已宣告在途请求时仅做一次 20ms 微批探测即收口
+						await new Promise((r) => setTimeout(r, waitWindowMs));
+						while (pump.queue.peek()?.kind === "mcp_parked") {
+							const nextItem = (await pump.queue.shift()) as {
+								kind: "mcp_parked";
+								call: ParkedToolCall;
+							};
+							writer.appendToolCall({
+								id: nextItem.call.callId,
+								name: nextItem.call.toolName,
+								arguments: nextItem.call.arguments,
+							});
+						}
+						break;
+					}
+
+					if (Date.now() >= batchDeadline) {
+						pump.pendingAnnouncedMcpCount = 0;
+						break;
+					}
+					await new Promise((r) => setTimeout(r, waitWindowMs));
+				}
+
+				if (signal?.aborted) {
+					abortCurrentTurnSync();
+					writer.fail("aborted", "Request aborted by user");
+					return;
 				}
 
 				writer.finishWithToolUse(this.buildIntermediateStepUsage(ledger, pump, writer));

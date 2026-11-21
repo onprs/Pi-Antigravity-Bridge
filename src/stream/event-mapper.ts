@@ -183,12 +183,6 @@ export function convertAcpUsageToPiUsage(acpUsage?: AcpPromptUsage): Usage {
 	};
 }
 
-interface PendingToolCallSlot {
-	contentIndex: number;
-	block: ToolCall;
-	hintName: string;
-}
-
 /**
  * 单个 Pi 推理步（`AssistantMessageEventStream`）状态机写出器。
  * 严格保证 `start` 先于一切增量事件发出、块开启与闭合配对平衡，且最终仅发出一次 `done` 或 `error`。
@@ -199,10 +193,10 @@ export class StepStreamWriter {
 	private started = false;
 	private terminated = false;
 	private openBlock?: { kind: "thinking" | "text"; index: number };
-	private readonly pendingToolCallSlots: PendingToolCallSlot[] = [];
 	private readonly messageFilter = new QuotaSoftErrorFilter();
 	private rawEstimatedOutputTokens = 0;
 	private rawEstimatedThoughtTokens = 0;
+	private emittedDeltaCount = 0;
 
 	constructor(
 		model: Model<Api>,
@@ -284,6 +278,7 @@ export class StepStreamWriter {
 		const est = estimateTextTokens(delta);
 		this.rawEstimatedThoughtTokens += est;
 		this.rawEstimatedOutputTokens += est;
+		this.emittedDeltaCount++;
 
 		const target = this.message.content[this.openBlock.index] as ThinkingContent;
 		target.thinking += delta;
@@ -306,92 +301,26 @@ export class StepStreamWriter {
 		return { quotaError };
 	}
 
-	/**
-	 * 在收到 ACP `tool_call` 前置宣告（模型刚开始生成 MCP 工具调用参数）时提前开启 `toolcall_start` 并推首字节 `"{"`，
-	 * 使下游 TPS 追踪器在工具参数生成起点即获得首个流式时间采样点。
-	 */
-	beginPendingToolCall(placeholderId: string, hintName: string): void {
-		if (this.terminated) return;
-		this.flushHeldText();
-		this.ensureStarted();
-		this.closeOpenBlock();
-
-		const index = this.message.content.length;
-		const block: ToolCall = {
-			type: "toolCall",
-			id: placeholderId,
-			name: hintName,
-			arguments: {},
-		};
-		this.message.content.push(block);
-		this.pendingToolCallSlots.push({
-			contentIndex: index,
-			block,
-			hintName,
-		});
-
-		this.rawEstimatedOutputTokens += Math.max(1, estimateTextTokens(hintName) + 1);
-
-		this.stream.push({
-			type: "toolcall_start",
-			contentIndex: index,
-			partial: this.message,
-		});
-		this.stream.push({
-			type: "toolcall_delta",
-			contentIndex: index,
-			delta: "{",
-			partial: this.message,
-		});
+	/** 当前消息是否尚未发出过任何流式 delta（用于判断是否需分两帧发送首个工具 JSON 增量以供实时 TPS 采样） */
+	get hasEmittedAnyDelta(): boolean {
+		return this.emittedDeltaCount > 0;
 	}
 
 	/**
-	 * 完成先前已开启的挂起工具块（发出剩余 JSON `toolcall_delta` 与 `toolcall_end`），
-	 * 若无匹配的前置挂起块则直接完整发出 `toolcall_start -> toolcall_delta -> toolcall_end`。
+	 * 写入完整工具调用块。
+	 * 严格保持 `toolCall.id` 与 `arguments` 从 `toolcall_start` 起恒定不变，避免 Pi TUI 因 ID 变更或空参数占位产生重复 `...` 卡片；
+	 * 当 `splitDeltaWithDelayMs > 0` 时，在同一稳定 `id` 与完整 `arguments` 上分两帧发出 JSON 增量以提供跨时间窗口的流式 TPS 采样点。
 	 */
-	appendToolCall(call: { id: string; name: string; arguments: JsonObject }): void {
+	async appendToolCallStreaming(
+		call: { id: string; name: string; arguments: JsonObject },
+		splitDeltaWithDelayMs = 0,
+	): Promise<void> {
 		if (this.terminated) return;
 		this.flushHeldText();
 		this.ensureStarted();
 		this.closeOpenBlock();
 
 		const serializedArgs = JSON.stringify(call.arguments ?? {});
-		const matchIdx = this.pendingToolCallSlots.findIndex(
-			(s) =>
-				s.hintName === call.name ||
-				s.hintName.toLowerCase().includes(call.name.toLowerCase()) ||
-				call.name.toLowerCase().includes(s.hintName.toLowerCase()),
-		);
-		const slot =
-			matchIdx !== -1
-				? this.pendingToolCallSlots.splice(matchIdx, 1)[0]
-				: this.pendingToolCallSlots.shift();
-
-		if (slot) {
-			slot.block.id = call.id;
-			slot.block.name = call.name;
-			slot.block.arguments = call.arguments;
-			const tailDelta = serializedArgs.startsWith("{")
-				? serializedArgs.slice(1)
-				: serializedArgs;
-			if (tailDelta.length > 0) {
-				this.rawEstimatedOutputTokens += estimateTextTokens(tailDelta);
-				this.stream.push({
-					type: "toolcall_delta",
-					contentIndex: slot.contentIndex,
-					delta: tailDelta,
-					partial: this.message,
-				});
-			}
-			this.stream.push({
-				type: "toolcall_end",
-				contentIndex: slot.contentIndex,
-				toolCall: slot.block,
-				partial: this.message,
-			});
-			return;
-		}
-
 		const index = this.message.content.length;
 		const toolCallBlock: ToolCall = {
 			type: "toolCall",
@@ -405,6 +334,71 @@ export class StepStreamWriter {
 			1,
 			estimateTextTokens(call.name) + estimateTextTokens(serializedArgs),
 		);
+
+		this.stream.push({
+			type: "toolcall_start",
+			contentIndex: index,
+			partial: this.message,
+		});
+
+		if (splitDeltaWithDelayMs > 0 && serializedArgs.length >= 2) {
+			const headDelta = serializedArgs.slice(0, 1);
+			const tailDelta = serializedArgs.slice(1);
+			this.emittedDeltaCount++;
+			this.stream.push({
+				type: "toolcall_delta",
+				contentIndex: index,
+				delta: headDelta,
+				partial: this.message,
+			});
+			await new Promise((r) => setTimeout(r, splitDeltaWithDelayMs));
+			if (this.terminated) return;
+			this.emittedDeltaCount++;
+			this.stream.push({
+				type: "toolcall_delta",
+				contentIndex: index,
+				delta: tailDelta,
+				partial: this.message,
+			});
+		} else {
+			this.emittedDeltaCount++;
+			this.stream.push({
+				type: "toolcall_delta",
+				contentIndex: index,
+				delta: serializedArgs,
+				partial: this.message,
+			});
+		}
+
+		this.stream.push({
+			type: "toolcall_end",
+			contentIndex: index,
+			toolCall: toolCallBlock,
+			partial: this.message,
+		});
+	}
+
+	appendToolCall(call: { id: string; name: string; arguments: JsonObject }): void {
+		if (this.terminated) return;
+		this.flushHeldText();
+		this.ensureStarted();
+		this.closeOpenBlock();
+
+		const serializedArgs = JSON.stringify(call.arguments ?? {});
+		const index = this.message.content.length;
+		const toolCallBlock: ToolCall = {
+			type: "toolCall",
+			id: call.id,
+			name: call.name,
+			arguments: call.arguments,
+		};
+		this.message.content.push(toolCallBlock);
+
+		this.rawEstimatedOutputTokens += Math.max(
+			1,
+			estimateTextTokens(call.name) + estimateTextTokens(serializedArgs),
+		);
+		this.emittedDeltaCount++;
 
 		this.stream.push({
 			type: "toolcall_start",
@@ -425,32 +419,12 @@ export class StepStreamWriter {
 		});
 	}
 
-	/** 清理尚未收到实际 MCP 调用即被取消的悬空前置工具块 */
-	private finalizeUnmatchedPendingToolCalls(): void {
-		while (this.pendingToolCallSlots.length > 0) {
-			const slot = this.pendingToolCallSlots.shift()!;
-			this.stream.push({
-				type: "toolcall_delta",
-				contentIndex: slot.contentIndex,
-				delta: "}",
-				partial: this.message,
-			});
-			this.stream.push({
-				type: "toolcall_end",
-				contentIndex: slot.contentIndex,
-				toolCall: slot.block,
-				partial: this.message,
-			});
-		}
-	}
-
 	/** 以 `toolUse` 结束当前切片步，并支持写入单步归因 Usage（供窗口进度条、缓存命中率与单步 TPS 实时计算） */
 	finishWithToolUse(stepUsage?: Usage): void {
 		if (this.terminated) return;
 		this.flushHeldText();
 		this.ensureStarted();
 		this.closeOpenBlock();
-		this.finalizeUnmatchedPendingToolCalls();
 
 		if (stepUsage) {
 			this.message.usage = stepUsage;
@@ -478,7 +452,6 @@ export class StepStreamWriter {
 
 		this.ensureStarted();
 		this.closeOpenBlock();
-		this.finalizeUnmatchedPendingToolCalls();
 
 		const reason = acpStopReason === "max_tokens" ? "length" : "stop";
 		this.message.stopReason = reason;
@@ -505,7 +478,6 @@ export class StepStreamWriter {
 	fail(reason: "aborted" | "error", errorMessage: string): void {
 		if (this.terminated) return;
 		this.closeOpenBlock();
-		this.finalizeUnmatchedPendingToolCalls();
 		this.message.stopReason = reason;
 		this.message.errorMessage = errorMessage;
 
@@ -543,6 +515,7 @@ export class StepStreamWriter {
 			});
 		}
 		this.rawEstimatedOutputTokens += estimateTextTokens(text);
+		this.emittedDeltaCount++;
 		const target = this.message.content[this.openBlock.index] as TextContent;
 		target.text += text;
 		this.stream.push({
