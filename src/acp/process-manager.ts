@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import type { BridgeConfig } from "../config.ts";
 import { resolveEffectiveFlags } from "../config.ts";
 import { type ResolvedBinary, resolveAgyBinary } from "./binary-resolver.ts";
@@ -22,7 +23,7 @@ import {
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.0";
+export const CLIENT_INFO_VERSION = "0.1.1";
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -161,12 +162,36 @@ function resolveManagedAgentMaterialization(
 	}
 	yamlLines.push("---", "");
 
-	const desired = yamlLines.join("\n");
+	let desired = yamlLines.join("\n");
+	if (agentName === BRIDGE_AGENT_NAME) {
+		try {
+			const bundledAssetPath = path.resolve(
+				path.dirname(fileURLToPath(import.meta.url)),
+				"..",
+				"..",
+				"assets",
+				"agents",
+				"pi-bridge.md",
+			);
+			if (fs.existsSync(bundledAssetPath)) {
+				desired = fs.readFileSync(bundledAssetPath, "utf8");
+			}
+		} catch {
+			// 回退内存生成的同构 YAML
+		}
+	}
+
+	const agentsRoot = path.join(profile.geminiDir, "config", "agents");
 	try {
 		if (!fs.existsSync(agentFile) || fs.readFileSync(agentFile, "utf8") !== desired) {
 			fs.mkdirSync(agentDir, { recursive: true });
 			fs.writeFileSync(agentFile, desired, "utf8");
+		} else {
+			// 刷新目录修改时间供惰性 LRU 保留近期活跃配置
+			const now = new Date();
+			fs.utimesSync(agentDir, now, now);
 		}
+		pruneOldManagedAgentDirs(agentsRoot, agentName);
 	} catch {
 		// 目录只读时忽略写入异常
 	}
@@ -175,6 +200,37 @@ function resolveManagedAgentMaterialization(
 		effectiveAgentName: agentName,
 		managedAgentDir: agentName === BRIDGE_AGENT_NAME ? undefined : agentDir,
 	};
+}
+
+function pruneOldManagedAgentDirs(agentsRoot: string, activeName: string, maxHashedDirs = 16): void {
+	try {
+		if (!fs.existsSync(agentsRoot)) return;
+		const prefix = `${BRIDGE_AGENT_NAME}-`;
+		const entries = fs
+			.readdirSync(agentsRoot, { withFileTypes: true })
+			.filter((e) => e.isDirectory() && e.name.startsWith(prefix) && e.name !== activeName)
+			.map((e) => {
+				const full = path.join(agentsRoot, e.name);
+				let mtimeMs = 0;
+				try {
+					mtimeMs = fs.statSync(full).mtimeMs;
+				} catch {
+					// 忽略
+				}
+				return { full, mtimeMs };
+			})
+			.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+		for (let i = maxHashedDirs; i < entries.length; i++) {
+			try {
+				fs.rmSync(entries[i].full, { recursive: true, force: true });
+			} catch {
+				// 忽略
+			}
+		}
+	} catch {
+		// 忽略
+	}
 }
 
 function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -253,7 +309,12 @@ export class AcpClientConnection {
 			env: appendNoProxyLoopback(env),
 			stdio: ["pipe", "pipe", "pipe"],
 			shell: binary.isWindowsWrapperScript,
+			detached: process.platform !== "win32",
 			windowsHide: true,
+		});
+
+		this.proc.stdin.on("error", () => {
+			// 子进程意外退出时忽略底层管道异步 EPIPE，交由 proc close/error 统一拒绝在途请求
 		});
 
 		const stdoutDecoder = new StringDecoder("utf8");
@@ -415,7 +476,6 @@ export class AcpClientConnection {
 	/** 优雅关闭连接、清理临时挂载 Agent 描述并在超时后回收跨平台子进程树 */
 	async dispose(): Promise<void> {
 		if (this.closed) {
-			this.cleanupManagedAgentDir();
 			return;
 		}
 		const sessions = Array.from(this.activeSessions);
@@ -451,16 +511,8 @@ export class AcpClientConnection {
 		}
 
 		this.closed = true;
-		this.cleanupManagedAgentDir();
-	}
-
-	private cleanupManagedAgentDir(): void {
-		if (!this.managedAgentDir) return;
-		try {
-			fs.rmSync(this.managedAgentDir, { recursive: true, force: true });
-		} catch {
-			// 忽略清理异常
-		}
+		// 保留确定性哈希目录 pi-bridge-<hash>，避免并发运行的多个 Pi 进程误删彼此正在使用的配置目录
+		void this.managedAgentDir;
 	}
 
 	private forceKillProcessTree(): void {
@@ -484,24 +536,32 @@ export class AcpClientConnection {
 			return;
 		}
 
-		try {
-			this.proc.kill("SIGTERM");
-			setTimeout(() => {
+		const sendPosixGroupOrPid = (sig: NodeJS.Signals) => {
+			try {
+				process.kill(-pid, sig);
+			} catch {
 				try {
-					if (this.proc.exitCode === null) {
-						this.proc.kill("SIGKILL");
-					}
+					this.proc.kill(sig);
 				} catch {
-					// 忽略
+					// 忽略已退出进程
 				}
-			}, 500).unref();
-		} catch {
-			// 忽略
-		}
+			}
+		};
+
+		sendPosixGroupOrPid("SIGTERM");
+		setTimeout(() => {
+			if (this.proc.exitCode === null) {
+				sendPosixGroupOrPid("SIGKILL");
+			}
+		}, 500).unref();
 	}
 
 	private writeJson(payload: unknown): void {
 		try {
+			if (this.closed || this.proc.stdin.destroyed || !this.proc.stdin.writable) {
+				this.failAllPending(new Error("Antigravity ACP stdin 不可写"));
+				return;
+			}
 			this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
 		} catch (error) {
 			this.failAllPending(error);

@@ -120,7 +120,12 @@ rl.on("line", async (line) => {
     const sess = sessions.get(sessionId);
 
     if (!isModeA && sess?.mcpHttp) {
-      // 模式 B：先发思考 -> 宣告并调用宿主 HTTP MCP 工具挂起 -> 拿到结果后发最终回答
+      // 模式 B：模拟中间步 usage_update + 思考 + 工具宣告 + HTTP MCP 挂起 + 最终步 usage_update 与累计账单返回
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 40000, size: 1048576 } }
+      });
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -152,6 +157,11 @@ rl.on("line", async (line) => {
       send({
         jsonrpc: "2.0",
         method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 50000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
         params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Got result." } } }
       });
       send({
@@ -162,7 +172,10 @@ rl.on("line", async (line) => {
       send({
         jsonrpc: "2.0",
         id: msg.id,
-        result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 40, thoughtTokens: 15 } }
+        result: {
+          stopReason: "end_turn",
+          usage: { inputTokens: 15000, cachedReadTokens: 75000, outputTokens: 80, thoughtTokens: 15 }
+        }
       });
       return;
     }
@@ -301,6 +314,10 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				sessionId: "pi-sess-b",
 				reasoning: "high",
 			});
+			const eventsStep1: AssistantMessageEvent[] = [];
+			for await (const ev of stream1) {
+				eventsStep1.push(ev);
+			}
 			const msg1 = await stream1.result();
 
 			assert.equal(msg1.stopReason, "toolUse");
@@ -308,7 +325,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.ok(toolCall);
 			assert.equal(toolCall.name, "read");
 			assert.deepEqual(toolCall.arguments, { path: "package.json" });
-			assert.equal(msg1.usage.totalTokens, 0);
+			// 验证中间步输出了 2 次 toolcall_delta（激活实时 TPS），且写入非零 output 与当前真实窗口 40000
+			const step1ToolDeltas = eventsStep1.filter((e) => e.type === "toolcall_delta");
+			assert.equal(step1ToolDeltas.length, 2);
+			assert.ok(msg1.usage.output > 0);
+			assert.equal(msg1.usage.totalTokens, 40000);
 
 			// 第 2 步：模拟 Pi Agent Loop 执行完 read 工具并返回结果，预期无缝恢复同一 ACP Turn
 			const ctx2 = normalizeContext({
@@ -340,9 +361,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.map((c) => c.text)
 				.join("");
 			assert.equal(finalText, 'File read OK: {"name":"demo"}');
-			assert.equal(msg2.usage.input, 100);
-			assert.equal(msg2.usage.output, 40);
-			assert.equal(msg2.usage.reasoning, 15);
+			// 最终消息总窗口严格对齐当前真实窗口 50000（避免两步累加值 90080 虚高），同时保留缓存命中拆分
+			assert.equal(msg2.usage.totalTokens, 50000);
+			assert.ok(msg2.usage.cacheRead > 35000);
+			assert.ok(msg2.usage.output > 0);
+			assert.equal(TEST_MODEL.contextWindow, 1048576);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

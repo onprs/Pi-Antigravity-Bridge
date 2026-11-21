@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url";
 /**
  * 纯 Node.js 标准库实现的跨平台 Stdio-to-HTTP MCP 转发桥。
  * 当用户显式设置 `processPerSession: false` 时，作为零 `nc` 依赖的跨平台 Stdio MCP 入口回连宿主本地 HTTP MCP 服务。
+ * 支持多路并发 JSON-RPC 请求同时在途，避免单个 Park-and-Yield 工具挂起阻塞并发工具调用或心跳。
  */
 export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: string): Promise<void> {
 	const decoder = new StringDecoder("utf8");
 	let buffer = "";
+	const inflight = new Set<Promise<void>>();
 
 	const forwardLine = async (line: string): Promise<void> => {
 		let parsed: Record<string, unknown>;
@@ -48,7 +50,13 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 		}
 	};
 
-	let chain = Promise.resolve();
+	const dispatchLine = (line: string): void => {
+		const task = forwardLine(line).finally(() => {
+			inflight.delete(task);
+		});
+		inflight.add(task);
+	};
+
 	process.stdin.on("data", (chunk: Buffer) => {
 		buffer += decoder.write(chunk);
 		let idx = buffer.indexOf("\n");
@@ -56,7 +64,7 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 			const line = buffer.slice(0, idx).trim();
 			buffer = buffer.slice(idx + 1);
 			if (line.length > 0) {
-				chain = chain.then(() => forwardLine(line));
+				dispatchLine(line);
 			}
 			idx = buffer.indexOf("\n");
 		}
@@ -65,12 +73,12 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 	process.stdin.on("end", () => {
 		const rest = (buffer + decoder.end()).trim();
 		if (rest.length > 0) {
-			chain = chain.then(() => forwardLine(rest));
+			dispatchLine(rest);
 		}
 	});
 }
 
-/** 生成一段内联 Node.js 启动脚本参数，使宿主无需依赖额外编译产物即可在任意平台启动 Stdio 转发桥 */
+/** 生成一段内联 Node.js 启动脚本参数，使宿主无需依赖额外编译产物即可在任意平台启动并发 Stdio 转发桥 */
 export function buildInlineStdioShimCommand(
 	targetUrl: string,
 	bearerToken: string,
@@ -79,7 +87,6 @@ export function buildInlineStdioShimCommand(
 		'const url = process.env.PI_AGY_MCP_URL;',
 		'const token = process.env.PI_AGY_MCP_TOKEN;',
 		'let buf = "";',
-		'let q = Promise.resolve();',
 		'async function send(line) {',
 		'  let msg; try { msg = JSON.parse(line); } catch { return; }',
 		'  const hasId = msg && msg.id !== undefined;',
@@ -91,14 +98,17 @@ export function buildInlineStdioShimCommand(
 		'    if (hasId) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e) } }) + "\\n");',
 		'  }',
 		'}',
-		'process.stdin.setEncoding("utf8");',
-		'process.stdin.on("data", (c) => {',
-		'  buf += c; let i;',
+		'function drain(flushAll) {',
+		'  let i;',
 		'  while ((i = buf.indexOf("\\n")) !== -1) {',
 		'    const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1);',
-		'    if (l) q = q.then(() => send(l));',
+		'    if (l) void send(l);',
 		'  }',
-		'});',
+		'  if (flushAll) { const r = buf.trim(); buf = ""; if (r) void send(r); }',
+		'}',
+		'process.stdin.setEncoding("utf8");',
+		'process.stdin.on("data", (c) => { buf += c; drain(false); });',
+		'process.stdin.on("end", () => drain(true));',
 	].join(" ");
 
 	return {
@@ -107,7 +117,8 @@ export function buildInlineStdioShimCommand(
 		env: [
 			{ name: "PI_AGY_MCP_URL", value: targetUrl },
 			{ name: "PI_AGY_MCP_TOKEN", value: bearerToken },
-			{ name: "NO_PROXY", value: "127.0.0.1,localhost" },
+			{ name: "NO_PROXY", value: "127.0.0.1,localhost,::1" },
+			{ name: "no_proxy", value: "127.0.0.1,localhost,::1" },
 		],
 	};
 }

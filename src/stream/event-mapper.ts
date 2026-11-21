@@ -13,19 +13,29 @@ import type {
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AcpPromptStopReason, AcpPromptUsage } from "../acp/protocol.ts";
 
+/**
+ * 精确匹配 AGY CLI 在配额耗尽未恢复时注入正文的告警行（必带 `⚠` 告警前缀，避免误杀正文中普通讨论 429 的说明）。
+ */
 const QUOTA_ERROR_LINE_REGEX =
-	/^(?:\s*⚠\s*)?(?:API error\s*\(attempt\s+\d+\):\s*)?RESOURCE_EXHAUSTED\s*\(code\s*429\):.*$/i;
+	/^\s*⚠\s*(?:API error\s*\(attempt\s+\d+\):\s*)?RESOURCE_EXHAUSTED\s*\(code\s*429\):.*$/i;
 
 const LEGACY_ATTEMPT_QUOTA_REGEX =
-	/(?:⚠\s*)?API error\s*\(attempt\s+\d+\):.*(?:RESOURCE_EXHAUSTED|code\s*429|quota|rate[_\s-]?limit)/i;
+	/^\s*⚠\s*API error\s*\(attempt\s+\d+\):.*(?:RESOURCE_EXHAUSTED|code\s*429|quota|rate[_\s-]?limit)/i;
 
 const SUSPICIOUS_LINE_PREFIXES = [
 	"⚠",
 	"⚠ RESOURCE_EXHAUSTED",
-	"RESOURCE_EXHAUSTED (",
 	"⚠ API error",
-	"API error (",
 ];
+
+const CJK_CHARS_REGEX = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
+
+/** 与 Pi / OpenTUI 同源的轻量增量 Token 估算器（CJK 1 字符≈1 token，其余代码/英文≈4 字符/token） */
+export function estimateTextTokens(text: string): number {
+	if (!text) return 0;
+	const cjkCount = text.match(CJK_CHARS_REGEX)?.length ?? 0;
+	return cjkCount + (text.length - cjkCount) / 4;
+}
 
 function isQuotaExhaustedLine(line: string): boolean {
 	const trimmed = line.trim();
@@ -47,12 +57,12 @@ function mightBecomeQuotaErrorLine(lineFragment: string): boolean {
 
 /**
  * 流式行尾缓冲与 429 配额软错误拦截器。
- * 普通文本零延迟透传；仅当行首命中 `⚠ API error (attempt` 可疑前缀时暂扣至行尾判定，
- * 一旦确认为 `RESOURCE_EXHAUSTED`（429），立即阻断脏文本进入聊天流并上报标准配额错误。
+ * 普通文本与 Markdown 代码块内部内容零延迟透传；仅当代码块外行首命中 `⚠` 告警前缀时暂扣至行尾判定。
  */
 export class QuotaSoftErrorFilter {
 	private heldLine = "";
 	private detectedError?: string;
+	private inFenceBlock = false;
 
 	get quotaErrorMessage(): string | undefined {
 		return this.detectedError;
@@ -71,7 +81,10 @@ export class QuotaSoftErrorFilter {
 
 		for (let i = 0; i < lines.length - 1; i++) {
 			const fullLine = lines[i];
-			if (isQuotaExhaustedLine(fullLine)) {
+			if (/^\s*```/.test(fullLine)) {
+				this.inFenceBlock = !this.inFenceBlock;
+			}
+			if (!this.inFenceBlock && isQuotaExhaustedLine(fullLine)) {
 				this.detectedError = fullLine.replace(/^\s*⚠\s*/, "").trim();
 				return {
 					safeText: safeParts.join(""),
@@ -83,14 +96,14 @@ export class QuotaSoftErrorFilter {
 
 		const tail = lines[lines.length - 1];
 		if (tail.length > 0) {
-			if (isQuotaExhaustedLine(tail)) {
+			if (!this.inFenceBlock && isQuotaExhaustedLine(tail)) {
 				this.detectedError = tail.replace(/^\s*⚠\s*/, "").trim();
 				return {
 					safeText: safeParts.join(""),
 					quotaError: this.detectedError,
 				};
 			}
-			if (mightBecomeQuotaErrorLine(tail)) {
+			if (!this.inFenceBlock && mightBecomeQuotaErrorLine(tail)) {
 				this.heldLine = tail;
 			} else {
 				safeParts.push(tail);
@@ -110,7 +123,7 @@ export class QuotaSoftErrorFilter {
 		if (!rem) {
 			return { safeText: "" };
 		}
-		if (isQuotaExhaustedLine(rem)) {
+		if (!this.inFenceBlock && isQuotaExhaustedLine(rem)) {
 			this.detectedError = rem.replace(/^\s*⚠\s*/, "").trim();
 			return { safeText: "", quotaError: this.detectedError };
 		}
@@ -170,6 +183,12 @@ export function convertAcpUsageToPiUsage(acpUsage?: AcpPromptUsage): Usage {
 	};
 }
 
+interface PendingToolCallSlot {
+	contentIndex: number;
+	block: ToolCall;
+	hintName: string;
+}
+
 /**
  * 单个 Pi 推理步（`AssistantMessageEventStream`）状态机写出器。
  * 严格保证 `start` 先于一切增量事件发出、块开启与闭合配对平衡，且最终仅发出一次 `done` 或 `error`。
@@ -180,7 +199,10 @@ export class StepStreamWriter {
 	private started = false;
 	private terminated = false;
 	private openBlock?: { kind: "thinking" | "text"; index: number };
+	private readonly pendingToolCallSlots: PendingToolCallSlot[] = [];
 	private readonly messageFilter = new QuotaSoftErrorFilter();
+	private rawEstimatedOutputTokens = 0;
+	private rawEstimatedThoughtTokens = 0;
 
 	constructor(
 		model: Model<Api>,
@@ -209,6 +231,16 @@ export class StepStreamWriter {
 
 	get isTerminated(): boolean {
 		return this.terminated;
+	}
+
+	/** 当前单步流式产生的输出 Token 估算值（含思考、正文与工具调用参数） */
+	get estimatedOutputTokens(): number {
+		return Math.ceil(this.rawEstimatedOutputTokens);
+	}
+
+	/** 当前单步流式产生的思考 Token 估算值 */
+	get estimatedThoughtTokens(): number {
+		return Math.ceil(this.rawEstimatedThoughtTokens);
 	}
 
 	setResponseMetadata(meta: { responseId?: string; providerThinkingLevel?: string }): void {
@@ -249,6 +281,10 @@ export class StepStreamWriter {
 			});
 		}
 
+		const est = estimateTextTokens(delta);
+		this.rawEstimatedThoughtTokens += est;
+		this.rawEstimatedOutputTokens += est;
+
 		const target = this.message.content[this.openBlock.index] as ThinkingContent;
 		target.thinking += delta;
 		this.stream.push({
@@ -270,11 +306,91 @@ export class StepStreamWriter {
 		return { quotaError };
 	}
 
+	/**
+	 * 在收到 ACP `tool_call` 前置宣告（模型刚开始生成 MCP 工具调用参数）时提前开启 `toolcall_start` 并推首字节 `"{"`，
+	 * 使下游 TPS 追踪器在工具参数生成起点即获得首个流式时间采样点。
+	 */
+	beginPendingToolCall(placeholderId: string, hintName: string): void {
+		if (this.terminated) return;
+		this.flushHeldText();
+		this.ensureStarted();
+		this.closeOpenBlock();
+
+		const index = this.message.content.length;
+		const block: ToolCall = {
+			type: "toolCall",
+			id: placeholderId,
+			name: hintName,
+			arguments: {},
+		};
+		this.message.content.push(block);
+		this.pendingToolCallSlots.push({
+			contentIndex: index,
+			block,
+			hintName,
+		});
+
+		this.rawEstimatedOutputTokens += Math.max(1, estimateTextTokens(hintName) + 1);
+
+		this.stream.push({
+			type: "toolcall_start",
+			contentIndex: index,
+			partial: this.message,
+		});
+		this.stream.push({
+			type: "toolcall_delta",
+			contentIndex: index,
+			delta: "{",
+			partial: this.message,
+		});
+	}
+
+	/**
+	 * 完成先前已开启的挂起工具块（发出剩余 JSON `toolcall_delta` 与 `toolcall_end`），
+	 * 若无匹配的前置挂起块则直接完整发出 `toolcall_start -> toolcall_delta -> toolcall_end`。
+	 */
 	appendToolCall(call: { id: string; name: string; arguments: JsonObject }): void {
 		if (this.terminated) return;
 		this.flushHeldText();
 		this.ensureStarted();
 		this.closeOpenBlock();
+
+		const serializedArgs = JSON.stringify(call.arguments ?? {});
+		const matchIdx = this.pendingToolCallSlots.findIndex(
+			(s) =>
+				s.hintName === call.name ||
+				s.hintName.toLowerCase().includes(call.name.toLowerCase()) ||
+				call.name.toLowerCase().includes(s.hintName.toLowerCase()),
+		);
+		const slot =
+			matchIdx !== -1
+				? this.pendingToolCallSlots.splice(matchIdx, 1)[0]
+				: this.pendingToolCallSlots.shift();
+
+		if (slot) {
+			slot.block.id = call.id;
+			slot.block.name = call.name;
+			slot.block.arguments = call.arguments;
+			const tailDelta = serializedArgs.startsWith("{")
+				? serializedArgs.slice(1)
+				: serializedArgs;
+			if (tailDelta.length > 0) {
+				this.rawEstimatedOutputTokens += estimateTextTokens(tailDelta);
+				this.stream.push({
+					type: "toolcall_delta",
+					contentIndex: slot.contentIndex,
+					delta: tailDelta,
+					partial: this.message,
+				});
+			}
+			this.stream.push({
+				type: "toolcall_end",
+				contentIndex: slot.contentIndex,
+				toolCall: slot.block,
+				partial: this.message,
+			});
+			return;
+		}
 
 		const index = this.message.content.length;
 		const toolCallBlock: ToolCall = {
@@ -285,12 +401,16 @@ export class StepStreamWriter {
 		};
 		this.message.content.push(toolCallBlock);
 
+		this.rawEstimatedOutputTokens += Math.max(
+			1,
+			estimateTextTokens(call.name) + estimateTextTokens(serializedArgs),
+		);
+
 		this.stream.push({
 			type: "toolcall_start",
 			contentIndex: index,
 			partial: this.message,
 		});
-		const serializedArgs = JSON.stringify(call.arguments);
 		this.stream.push({
 			type: "toolcall_delta",
 			contentIndex: index,
@@ -305,13 +425,36 @@ export class StepStreamWriter {
 		});
 	}
 
-	/** 以 `toolUse` 结束当前切片步（中间步保持账单 Usage 为 0，避免多步重复累加） */
-	finishWithToolUse(): void {
+	/** 清理尚未收到实际 MCP 调用即被取消的悬空前置工具块 */
+	private finalizeUnmatchedPendingToolCalls(): void {
+		while (this.pendingToolCallSlots.length > 0) {
+			const slot = this.pendingToolCallSlots.shift()!;
+			this.stream.push({
+				type: "toolcall_delta",
+				contentIndex: slot.contentIndex,
+				delta: "}",
+				partial: this.message,
+			});
+			this.stream.push({
+				type: "toolcall_end",
+				contentIndex: slot.contentIndex,
+				toolCall: slot.block,
+				partial: this.message,
+			});
+		}
+	}
+
+	/** 以 `toolUse` 结束当前切片步，并支持写入单步归因 Usage（供窗口进度条、缓存命中率与单步 TPS 实时计算） */
+	finishWithToolUse(stepUsage?: Usage): void {
 		if (this.terminated) return;
 		this.flushHeldText();
 		this.ensureStarted();
 		this.closeOpenBlock();
+		this.finalizeUnmatchedPendingToolCalls();
 
+		if (stepUsage) {
+			this.message.usage = stepUsage;
+		}
 		this.message.stopReason = "toolUse";
 		this.terminated = true;
 		this.stream.push({
@@ -322,8 +465,11 @@ export class StepStreamWriter {
 		this.stream.end(this.message);
 	}
 
-	/** 正常结束整个模型回答轮次并写入终态 Token 用量 */
-	finishTurn(acpStopReason: AcpPromptStopReason, acpUsage?: AcpPromptUsage): { quotaError?: string } {
+	/** 正常结束整个模型回答轮次并写入终态 Token 用量（支持直接传入校准后的 `Usage` 或原始 `AcpPromptUsage`） */
+	finishTurn(
+		acpStopReason: AcpPromptStopReason,
+		usageOrRaw?: AcpPromptUsage | Usage,
+	): { quotaError?: string } {
 		if (this.terminated) return {};
 		const flushed = this.flushHeldText();
 		if (flushed.quotaError) {
@@ -332,12 +478,18 @@ export class StepStreamWriter {
 
 		this.ensureStarted();
 		this.closeOpenBlock();
+		this.finalizeUnmatchedPendingToolCalls();
 
 		const reason = acpStopReason === "max_tokens" ? "length" : "stop";
 		this.message.stopReason = reason;
 		this.message.rawStopReason = acpStopReason;
 		this.message.endTurn = reason === "stop";
-		this.message.usage = convertAcpUsageToPiUsage(acpUsage);
+
+		if (usageOrRaw && "cost" in usageOrRaw && "cacheRead" in usageOrRaw) {
+			this.message.usage = usageOrRaw;
+		} else {
+			this.message.usage = convertAcpUsageToPiUsage(usageOrRaw as AcpPromptUsage | undefined);
+		}
 
 		this.terminated = true;
 		this.stream.push({
@@ -353,6 +505,7 @@ export class StepStreamWriter {
 	fail(reason: "aborted" | "error", errorMessage: string): void {
 		if (this.terminated) return;
 		this.closeOpenBlock();
+		this.finalizeUnmatchedPendingToolCalls();
 		this.message.stopReason = reason;
 		this.message.errorMessage = errorMessage;
 
@@ -389,6 +542,7 @@ export class StepStreamWriter {
 				partial: this.message,
 			});
 		}
+		this.rawEstimatedOutputTokens += estimateTextTokens(text);
 		const target = this.message.content[this.openBlock.index] as TextContent;
 		target.text += text;
 		this.stream.push({

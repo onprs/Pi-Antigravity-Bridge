@@ -33,6 +33,8 @@ export interface AgySessionAnchor {
 	mountDigest: string;
 	/** 暴露给宿主的 MCP 工具表指纹 */
 	toolsDigest: string;
+	/** 是否为通过 `/agy sessions` 刚导入尚未经历首轮请求对齐的原始会话锚点 */
+	importedRaw?: boolean;
 	/** 可选的本地 SQLite 会话数据库检查点水位 */
 	dbCheckpoint?: SqliteDbCheckpoint;
 }
@@ -87,7 +89,8 @@ export function findBranchAnchorForHistory(options: {
 
 		const anchor = custom.data;
 		if (anchor.version !== 1 || !anchor.agySessionId) continue;
-		if (anchor.toolMode !== toolMode || anchor.mountDigest !== mountDigest) continue;
+		if (anchor.toolMode !== toolMode) continue;
+		if (!anchor.importedRaw && anchor.mountDigest !== mountDigest) continue;
 		if (!hasLocalConversationDb(config, anchor.agySessionId)) continue;
 
 		if (

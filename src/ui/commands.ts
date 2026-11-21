@@ -22,7 +22,6 @@ import type {
 import {
 	ANTIGRAVITY_API_ID,
 	ANTIGRAVITY_PROVIDER_ID,
-	probeLiveAntigravityCatalog,
 } from "../catalog/model-discovery.ts";
 import {
 	type AgyExecutionMode,
@@ -33,7 +32,7 @@ import {
 	saveGlobalBridgeConfigPatch,
 	type ToolMode,
 } from "../config.ts";
-import { prepareCustomizationMount } from "../session/customization-mounter.ts";
+import { isPiMcpRelatedTool } from "../mcp/pi-mcp-forwarder.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import { createZeroUsage } from "../stream/event-mapper.ts";
 import { AGY_MIRROR_TOOL_NAMES } from "../tools/agy-renderers.ts";
@@ -84,9 +83,25 @@ export class ToolActivationController {
 		}
 
 		const baseUserTools = this.savedUserActiveTools ?? nonMirrorCurrent;
+		const flags = resolveEffectiveFlags(config);
 
 		if (config.toolMode === "agy-tools") {
-			this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES]);
+			if (flags.bridgePiMcp && config.piMcpBridgeStrategy === "via-host") {
+				let allRegisteredNames: string[] = [];
+				try {
+					allRegisteredNames = this.pi.getAllTools().map((t) => t.name);
+				} catch {
+					// 忽略未初始化运行态
+				}
+				const candidatePool = Array.from(new Set([...baseUserTools, ...allRegisteredNames]));
+				const mcpBridgedTools = candidatePool.filter(
+					(name) =>
+						isPiMcpRelatedTool(name) || name === "codemode" || name === "tool_search",
+				);
+				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES, ...mcpBridgedTools]);
+			} else {
+				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES]);
+			}
 		} else {
 			// hybrid：激活镜像工具 + 不与 AGY 内置基础读写冲突的 Pi 扩展工具
 			const extraTools = baseUserTools.filter((name) => !OVERLAPPING_PI_BASE_TOOLS.has(name));
@@ -152,9 +167,9 @@ function buildCompletions(prefix: string): AutocompleteItem[] | null {
 
 	if (sub === "mode" && parts.length === 2) {
 		return [
-			{ value: "mode agy-tools", label: "agy-tools", description: "AGY 原生工具与 Subagent 模式（默认推荐）" },
+			{ value: "mode pi-tools", label: "pi-tools", description: "通过 MCP 挂载 Pi 工具集主控模式（默认）" },
+			{ value: "mode agy-tools", label: "agy-tools", description: "AGY 原生工具与 Subagent 模式" },
 			{ value: "mode hybrid", label: "hybrid", description: "AGY 原生工具 + Pi 专属扩展工具混合模式" },
-			{ value: "mode pi-tools", label: "pi-tools", description: "通过 MCP 挂载 Pi 工具集主控模式" },
 		].filter((i) => i.label.startsWith(arg1) || i.value.startsWith(`mode ${arg1}`));
 	}
 
@@ -314,9 +329,9 @@ async function handleModeSubcommand(
 			return;
 		}
 		const options = [
-			"agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力（默认推荐）",
+			"pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流（默认）",
+			"agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力",
 			"hybrid — AGY 原生工具 + Pi 专属第三方扩展工具",
-			"pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流",
 		];
 		const picked = await ctx.ui.select(
 			`切换工具模式（当前：${coordinator.config.toolMode}）`,
@@ -472,16 +487,34 @@ async function handleLoginSubcommand(
 		);
 		if (!confirmed) return;
 
-		const res = spawnSync(
-			bin.binPath,
-			["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
-			{
-				stdio: "inherit",
-				shell: bin.isWindowsWrapperScript,
-			},
-		);
+		const spawnLoginCmd =
+			bin.isWindowsWrapperScript && bin.binPath.includes(" ")
+				? `"${bin.binPath}"`
+				: bin.binPath;
 
-		if (res.status === 0) {
+		const exitStatus = await ctx.ui.custom<number | null>((tui, _theme, _kb, done) => {
+			tui.stop();
+			process.stdout.write("\x1b[2J\x1b[H");
+			let status: number | null = null;
+			try {
+				const res = spawnSync(
+					spawnLoginCmd,
+					["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
+					{
+						stdio: "inherit",
+						shell: bin.isWindowsWrapperScript,
+					},
+				);
+				status = res.status;
+			} finally {
+				tui.start();
+				tui.requestRender(true);
+				done(status);
+			}
+			return { render: () => [], invalidate: () => {} };
+		});
+
+		if (exitStatus === 0) {
 			const count = await onRefreshProviderModels(ctx);
 			ctx.ui.notify(`登录完成，已加载 ${count} 个可用模型。`, "info");
 		} else {
@@ -647,11 +680,11 @@ async function handleSessionsImportSubcommand(
 			}
 		},
 		withSession: async (replacedCtx) => {
-			const mountInfo = prepareCustomizationMount([], coordinator.config, replacedCtx.cwd);
 			coordinator.registerImportedSessionAnchor({
 				agySessionId: target.sessionId,
 				visibleMessages: replayedMessages,
-				mountDigest: mountInfo.mountDigest,
+				mountDigest: "",
+				importedRaw: true,
 			});
 			replacedCtx.ui.notify(
 				`已导入会话 "${target.title || target.sessionId.slice(0, 8)}"（共 ${replayedMessages.length} 条消息）。`,
@@ -659,6 +692,4 @@ async function handleSessionsImportSubcommand(
 			);
 		},
 	});
-
-	void probeLiveAntigravityCatalog;
 }

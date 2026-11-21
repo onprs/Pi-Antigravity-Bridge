@@ -1,17 +1,20 @@
 import * as assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { SystemMessage, Tool } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAgyBinary } from "../src/acp/binary-resolver.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
 import { LocalHttpMcpBridge, type ParkedToolCall } from "../src/mcp/http-mcp-bridge.ts";
 import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
 import { validateToolArguments } from "../src/mcp/schema-validator.ts";
+import { buildInlineStdioShimCommand } from "../src/mcp/stdio-shim.ts";
 import { prepareCustomizationMount } from "../src/session/customization-mounter.ts";
+import { ToolActivationController } from "../src/ui/commands.ts";
 
 describe("MCP 工具参数 JSON Schema 预校验", () => {
 	const editSchema = {
@@ -473,6 +476,91 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			);
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("agy-tools 开启 bridgePiMcp 时保持 MCP 工具激活，且 Stdio 转发桥支持并发在途请求不阻塞", async () => {
+		let activeTools = ["read", "bash", "codemode", "mcp__github__search"];
+		const fakePi = {
+			getActiveTools: () => [...activeTools],
+			getAllTools: () => [
+				{ name: "read" },
+				{ name: "bash" },
+				{ name: "codemode" },
+				{ name: "tool_search" },
+				{ name: "mcp__github__search" },
+			],
+			setActiveTools: (next: string[]) => {
+				activeTools = [...next];
+			},
+		} as unknown as ExtensionAPI;
+
+		const ctrl = new ToolActivationController(fakePi);
+		const fakeCtx = { model: { provider: "antigravity", id: "gemini-4-neon" } } as unknown as ExtensionContext;
+		ctrl.syncForContext(fakeCtx, {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			bridgePiMcp: true,
+			piMcpBridgeStrategy: "via-host",
+		});
+
+		assert.ok(activeTools.includes("agy_read"));
+		assert.ok(activeTools.includes("codemode"));
+		assert.ok(activeTools.includes("tool_search"));
+		assert.ok(activeTools.includes("mcp__github__search"));
+		assert.ok(!activeTools.includes("read"));
+
+		// 验证内联 Stdio 转发桥在首个请求挂起时不会阻塞后续并发 ping 请求
+		const bridge = new LocalHttpMcpBridge(5_000);
+		const parked: ParkedToolCall[] = [];
+		const token = bridge.registerSessionBinding({
+			agySessionId: "sess-stdio",
+			tools: [{ name: "slow_tool", description: "slow", parameters: { type: "object", properties: {} } }],
+			onParkedCall: (c) => parked.push(c),
+			onHoldTimeout: async () => {},
+		});
+
+		try {
+			const port = await bridge.ensureListening();
+			bridge.recordAcpToolAnnouncement("sess-stdio", "mcp_pi_tools_slow_tool");
+			const spec = buildInlineStdioShimCommand(`http://127.0.0.1:${port}/mcp`, token);
+			const envObj: NodeJS.ProcessEnv = { ...process.env };
+			for (const pair of spec.env) envObj[pair.name] = pair.value;
+
+			const child = spawn(spec.command, spec.args, { env: envObj, stdio: ["pipe", "pipe", "pipe"] });
+			const lines: Array<{ id: number }> = [];
+			child.stdout.setEncoding("utf8");
+			let outBuf = "";
+			child.stdout.on("data", (chunk: string) => {
+				outBuf += chunk;
+				let nl = outBuf.indexOf("\n");
+				while (nl !== -1) {
+					const raw = outBuf.slice(0, nl).trim();
+					outBuf = outBuf.slice(nl + 1);
+					if (raw) lines.push(JSON.parse(raw) as { id: number });
+					nl = outBuf.indexOf("\n");
+				}
+			});
+
+			// 先发挂起的 tools/call (id=1)，紧接着并发发送 ping (id=2)
+			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow_tool", arguments: {} } })}\n`);
+			await new Promise((r) => setTimeout(r, 40));
+			assert.equal(parked.length, 1);
+
+			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping", params: {} })}\n`);
+			await new Promise((r) => setTimeout(r, 40));
+			// id=2 (ping) 必须在 id=1 仍处于挂起态时先行返回
+			assert.equal(lines.length, 1);
+			assert.equal(lines[0].id, 2);
+
+			parked[0].settle({ content: [{ type: "text", text: "done" }] });
+			await new Promise((r) => setTimeout(r, 40));
+			assert.equal(lines.length, 2);
+			assert.equal(lines[1].id, 1);
+			child.stdin.end();
+			child.kill();
+		} finally {
+			await bridge.dispose();
 		}
 	});
 });

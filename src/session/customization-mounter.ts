@@ -380,8 +380,39 @@ function buildPureModeWorkspaceContextBlock(params: {
 		}
 	}
 
-	blocks.push("</workspace_context>");
+	blocks.push("</workspace_context>", "");
 	return blocks.join("\n");
+}
+
+function pruneOldMountCacheDirs(mountsRoot: string, keepDirName: string, maxEntries = 16): void {
+	try {
+		if (!fs.existsSync(mountsRoot)) return;
+		const entries = fs
+			.readdirSync(mountsRoot, { withFileTypes: true })
+			.filter((e) => e.isDirectory() && e.name.startsWith("pi-mount-") && e.name !== keepDirName)
+			.map((e) => {
+				const full = path.join(mountsRoot, e.name);
+				let mtimeMs = 0;
+				try {
+					mtimeMs = fs.statSync(full).mtimeMs;
+				} catch {
+					// 忽略
+				}
+				return { full, mtimeMs };
+			})
+			.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+		for (let i = maxEntries - 1; i < entries.length; i++) {
+			if (i < 0) continue;
+			try {
+				fs.rmSync(entries[i].full, { recursive: true, force: true });
+			} catch {
+				// 忽略并发清理异常
+			}
+		}
+	} catch {
+		// 忽略
+	}
 }
 
 /**
@@ -486,17 +517,19 @@ export function prepareCustomizationMount(
 
 	const shortHash = mountDigest.slice(0, 12);
 	const mountsRoot = path.join(resolvePiAgentDir(env), "cache", "antigravity-mounts");
-	const pluginDir = path.join(mountsRoot, `pi-mount-${shortHash}`);
+	const pluginDirName = `pi-mount-${shortHash}`;
+	const pluginDir = path.join(mountsRoot, pluginDirName);
 
 	const manifestJson = `${JSON.stringify(
 		{
-			name: `pi-mount-${shortHash}`,
-			version: "0.1.0",
+			name: pluginDirName,
+			version: "0.1.1",
 		},
 		null,
 		2,
 	)}\n`;
 	writeFileIfChanged(path.join(pluginDir, "plugin.json"), manifestJson);
+	pruneOldMountCacheDirs(mountsRoot, pluginDirName);
 
 	const skillsJsonPath = path.join(pluginDir, "skills.json");
 	if (skillEntries.length > 0) {

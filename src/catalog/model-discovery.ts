@@ -84,16 +84,13 @@ export function inferModelSpecs(modelId: string): {
 			supportsImage: true,
 		};
 	}
-	if (lower.includes("gemini-4-neon") || lower.includes("gemini-4-hydrogen")) {
+	if (
+		lower.includes("gemini-4-") ||
+		lower.includes("gemini-3") ||
+		lower.includes("orchestrator")
+	) {
 		return {
-			contextWindow: observed ?? 512_000,
-			maxTokens: 65_536,
-			supportsImage: true,
-		};
-	}
-	if (lower.includes("gemini-4-") || lower.includes("gemini-3") || lower.includes("orchestrator")) {
-		return {
-			contextWindow: observed ?? 1_000_000,
+			contextWindow: observed ?? 1_048_576,
 			maxTokens: 65_536,
 			supportsImage: true,
 		};
@@ -319,7 +316,7 @@ export function writeCachedCatalog(
 	}
 }
 
-function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: string): void {
+export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: string): void {
 	const convDir = resolveAgyConversationsDir(config);
 	for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
 		try {

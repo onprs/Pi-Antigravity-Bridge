@@ -50,9 +50,15 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 		const d1 = directFilter.push("\n⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n");
 		assert.equal(d1.safeText, "\n");
 		assert.ok(d1.quotaError?.includes("RESOURCE_EXHAUSTED (code 429)"));
+
+		// 验证模型正文中正常引用或代码块讨论 429 报错样本时不会误判拦截
+		const quoteFilter = new QuotaSoftErrorFilter();
+		const q1 = quoteFilter.push("常见报错如下：\n```\n⚠ RESOURCE_EXHAUSTED (code 429): sample\n```\nRESOURCE_EXHAUSTED (code 429): discussed inline\n");
+		assert.equal(q1.quotaError, undefined);
+		assert.ok(q1.safeText.includes("discussed inline"));
 	});
 
-	it("StepStreamWriter 维护块平衡并保证中间 toolUse 步 Usage 为 0", async () => {
+	it("StepStreamWriter 支持两阶段工具调用流式采样、代码块平衡与分步 Usage 写入", async () => {
 		const mockModel = {
 			id: "gemini-4-neon",
 			name: "Gemini 4 Neon",
@@ -74,6 +80,7 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 		writer.appendThinkingDelta("Let me check ");
 		writer.appendThinkingDelta("the file.");
 		writer.appendTextDelta("Reading now.");
+		writer.beginPendingToolCall("placeholder_1", "read");
 		writer.appendToolCall({ id: "call_1", name: "read", arguments: { path: "a.ts" } });
 		writer.finishWithToolUse();
 
@@ -95,10 +102,17 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 				"text_end",
 				"toolcall_start",
 				"toolcall_delta",
+				"toolcall_delta",
 				"toolcall_end",
 				"done",
 			],
 		);
+		const toolDeltas = events
+			.filter((e): e is Extract<AssistantMessageEvent, { type: "toolcall_delta" }> => e.type === "toolcall_delta")
+			.map((e) => e.delta)
+			.join("");
+		assert.equal(toolDeltas, JSON.stringify({ path: "a.ts" }));
+		assert.ok(writer.estimatedOutputTokens > 0);
 		assert.equal(writer.message.stopReason, "toolUse");
 		assert.equal(writer.message.usage.totalTokens, 0);
 
@@ -274,6 +288,35 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 				config: cfg,
 			});
 			assert.equal(forkHit.kind, "forkable");
+
+			// 验证 /agy sessions 刚导入的原始锚点（importedRaw: true）可跨空 mountDigest 直接命中 exact 恢复
+			const importedEntries: SessionEntry[] = [
+				{
+					type: "custom",
+					id: "e2",
+					parentId: null,
+					timestamp: "2026-11-21T00:00:00Z",
+					customType: AGY_SESSION_ANCHOR_CUSTOM_TYPE,
+					data: {
+						version: 1,
+						agySessionId: origSessionId,
+						toolMode: "pi-tools",
+						transcriptDigest: computeTranscriptDigest([m1]),
+						messageCount: 1,
+						mountDigest: "",
+						toolsDigest: "",
+						importedRaw: true,
+					},
+				},
+			];
+			const importedHit = findBranchAnchorForHistory({
+				branchEntries: importedEntries,
+				priorMessages: [m1],
+				toolMode: "pi-tools",
+				mountDigest: "new-live-mount-digest",
+				config: cfg,
+			});
+			assert.equal(importedHit.kind, "exact");
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}

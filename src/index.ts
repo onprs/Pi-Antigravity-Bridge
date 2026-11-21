@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -17,7 +19,7 @@ import {
 	probeLiveAntigravityCatalog,
 	readCachedCatalog,
 } from "./catalog/model-discovery.ts";
-import { loadBridgeConfig } from "./config.ts";
+import { loadBridgeConfig, resolvePiAgentDir } from "./config.ts";
 import { discoverAgySkillDirectoriesForPi } from "./session/customization-mounter.ts";
 import { extractVisibleMessages } from "./session/reconcile.ts";
 import { TurnCoordinator } from "./session/turn-coordinator.ts";
@@ -34,6 +36,49 @@ import { updateAntigravityStatusBar } from "./ui/status-bar.ts";
 
 const SENTINEL_API_KEY = "agy-managed";
 const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+
+/**
+ * 读取 Pi 的 `trust.json` 判断指定工作目录在 `resources_discover` 早期阶段是否已被授予项目信任。
+ */
+function checkProjectTrustedFromStore(cwd: string): boolean {
+	try {
+		const trustFile = path.join(resolvePiAgentDir(), "trust.json");
+		if (!fs.existsSync(trustFile)) return false;
+		const parsed: unknown = JSON.parse(fs.readFileSync(trustFile, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+		const store = parsed as Record<string, unknown>;
+		const isWin = process.platform === "win32";
+		const norm = (p: string) => {
+			let resolved = p;
+			try {
+				resolved = fs.realpathSync(p);
+			} catch {
+				resolved = path.resolve(p);
+			}
+			return isWin ? resolved.toLowerCase() : resolved;
+		};
+
+		const normalizedStore = new Map<string, boolean>();
+		for (const [k, v] of Object.entries(store)) {
+			if (typeof v === "boolean") {
+				normalizedStore.set(norm(k), v);
+			}
+		}
+
+		let current = norm(cwd);
+		while (true) {
+			const decision = normalizedStore.get(current);
+			if (typeof decision === "boolean") {
+				return decision;
+			}
+			const parent = path.dirname(current);
+			if (parent === current) return false;
+			current = parent;
+		}
+	} catch {
+		return false;
+	}
+}
 
 /**
  * Pi × Antigravity ACP 桥接扩展主入口。
@@ -104,11 +149,22 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 						};
 					}
 				} catch {
-					// 未登录或探测失败时引导终端登录
+					// 未登录或探测失败时继续后续引导
 				}
 
+				const activeCtx = coordinator.getActiveContext();
+				if (activeCtx?.mode === "tui") {
+					throw new Error(
+						"当前处于交互式 TUI 面板，请按 Esc 返回后执行 `/agy login`（自动安全释放并恢复终端完成登录），或在独立终端运行 `agy acp --login`。",
+					);
+				}
+
+				const spawnCmd =
+					bin.isWindowsWrapperScript && bin.binPath.includes(" ")
+						? `"${bin.binPath}"`
+						: bin.binPath;
 				const res = spawnSync(
-					bin.binPath,
+					spawnCmd,
 					["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
 					{
 						stdio: "inherit",
@@ -177,7 +233,11 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 
 	// 4. 注册可选的反向 AGY Skills 发现钩子
 	pi.on("resources_discover", (event) => {
-		const cfg = loadBridgeConfig({ cwd: event.cwd, isProjectTrusted: false });
+		const isTrusted =
+			coordinator.getActiveContext()?.cwd === event.cwd
+				? (coordinator.getActiveContext()?.isProjectTrusted() ?? false)
+				: checkProjectTrustedFromStore(event.cwd);
+		const cfg = loadBridgeConfig({ cwd: event.cwd, isProjectTrusted: isTrusted });
 		const skillDirs = discoverAgySkillDirectoriesForPi(cfg, event.cwd);
 		if (skillDirs.length === 0) {
 			return undefined;
