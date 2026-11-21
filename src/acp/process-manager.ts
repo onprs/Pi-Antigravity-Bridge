@@ -23,7 +23,7 @@ import {
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.2";
+export const CLIENT_INFO_VERSION = "0.1.3";
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -756,6 +756,16 @@ export class AcpProcessManager {
 			await conn.dispose();
 			throw error;
 		}
+	}
+
+	/** 从连接池驱逐并强制销毁已卡死或状态异常的单个子进程连接 */
+	async evict(target: AcpClientConnection): Promise<void> {
+		for (const [key, conn] of this.pool.entries()) {
+			if (conn === target) {
+				this.pool.delete(key);
+			}
+		}
+		await target.dispose();
 	}
 
 	async disposeAll(): Promise<void> {

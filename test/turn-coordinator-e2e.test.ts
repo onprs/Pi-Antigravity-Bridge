@@ -111,7 +111,15 @@ rl.on("line", async (line) => {
   }
 
   if (msg.method === "session/cancel") {
-    // 模拟后端繁忙时 session/cancel 迟迟不回包，验证前端 Esc 不受其阻塞
+    const cancelSid = msg.params?.sessionId;
+    const sess = cancelSid ? sessions.get(cancelSid) : undefined;
+    if (sess?.cancelablePromptId !== undefined) {
+      const pid = sess.cancelablePromptId;
+      sess.cancelablePromptId = undefined;
+      sess.inFlightPromptId = undefined;
+      send({ jsonrpc: "2.0", id: pid, result: { stopReason: "cancelled" } });
+    }
+    // 注意：真实 ACP 协议中 session/cancel 是单向通知，不返回 JSON-RPC response
     return;
   }
 
@@ -122,11 +130,170 @@ rl.on("line", async (line) => {
 
   if (msg.method === "session/prompt") {
     const { sessionId, prompt } = msg.params;
-    if (prompt?.[0]?.text === "HANG_FOREVER") {
-      // 模拟长耗时推理中等待用户按 Esc
+    const sess = sessions.get(sessionId);
+
+    // 模拟真实 agy acp 协议约束：同一会话若上一轮 session/prompt 尚未结算就收到重叠 session/prompt，
+    // 立即令旧请求提前返回 end_turn 并挂死新请求，确保测试能严格拦截任何并发抢占回归！
+    if (sess?.inFlightPromptId !== undefined) {
+      const oldId = sess.inFlightPromptId;
+      sess.inFlightPromptId = msg.id;
+      send({ jsonrpc: "2.0", id: oldId, result: { stopReason: "end_turn" } });
       return;
     }
-    const sess = sessions.get(sessionId);
+
+    const fullPromptText = (prompt || []).map((b) => b.text || "").join("\\n");
+
+    if (fullPromptText.includes("HANG_FOREVER")) {
+      if (sess) sess.inFlightPromptId = msg.id;
+      // 模拟极端死锁：即使收到 session/cancel 也不回包
+      return;
+    }
+
+    if (fullPromptText.includes("CANCEL_RESPONSIVE")) {
+      if (sess) {
+        sess.inFlightPromptId = msg.id;
+        sess.cancelablePromptId = msg.id;
+      }
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Counting 1..." } } }
+      });
+      return;
+    }
+
+    if (fullPromptText.includes("MULTI_STEP_WITH_STEER") && !isModeA && sess?.mcpHttp) {
+      sess.inFlightPromptId = msg.id;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+
+      // Step 1：读取 a.ts
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 20000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_ms_1", title: "mcp_pi_tools_read" } }
+      });
+      const res1 = await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "tools/call",
+          params: {
+            name: "read",
+            arguments: { path: "a.ts" },
+            _meta: { "antigravity.google/root_conversation_id": sessionId }
+          }
+        })
+      }).then((r) => r.json());
+
+      const combinedText1 = (res1.result?.content || []).map((c) => c.text || "").join("\\n");
+
+      // Step 2：收到工具结果与捎带的运行中用户消息后，继续执行未完任务读取 b.ts（不中断原任务！）
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 28000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_ms_2", title: "mcp_pi_tools_read" } }
+      });
+      const res2 = await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 22,
+          method: "tools/call",
+          params: {
+            name: "read",
+            arguments: { path: "b.ts" },
+            _meta: { "antigravity.google/root_conversation_id": sessionId }
+          }
+        })
+      }).then((r) => r.json());
+
+      const combinedText2 = (res2.result?.content || []).map((c) => c.text || "").join("\\n");
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 32000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Both done! A=" + combinedText1 + " B=" + combinedText2 }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          stopReason: "end_turn",
+          usage: { inputTokens: 8000, cachedReadTokens: 24000, outputTokens: 90, thoughtTokens: 10 }
+        }
+      });
+      return;
+    }
+
+    if (fullPromptText.includes("顺便检查缓存显示") && sess) {
+      sess.inFlightPromptId = msg.id;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "SteerAnswered=true" }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "end_turn", usage: { inputTokens: 600, cachedReadTokens: 32000, outputTokens: 20 } }
+      });
+      return;
+    }
+
+    const followIdx = fullPromptText.indexOf("FOLLOWUP_MSG:");
+    if (followIdx !== -1 && sess) {
+      const followLine = fullPromptText.slice(followIdx).split("\\n")[0];
+      sess.inFlightPromptId = msg.id;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Echo -> " + followLine }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "end_turn", usage: { inputTokens: 500, cachedReadTokens: 32000, outputTokens: 25 } }
+      });
+      return;
+    }
 
     if (!isModeA && sess?.mcpHttp) {
       // 模式 B：模拟中间步 usage_update + 思考 + 工具宣告 + HTTP MCP 挂起 + 最终步 usage_update 与累计账单返回
@@ -525,6 +692,164 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 
 			assert.equal(abortedMsg.stopReason, "aborted");
 			assert.ok(elapsed < 50, `Esc 中断耗时应小于 50ms，实际耗时 ${elapsed}ms`);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("运行中插入用户消息 (Steering) 不中断当前多步任务、实时估算首轮缓存命中且后续追问正常吐字", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-steer-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+			];
+
+			// Step 1：触发多步读取任务，返回第 1 个工具调用 a.ts
+			const u0 = { role: "user" as const, content: "MULTI_STEP_WITH_STEER", timestamp: 1 };
+			const ctx1 = normalizeContext({ systemPrompt: "You are Pi.", tools, messages: [u0] });
+			const msg1 = await coord.streamSimple(TEST_MODEL, ctx1, { sessionId: "pi-sess-steer" }).result();
+			assert.equal(msg1.stopReason, "toolUse");
+			const tc1 = msg1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			assert.equal(tc1.arguments.path, "a.ts");
+
+			// Step 2：在 a.ts 工具结果之后夹带用户在运行中按 Enter 发送的转向消息
+			const tr1 = {
+				role: "toolResult" as const,
+				toolCallId: tc1.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "export const a = 1;" }],
+				isError: false,
+				timestamp: 2,
+			};
+			const uSteer = {
+				role: "user" as const,
+				content: "顺便检查缓存显示",
+				timestamp: 3,
+			};
+			const ctx2 = normalizeContext({
+				systemPrompt: "You are Pi.",
+				tools,
+				messages: [u0, msg1, tr1, uSteer],
+			});
+			const msg2 = await coord.streamSimple(TEST_MODEL, ctx2, { sessionId: "pi-sess-steer" }).result();
+
+			// 关键断言 1：原任务绝不提前终止，继续产出第 2 步工具调用 b.ts！
+			assert.equal(msg2.stopReason, "toolUse");
+			const tc2 = msg2.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			assert.equal(tc2.arguments.path, "b.ts");
+			// 关键断言 2：首轮第 2 步已基于前序窗口前缀估算非零 cacheRead，状态栏可实时显示缓存命中率
+			assert.ok(msg2.usage.cacheRead >= 19000, `预期首轮第 2 步 cacheRead > 0，实际为 ${msg2.usage.cacheRead}`);
+
+			// Step 3：完成 b.ts 工具执行，收口整轮输出（包含原任务结果与运行中消息响应）
+			const tr2 = {
+				role: "toolResult" as const,
+				toolCallId: tc2.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "export const b = 2;" }],
+				isError: false,
+				timestamp: 4,
+			};
+			const ctx3 = normalizeContext({
+				systemPrompt: "You are Pi.",
+				tools,
+				messages: [u0, msg1, tr1, uSteer, msg2, tr2],
+			});
+			const msg3 = await coord.streamSimple(TEST_MODEL, ctx3, { sessionId: "pi-sess-steer" }).result();
+			assert.equal(msg3.stopReason, "stop");
+			const text3 = msg3.content
+				.filter((c) => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.equal(text3, "Both done! A=export const a = 1; B=export const b = 2;\n\nSteerAnswered=true");
+
+			// Step 4：继续发送下一条普通用户消息，验证复用同一会话且正常流式吐字（绝不挂死）
+			const uFollow = {
+				role: "user" as const,
+				content: "FOLLOWUP_MSG:下一条指令",
+				timestamp: 5,
+			};
+			const ctx4 = normalizeContext({
+				systemPrompt: "You are Pi.",
+				tools,
+				messages: [u0, msg1, tr1, uSteer, msg2, tr2, msg3, uFollow],
+			});
+			const msg4 = await coord.streamSimple(TEST_MODEL, ctx4, { sessionId: "pi-sess-steer" }).result();
+			assert.equal(msg4.stopReason, "stop");
+			const text4 = msg4.content
+				.filter((c) => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.equal(text4, "Echo -> FOLLOWUP_MSG:下一条指令");
+			assert.equal(msg4.responseId, msg1.responseId);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("按下 Esc 取消运行中轮次后立即发送新消息仍能正常流式输出（不卡死）", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-cancel-next-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const ac = new AbortController();
+			const u1 = { role: "user" as const, content: "CANCEL_RESPONSIVE", timestamp: 1 };
+			const ctx1 = normalizeContext({ messages: [u1] });
+			const stream1 = coord.streamSimple(TEST_MODEL, ctx1, {
+				sessionId: "pi-sess-cancel-next",
+				signal: ac.signal,
+			});
+
+			await new Promise((r) => setTimeout(r, 80));
+			ac.abort();
+			const abortedMsg = await stream1.result();
+			assert.equal(abortedMsg.stopReason, "aborted");
+
+			// 模拟 Pi 在 turn_end 记录完结快照后用户立即发送下一条消息
+			await coord.persistTurnAnchor([u1, abortedMsg], "pi-sess-cancel-next");
+
+			const u2 = { role: "user" as const, content: "FOLLOWUP_MSG:取消后立刻重发", timestamp: 2 };
+			const ctx2 = normalizeContext({ messages: [u1, abortedMsg, u2] });
+			const msg2 = await coord
+				.streamSimple(TEST_MODEL, ctx2, { sessionId: "pi-sess-cancel-next" })
+				.result();
+			assert.equal(msg2.stopReason, "stop");
+			const text2 = msg2.content
+				.filter((c) => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.equal(text2, "Echo -> FOLLOWUP_MSG:取消后立刻重发");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

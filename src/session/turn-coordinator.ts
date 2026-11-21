@@ -128,6 +128,10 @@ interface ActiveTurnPump {
 	accountedOutputTokens: number;
 	/** 已收到 ACP 前置 `tool_call` 宣告但 HTTP MCP `POST /mcp` 仍在途的并发调用计数 */
 	pendingAnnouncedMcpCount: number;
+	/** 已向 Pi 推理流发出的宿主 MCP `callId` 集合，防止误结算仍在队列中待消费的后续工具请求 */
+	readonly emittedMcpCallIds: Set<string>;
+	/** 运行中排队进入的转向用户消息，在工具结果结算或本轮 `prompt_done` 收口时安全串行投递 */
+	readonly pendingSteeringUsers: UserMessage[];
 }
 
 interface ManagedSessionLedger {
@@ -159,6 +163,8 @@ interface ManagedSessionLedger {
 	/** 记录已确认为宿主 MCP 宣告的 ACP `toolCallId`，防止省略 `title` 的 `tool_call_update` 在 hybrid 下串扰 */
 	hostMcpAnnouncementIds: Set<string>;
 	activePump?: ActiveTurnPump;
+	/** 当前会话在后端仍在途的 `session/prompt` RPC Promise（严禁在它结算前重叠发送下一条 `session/prompt`） */
+	inFlightPrompt?: Promise<void>;
 }
 
 const DEFAULT_SESSION_KEY = "__default_pi_session__";
@@ -243,9 +249,7 @@ export class TurnCoordinator {
 	cancelAgySessionById(agySessionId: string): void {
 		const ledger = this.ledgersByAgyId.get(agySessionId);
 		if (!ledger) return;
-		this.httpMcpBridge.markSessionTurnCancelled(agySessionId);
-		this.mirrorBroker.abortSessionCalls(agySessionId, "Cancelled by user");
-		void ledger.conn.request("session/cancel", { sessionId: agySessionId }).catch(() => {});
+		this.abortLedgerTurnNonBlocking(ledger);
 	}
 
 	/** 实时切换当前活跃会话的 AGY 原生执行模式（`default` | `accept-edits` | `plan`） */
@@ -282,10 +286,17 @@ export class TurnCoordinator {
 	/** 在每轮对话稳定完结时，将最新会话锚点（含可选 SQLite 检查点）追加进 Pi `.jsonl` 分支 */
 	async persistTurnAnchor(
 		messagesSnapshot?: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
+		piSessionId?: string,
 	): Promise<void> {
-		const key = this.resolveCurrentPiSessionKey();
+		const key = this.resolveCurrentPiSessionKey(piSessionId);
 		const ledger = this.ledgers.get(key);
 		if (!ledger || ledger.activePump || ledger.parkedCalls.size > 0) {
+			return;
+		}
+
+		// 若前序轮次刚执行过取消，等待后端在途 session/prompt 收敛（正常约数毫秒）；若连接卡死则跳过写入污染锚点
+		const settled = await this.waitForInFlightPrompt(ledger, 1_500);
+		if (!settled || ledger.activePump || ledger.parkedCalls.size > 0) {
 			return;
 		}
 
@@ -340,13 +351,13 @@ export class TurnCoordinator {
 
 	/**
 	 * 当用户按下 `Esc` 中断流或在工具执行期间中断整个 Agent Run 时，
-	 * 0 毫秒同步清理挂起中的 MCP 工具调用与活跃队列，并在后台异步发送 `session/cancel`（绝不阻塞前端 UI 停止）。
+	 * 0 毫秒同步清理挂起中的 MCP 工具调用与活跃队列，并发送 ACP 单向 `session/cancel` 通知。
 	 */
 	cancelActiveTurnForPiSession(piSessionId?: string): void {
 		const key = piSessionId || this.resolveCurrentPiSessionKey();
 		const ledger = this.ledgers.get(key);
 		if (!ledger) return;
-		if (!ledger.activePump && ledger.parkedCalls.size === 0) {
+		if (!ledger.activePump && ledger.parkedCalls.size === 0 && !ledger.inFlightPrompt) {
 			return;
 		}
 		this.abortLedgerTurnNonBlocking(ledger);
@@ -362,10 +373,70 @@ export class TurnCoordinator {
 			});
 		}
 		ledger.parkedCalls.clear();
+		if (ledger.activePump) {
+			ledger.activePump.finished = true;
+		}
 		ledger.activePump = undefined;
-		void ledger.conn
-			.request("session/cancel", { sessionId: ledger.agySessionId }, { timeoutMs: 3_000 })
-			.catch(() => {});
+		ledger.conn.notify("session/cancel", { sessionId: ledger.agySessionId });
+	}
+
+	/**
+	 * 等待会话在途的 `session/prompt` 请求结算完成。
+	 * 若超出最大容忍时间仍未结算（例如底层进程死锁），返回 `false` 以便上层驱逐卡死进程并无缝重建。
+	 */
+	private async waitForInFlightPrompt(
+		ledger: ManagedSessionLedger,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		const inflight = ledger.inFlightPrompt;
+		if (!inflight) return true;
+		if (signal?.aborted) return false;
+
+		return new Promise<boolean>((resolve) => {
+			let done = false;
+			const finish = (ok: boolean) => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				resolve(ok);
+			};
+
+			const onAbort = () => finish(false);
+			signal?.addEventListener("abort", onAbort, { once: true });
+
+			const timer = setTimeout(() => {
+				finish(false);
+			}, timeoutMs);
+
+			void inflight.finally(() => {
+				finish(true);
+			});
+		});
+	}
+
+	/** 驱逐已卡死的后端连接与会话绑定，确保下一轮消息能通过健康新进程正常响应 */
+	private async discardWedgedLedger(ledger: ManagedSessionLedger): Promise<void> {
+		this.ledgers.delete(ledger.piSessionKey);
+		this.ledgersByAgyId.delete(ledger.agySessionId);
+
+		for (const [, parked] of ledger.parkedCalls) {
+			parked.settle({
+				isError: true,
+				content: [{ type: "text", text: "Session reset" }],
+			});
+		}
+		ledger.parkedCalls.clear();
+		ledger.detachedCallIds.clear();
+		ledger.activePump = undefined;
+		ledger.inFlightPrompt = undefined;
+
+		if (ledger.mcpToken) {
+			this.httpMcpBridge.unregisterSessionBinding(ledger.mcpToken);
+		}
+		this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "Session reset");
+		await this.processManager.evict(ledger.conn);
 	}
 
 	/** Pi `registerProvider` 核心流式入口 */
@@ -610,7 +681,9 @@ export class TurnCoordinator {
 			// 2b. 模式 A / Hybrid：镜像工具执行完毕，无缝续接后台同一活跃 ACP Turn 队列（含已缓存的尾部事件与终态）
 			if (existing.activePump) {
 				const { trailingUsers } = this.collectRecentToolResultsAndSteeringUsers(visibleMessages);
-				this.forwardSteeringUsersIfPresent(existing, trailingUsers);
+				if (trailingUsers.length > 0) {
+					existing.activePump.pendingSteeringUsers.push(...trailingUsers);
+				}
 				writer.setResponseMetadata({
 					responseId: existing.agySessionId,
 					providerThinkingLevel: existing.appliedThoughtLevel,
@@ -623,24 +696,39 @@ export class TurnCoordinator {
 				return;
 			}
 
-			// 2c. 连续正常追问：前缀摘要匹配时直接复用活跃会话发送新增用户消息
-			const continuationPrompts = this.tryExtractIncrementalUserPrompts(existing, visibleMessages);
-			if (continuationPrompts && existing.toolsDigest === toolsDigest) {
-				await this.executePromptOnLedger(
-					existing,
-					continuationPrompts,
-					visibleMessages,
-					writer,
-					model,
-					options,
-				);
-				return;
+			// 2c. 连续正常追问：先确认上一轮在途请求已完全收敛；若底层卡死则自动驱逐重建，否则直接复用会话与缓存
+			const idleOk = await this.waitForInFlightPrompt(existing, 2_500, options?.signal);
+			if (!idleOk) {
+				if (options?.signal?.aborted) {
+					writer.fail("aborted", "Request aborted by user");
+					return;
+				}
+				await this.discardWedgedLedger(existing);
+			} else {
+				const continuationPrompts = this.tryExtractIncrementalUserPrompts(existing, visibleMessages);
+				if (continuationPrompts && existing.toolsDigest === toolsDigest) {
+					await this.executePromptOnLedger(
+						existing,
+						continuationPrompts,
+						visibleMessages,
+						writer,
+						model,
+						options,
+					);
+					return;
+				}
 			}
 		}
 
 		// 3. 会话不存在、工具集/模式变更或历史分支偏离：安全拆解旧会话并按三级状态机重建/恢复
-		if (existing) {
-			await this.teardownLedger(existing);
+		const stillExisting = this.ledgers.get(piSessionKey);
+		if (stillExisting) {
+			const settled = await this.waitForInFlightPrompt(stillExisting, 1_500, options?.signal);
+			if (!settled) {
+				await this.discardWedgedLedger(stillExisting);
+			} else {
+				await this.teardownLedger(stillExisting);
+			}
 		}
 
 		const { ledger, initialPromptBlocks } = await this.bootstrapOrRestoreLedger({
@@ -704,21 +792,6 @@ export class TurnCoordinator {
 		return { recentToolResults, trailingUsers };
 	}
 
-	private forwardSteeringUsersIfPresent(
-		ledger: ManagedSessionLedger,
-		trailingUsers: readonly UserMessage[],
-	): void {
-		if (trailingUsers.length === 0) return;
-		const steerBlocks = convertUserMessagesToPromptBlocks(trailingUsers);
-		if (steerBlocks.length === 0) return;
-		void ledger.conn
-			.request("session/prompt", {
-				sessionId: ledger.agySessionId,
-				prompt: steerBlocks,
-			})
-			.catch(() => {});
-	}
-
 	private async continueFromParkedOrDetachedToolResults(
 		ledger: ManagedSessionLedger,
 		writer: StepStreamWriter,
@@ -739,7 +812,7 @@ export class TurnCoordinator {
 		const { recentToolResults, trailingUsers } =
 			this.collectRecentToolResultsAndSteeringUsers(visibleMessages);
 
-		// 分支 A：若存在因超过 165 秒守护阈值已剥离的调用，通过新 session/prompt 补发迟到结果
+		// 分支 A：若存在因超过 165 秒守护阈值已剥离的调用，等待在途取消收敛后通过新 session/prompt 补发迟到结果
 		if (ledger.detachedCallIds.size > 0) {
 			const detachedResults: ToolResultMessage[] = [];
 			for (const callId of ledger.detachedCallIds) {
@@ -754,6 +827,45 @@ export class TurnCoordinator {
 			}
 			ledger.detachedCallIds.clear();
 			ledger.activePump = undefined;
+
+			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+			if (!idleOk) {
+				if (options?.signal?.aborted) {
+					writer.fail("aborted", "Request aborted by user");
+					return;
+				}
+				await this.discardWedgedLedger(ledger);
+				const cwd = this.activeContext?.cwd ?? process.cwd();
+				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
+				const mountInfo = prepareCustomizationMount(
+					visibleMessages,
+					this.currentConfig,
+					cwd,
+				);
+				const restored = await this.bootstrapOrRestoreLedger({
+					piSessionKey: ledger.piSessionKey,
+					cwd,
+					isProjectTrusted,
+					visibleMessages,
+					hostMcpTools,
+					toolsDigest,
+					mountedPluginPaths: mountInfo.mountedPluginPaths,
+					mountDigest: mountInfo.mountDigest,
+					additionalDirectories: mountInfo.additionalDirectories,
+					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					signal: options?.signal,
+				});
+				await this.executePromptOnLedger(
+					restored.ledger,
+					restored.initialPromptBlocks,
+					visibleMessages,
+					writer,
+					model,
+					options,
+				);
+				return;
+			}
+
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
 
 			const lateBlocks =
@@ -772,31 +884,73 @@ export class TurnCoordinator {
 			return;
 		}
 
-		// 分支 B：165 秒内正常完成，直接结算挂起的 HTTP MCP 请求并继续消费同一活跃 ACP Turn
+		// 分支 B：165 秒内正常完成，直接结算已发给 Pi 的挂起 HTTP MCP 请求并继续消费同一活跃 ACP Turn
 		const pump = ledger.activePump;
 		if (!pump) {
+			for (const [, parked] of ledger.parkedCalls) {
+				parked.settle({
+					isError: true,
+					content: [{ type: "text", text: "Turn ended" }],
+				});
+			}
+			ledger.parkedCalls.clear();
+			const idleOk = await this.waitForInFlightPrompt(ledger, 2_000, options?.signal);
+			if (!idleOk) {
+				if (options?.signal?.aborted) {
+					writer.fail("aborted", "Request aborted by user");
+					return;
+				}
+				await this.discardWedgedLedger(ledger);
+				const cwd = this.activeContext?.cwd ?? process.cwd();
+				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
+				const mountInfo = prepareCustomizationMount(visibleMessages, this.currentConfig, cwd);
+				const restored = await this.bootstrapOrRestoreLedger({
+					piSessionKey: ledger.piSessionKey,
+					cwd,
+					isProjectTrusted,
+					visibleMessages,
+					hostMcpTools,
+					toolsDigest,
+					mountedPluginPaths: mountInfo.mountedPluginPaths,
+					mountDigest: mountInfo.mountDigest,
+					additionalDirectories: mountInfo.additionalDirectories,
+					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					signal: options?.signal,
+				});
+				await this.executePromptOnLedger(
+					restored.ledger,
+					restored.initialPromptBlocks,
+					visibleMessages,
+					writer,
+					model,
+					options,
+				);
+				return;
+			}
 			const replay = buildFreshReplayPromptBlocks(visibleMessages);
 			await this.executePromptOnLedger(ledger, replay, visibleMessages, writer, model, options);
 			return;
 		}
 
-		// 若用户在工具执行期间插入了实时转向消息，利用 AGY 原生运行中 Steering 发送
-		this.forwardSteeringUsersIfPresent(ledger, trailingUsers);
+		if (trailingUsers.length > 0) {
+			pump.pendingSteeringUsers.push(...trailingUsers);
+		}
 
-		for (const [callId, parked] of Array.from(ledger.parkedCalls.entries())) {
+		// 仅结算已发给 Pi 执行的工具调用，保留仍在队列中等待下一步发出的并发/顺序后续请求；
+		// 运行中附带的用户消息保留在 pump.pendingSteeringUsers 中，待当前任务 prompt_done 后以真实用户身份串行发送。
+		const entriesToSettle = Array.from(ledger.parkedCalls.entries()).filter(
+			([callId]) => pump.emittedMcpCallIds.has(callId) || recentToolResults.has(callId),
+		);
+
+		for (const [callId, parked] of entriesToSettle) {
 			const tr = recentToolResults.get(callId);
 			ledger.parkedCalls.delete(callId);
-			if (tr) {
-				parked.settle({
-					content: tr.content,
-					isError: tr.isError,
-				});
-			} else {
-				parked.settle({
-					content: [{ type: "text", text: "(tool call skipped)" }],
-					isError: true,
-				});
-			}
+			pump.emittedMcpCallIds.delete(callId);
+
+			parked.settle({
+				content: tr ? [...tr.content] : [{ type: "text", text: "(tool call skipped)" }],
+				isError: tr ? tr.isError : true,
+			});
 		}
 
 		writer.setResponseMetadata({
@@ -849,14 +1003,19 @@ export class TurnCoordinator {
 				tools: params.hostMcpTools,
 				onParkedCall: (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
-					fullLedger.parkedCalls.set(call.callId, call);
-					if (fullLedger.activePump) {
-						fullLedger.activePump.pendingAnnouncedMcpCount = Math.max(
-							0,
-							fullLedger.activePump.pendingAnnouncedMcpCount - 1,
-						);
-						fullLedger.activePump.queue.push({ kind: "mcp_parked", call });
+					if (!fullLedger.activePump || fullLedger.activePump.finished) {
+						call.settle({
+							isError: true,
+							content: [{ type: "text", text: "Turn cancelled." }],
+						});
+						return;
 					}
+					fullLedger.parkedCalls.set(call.callId, call);
+					fullLedger.activePump.pendingAnnouncedMcpCount = Math.max(
+						0,
+						fullLedger.activePump.pendingAnnouncedMcpCount - 1,
+					);
+					fullLedger.activePump.queue.push({ kind: "mcp_parked", call });
 				},
 				onHoldTimeout: async (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
@@ -866,9 +1025,7 @@ export class TurnCoordinator {
 					}
 					if (fullLedger.agySessionId) {
 						this.httpMcpBridge.markSessionTurnCancelled(fullLedger.agySessionId);
-						void fullLedger.conn
-							.request("session/cancel", { sessionId: fullLedger.agySessionId }, { timeoutMs: 3_000 })
-							.catch(() => {});
+						fullLedger.conn.notify("session/cancel", { sessionId: fullLedger.agySessionId });
 					}
 				},
 			});
@@ -1130,6 +1287,40 @@ export class TurnCoordinator {
 		}
 	}
 
+	private startTrackedSessionPrompt(
+		ledger: ManagedSessionLedger,
+		pump: ActiveTurnPump,
+		outboundPayload: { sessionId: string; prompt: AcpPromptBlock[] },
+	): void {
+		this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+		pump.finished = false;
+
+		let trackedRef: Promise<void> | undefined;
+		const tracked = ledger.conn
+			.request<AcpPromptResponse>("session/prompt", outboundPayload)
+			.then((response) => {
+				pump.finished = true;
+				if (ledger.activePump === pump) {
+					this.mirrorBroker.completePendingCallsImplicitly(ledger.agySessionId);
+				}
+				pump.queue.push({ kind: "prompt_done", response });
+			})
+			.catch((error) => {
+				pump.finished = true;
+				if (ledger.activePump === pump) {
+					this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
+				}
+				pump.queue.push({ kind: "prompt_error", error });
+			})
+			.finally(() => {
+				if (ledger.inFlightPrompt === trackedRef) {
+					ledger.inFlightPrompt = undefined;
+				}
+			});
+		trackedRef = tracked;
+		ledger.inFlightPrompt = tracked;
+	}
+
 	private async executePromptOnLedger(
 		ledger: ManagedSessionLedger,
 		promptBlocks: AcpPromptBlock[],
@@ -1142,6 +1333,12 @@ export class TurnCoordinator {
 		model: Model<Api>,
 		options?: SimpleStreamOptions,
 	): Promise<void> {
+		await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+		if (options?.signal?.aborted) {
+			writer.fail("aborted", "Request aborted by user");
+			return;
+		}
+
 		await this.syncSessionModelAndMode(ledger, model, options);
 
 		writer.setResponseMetadata({
@@ -1165,29 +1362,17 @@ export class TurnCoordinator {
 			}
 		}
 
-		this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
-
 		const pump: ActiveTurnPump = {
 			queue: new AsyncEventQueue<PumpQueueItem>(),
 			finished: false,
 			cancelledByHoldTimeout: false,
 			accountedOutputTokens: 0,
 			pendingAnnouncedMcpCount: 0,
+			emittedMcpCallIds: new Set<string>(),
+			pendingSteeringUsers: [],
 		};
 		ledger.activePump = pump;
-
-		void ledger.conn
-			.request<AcpPromptResponse>("session/prompt", outboundPayload)
-			.then((response) => {
-				pump.finished = true;
-				this.mirrorBroker.completePendingCallsImplicitly(ledger.agySessionId);
-				pump.queue.push({ kind: "prompt_done", response });
-			})
-			.catch((error) => {
-				pump.finished = true;
-				this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
-				pump.queue.push({ kind: "prompt_error", error });
-			});
+		this.startTrackedSessionPrompt(ledger, pump, outboundPayload);
 
 		if (options?.onResponse) {
 			await options.onResponse(
@@ -1318,6 +1503,7 @@ export class TurnCoordinator {
 			}
 
 			if (item.kind === "mcp_parked") {
+				pump.emittedMcpCallIds.add(item.call.callId);
 				await writer.appendToolCallStreaming(
 					{
 						id: item.call.callId,
@@ -1335,6 +1521,7 @@ export class TurnCoordinator {
 							kind: "mcp_parked";
 							call: ParkedToolCall;
 						};
+						pump.emittedMcpCallIds.add(nextItem.call.callId);
 						writer.appendToolCall({
 							id: nextItem.call.callId,
 							name: nextItem.call.toolName,
@@ -1352,6 +1539,7 @@ export class TurnCoordinator {
 								kind: "mcp_parked";
 								call: ParkedToolCall;
 							};
+							pump.emittedMcpCallIds.add(nextItem.call.callId);
 							writer.appendToolCall({
 								id: nextItem.call.callId,
 								name: nextItem.call.toolName,
@@ -1380,7 +1568,6 @@ export class TurnCoordinator {
 
 			if (item.kind === "prompt_done") {
 				this.mirrorBroker.completePendingCallsImplicitly(ledger.agySessionId);
-				ledger.activePump = undefined;
 
 				if (ledger.windowSize) {
 					recordObservedContextWindow(model.id, ledger.windowSize);
@@ -1388,13 +1575,47 @@ export class TurnCoordinator {
 				}
 
 				if (item.response.stopReason === "cancelled" && signal?.aborted) {
+					ledger.activePump = undefined;
 					writer.fail("aborted", "Request aborted");
 					return;
 				}
 				if (item.response.stopReason === "refusal") {
+					ledger.activePump = undefined;
 					writer.fail("error", "Model refused the request");
 					return;
 				}
+
+				// 若运行中存在排队进入的转向用户消息，在当前轮次完全结束后立即以真实用户身份串行续接下一轮 session/prompt
+				if (
+					pump.pendingSteeringUsers.length > 0 &&
+					!signal?.aborted &&
+					item.response.stopReason !== "cancelled"
+				) {
+					const raw = convertAcpUsageToPiUsage(item.response.usage);
+					const rawPromptTotal = raw.input + raw.cacheRead + raw.cacheWrite;
+					if (rawPromptTotal > 0) {
+						ledger.lastObservedCacheRatio = Math.min(
+							1,
+							Math.max(0, raw.cacheRead / rawPromptTotal),
+						);
+					}
+					const steerBlocks = convertUserMessagesToPromptBlocks(
+						pump.pendingSteeringUsers.splice(0),
+					);
+					if (steerBlocks.length > 0) {
+						if (writer.estimatedOutputTokens > 0) {
+							writer.appendTextDelta("\n\n");
+						}
+						pump.accountedOutputTokens = 0;
+						this.startTrackedSessionPrompt(ledger, pump, {
+							sessionId: ledger.agySessionId,
+							prompt: steerBlocks,
+						});
+						continue;
+					}
+				}
+
+				ledger.activePump = undefined;
 
 				const calibratedUsage = this.buildFinalStepUsage(
 					ledger,
@@ -1457,15 +1678,21 @@ export class TurnCoordinator {
 			};
 		}
 
-		const stepTotal = Math.max(output + 1, liveWindowUsed || ledger.cachedPrefixTokens + output);
+		const prevCachedPrefix = ledger.cachedPrefixTokens;
+		const stepTotal = Math.max(output + 1, liveWindowUsed || prevCachedPrefix + output);
 		const promptTokens = Math.max(1, stepTotal - output);
-		const cacheRead =
-			ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0
-				? Math.min(promptTokens, Math.round(promptTokens * ledger.lastObservedCacheRatio))
-				: 0;
+		let cacheRead = 0;
+		if (ledger.lastObservedCacheRatio !== undefined) {
+			if (ledger.lastObservedCacheRatio > 0) {
+				cacheRead = Math.min(promptTokens, Math.round(promptTokens * ledger.lastObservedCacheRatio));
+			}
+		} else if (prevCachedPrefix > 0) {
+			// 首轮多步执行途中尚无最终 PromptResponse.usage 时，按同会话前序已缓存前缀估算命中量
+			cacheRead = Math.min(promptTokens, prevCachedPrefix);
+		}
 		const input = Math.max(0, promptTokens - cacheRead);
 		const totalTokens = input + cacheRead + output;
-		ledger.cachedPrefixTokens = Math.max(ledger.cachedPrefixTokens, totalTokens);
+		ledger.cachedPrefixTokens = Math.max(prevCachedPrefix, totalTokens);
 
 		return {
 			input,
@@ -1710,6 +1937,7 @@ export class TurnCoordinator {
 		ledger.parkedCalls.clear();
 		ledger.detachedCallIds.clear();
 		ledger.activePump = undefined;
+		ledger.inFlightPrompt = undefined;
 
 		if (ledger.mcpToken) {
 			this.httpMcpBridge.unregisterSessionBinding(ledger.mcpToken);
