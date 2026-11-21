@@ -327,6 +327,11 @@ function buildPureModeToolGuidelines(declaredTools: readonly Tool[]): string[] {
 			"Use edit for targeted changes. Batch changes to one file in a single call; each edits[].oldText must exactly and uniquely match the original file.",
 		);
 	}
+	if (names.has("context_recall")) {
+		guidelines.push(
+			"For archived historical tool outputs or images referencing ctx:// handles, prefer context_recall over re-reading files or re-running commands unless current live state is explicitly required.",
+		);
+	}
 
 	guidelines.push("Be concise in your responses.");
 	guidelines.push("Show file paths clearly when working with files without forcing file:// URLs.");

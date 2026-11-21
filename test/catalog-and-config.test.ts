@@ -12,8 +12,12 @@ import { AcpProcessManager } from "../src/acp/process-manager.ts";
 import type { AcpAvailableModel, AcpConfigOption } from "../src/acp/protocol.ts";
 import {
 	aggregateAcpModels,
+	getSeedModels,
 	probeLiveAntigravityCatalog,
+	readCachedCatalog,
+	resolveBuiltinModelCost,
 	resolveSessionModelSelection,
+	writeCachedCatalog,
 } from "../src/catalog/model-discovery.ts";
 import {
 	DEFAULT_BRIDGE_CONFIG,
@@ -433,5 +437,64 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 		assert.equal(fallbackSel.configModelValue, "gemini-4-neon-medium");
 		assert.equal(fallbackSel.configThoughtLevel, undefined);
 		assert.equal(fallbackSel.effectiveEffort, "medium");
+	});
+
+	it("从 Pi 内置模型目录自动解析官方参考定价，并自动为旧版零费用磁盘缓存补全价格", () => {
+		const { models } = aggregateAcpModels(SAMPLE_AVAILABLE_MODELS, SAMPLE_CONFIG_OPTIONS);
+		const neon = models.find((m) => m.id === "gemini-4-neon")!;
+		const carbon = models.find((m) => m.id === "gemini-4-carbon")!;
+		const orch = models.find((m) => m.id === "gemini-pro-orchestrator")!;
+		const opus = models.find((m) => m.id === "claude-opus-5-5")!;
+		const gptOss = models.find((m) => m.id === "gpt-oss-120b-medium")!;
+
+		assert.ok(neon.cost.input > 0 && neon.cost.output > 0 && neon.cost.cacheRead > 0);
+		assert.ok(carbon.cost.input > 0 && carbon.cost.output > 0);
+		assert.deepEqual(orch.cost, carbon.cost);
+		assert.ok(opus.cost.input > 0 && opus.cost.output > 0 && opus.cost.cacheWrite > 0);
+		assert.ok(gptOss.cost.input > 0 && gptOss.cost.output > 0);
+
+		// 支持 -thinking 尾缀与 -preview 自动映射，以及未知模型安全回退零费用
+		const claudeThinkingCost = resolveBuiltinModelCost("claude-opus-4-6-thinking");
+		assert.ok(claudeThinkingCost.input > 0 && claudeThinkingCost.output > 0);
+		const gemini31ProCost = resolveBuiltinModelCost("gemini-3.1-pro");
+		assert.ok(gemini31ProCost.input > 0 && gemini31ProCost.output > 0);
+		assert.deepEqual(resolveBuiltinModelCost("unknown-future-model-xyz"), {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+
+		// 种子模型均具备有效价格
+		for (const seed of getSeedModels()) {
+			assert.ok(seed.cost.input > 0 && seed.cost.output > 0, `种子模型 ${seed.id} 应具备非零价格`);
+		}
+
+		// 旧版全零价格缓存读出时必须自动补全非零定价
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-cost-hydrate-"));
+		try {
+			const isolatedEnv: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: tmpRoot };
+			writeCachedCatalog(
+				{
+					version: 1,
+					updatedAt: Date.now(),
+					models: [
+						{
+							...neon,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					],
+					modelEfforts: { "gemini-4-neon": ["low", "medium", "high", "xhigh"] },
+				},
+				isolatedEnv,
+			);
+			const hydrated = readCachedCatalog(isolatedEnv);
+			assert.ok(hydrated);
+			assert.equal(hydrated.models[0].cost.input, neon.cost.input);
+			assert.equal(hydrated.models[0].cost.output, neon.cost.output);
+			assert.equal(hydrated.models[0].cost.cacheRead, neon.cost.cacheRead);
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
 	});
 });

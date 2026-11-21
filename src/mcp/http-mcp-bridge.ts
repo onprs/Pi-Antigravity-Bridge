@@ -53,18 +53,123 @@ interface PendingAnnouncementWaiter {
 	timer: ReturnType<typeof setTimeout>;
 }
 
-/** JSON Schema 清洗：剥离 TypeBox Symbol 及可能触发上游严格解析器异常的非标准顶层元字段 */
+function inferLiteralJsonType(value: unknown): string | undefined {
+	if (typeof value === "string") return "string";
+	if (typeof value === "boolean") return "boolean";
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return Number.isInteger(value) ? "integer" : "number";
+	}
+	if (value === null) return "null";
+	return undefined;
+}
+
+function isPureLiteralSchemaBranch(
+	node: unknown,
+): node is Record<string, unknown> & { const: unknown } {
+	if (!node || typeof node !== "object" || Array.isArray(node)) return false;
+	const rec = node as Record<string, unknown>;
+	if (!("const" in rec)) return false;
+	for (const key of Object.keys(rec)) {
+		if (key !== "const" && key !== "type" && key !== "description" && key !== "title") {
+			return false;
+		}
+	}
+	return true;
+}
+
+function normalizeJsonSchemaNode(node: unknown, depth = 0): unknown {
+	if (depth > 16 || !node || typeof node !== "object") {
+		return node;
+	}
+	if (Array.isArray(node)) {
+		return node.map((item) => normalizeJsonSchemaNode(item, depth + 1));
+	}
+
+	const rec = { ...(node as Record<string, unknown>) };
+	delete rec.$schema;
+
+	// 将 TypeBox Type.Union([Type.Literal(...), ...]) 生成的 anyOf/oneOf 常量联合折叠为标准 type + enum，
+	// 避免 Gemini / AGY MCP 协议转换器丢弃 anyOf 导致枚举参数退化为空对象 {}（如 context_recall 的 part/imageVersion/view）
+	for (const unionKey of ["anyOf", "oneOf"] as const) {
+		const branches = rec[unionKey];
+		if (Array.isArray(branches) && branches.length > 0 && branches.every(isPureLiteralSchemaBranch)) {
+			const values = branches.map((b) => b.const);
+			const inferredTypes = new Set(
+				values
+					.map((v) => inferLiteralJsonType(v))
+					.filter((t): t is string => t !== undefined),
+			);
+			delete rec[unionKey];
+			rec.enum = values;
+			if (!rec.type && inferredTypes.size === 1) {
+				rec.type = Array.from(inferredTypes)[0];
+			} else if (
+				!rec.type &&
+				inferredTypes.size === 2 &&
+				inferredTypes.has("integer") &&
+				inferredTypes.has("number")
+			) {
+				rec.type = "number";
+			}
+			break;
+		}
+	}
+
+	if ("const" in rec && !Array.isArray(rec.enum)) {
+		const val = rec.const;
+		delete rec.const;
+		rec.enum = [val];
+		if (!rec.type) {
+			const inferred = inferLiteralJsonType(val);
+			if (inferred) rec.type = inferred;
+		}
+	}
+
+	if (!rec.type && rec.properties && typeof rec.properties === "object") {
+		rec.type = "object";
+	}
+
+	if (rec.properties && typeof rec.properties === "object" && !Array.isArray(rec.properties)) {
+		const nextProps: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(rec.properties as Record<string, unknown>)) {
+			nextProps[k] = normalizeJsonSchemaNode(v, depth + 1);
+		}
+		rec.properties = nextProps;
+	}
+	if (rec.items && typeof rec.items === "object") {
+		rec.items = normalizeJsonSchemaNode(rec.items, depth + 1);
+	}
+	if (rec.additionalProperties && typeof rec.additionalProperties === "object") {
+		rec.additionalProperties = normalizeJsonSchemaNode(rec.additionalProperties, depth + 1);
+	}
+	for (const compositeKey of ["anyOf", "oneOf", "allOf"] as const) {
+		if (Array.isArray(rec[compositeKey])) {
+			rec[compositeKey] = (rec[compositeKey] as unknown[]).map((b) =>
+				normalizeJsonSchemaNode(b, depth + 1),
+			);
+		}
+	}
+	for (const defsKey of ["$defs", "definitions"] as const) {
+		if (rec[defsKey] && typeof rec[defsKey] === "object" && !Array.isArray(rec[defsKey])) {
+			const nextDefs: Record<string, unknown> = {};
+			for (const [k, v] of Object.entries(rec[defsKey] as Record<string, unknown>)) {
+				nextDefs[k] = normalizeJsonSchemaNode(v, depth + 1);
+			}
+			rec[defsKey] = nextDefs;
+		}
+	}
+	return rec;
+}
+
+/** JSON Schema 清洗：剥离 TypeBox Symbol、非标准顶层元字段并将字面量 anyOf/oneOf 规整为标准 enum */
 export function sanitizeJsonSchemaForMcp(rawSchema: unknown): Record<string, unknown> {
 	try {
-		const cloned = JSON.parse(JSON.stringify(rawSchema ?? { type: "object", properties: {} })) as Record<
-			string,
-			unknown
-		>;
-		delete cloned.$schema;
-		if (!cloned.type && cloned.properties) {
-			cloned.type = "object";
+		const cloned = JSON.parse(JSON.stringify(rawSchema ?? { type: "object", properties: {} }));
+		const normalized = normalizeJsonSchemaNode(cloned);
+		if (normalized && typeof normalized === "object" && !Array.isArray(normalized)) {
+			return normalized as Record<string, unknown>;
 		}
-		return cloned;
+		return { type: "object", properties: {} };
 	} catch {
 		return { type: "object", properties: {} };
 	}
@@ -618,9 +723,13 @@ export class LocalHttpMcpBridge {
 			return;
 		}
 
-		// 1. 对齐宿主工具的参数预处理与 JSON Schema 参数预校验
+		// 1. 对齐宿主工具的参数预处理与 JSON Schema 参数预校验（与 tools/list 暴露的规整 Schema 保持一致）
 		const normalizedArgs = normalizeHostToolArguments(toolName, rawArgs, toolDef);
-		const validation = validateToolArguments(toolName, normalizedArgs, toolDef.parameters);
+		const validation = validateToolArguments(
+			toolName,
+			normalizedArgs,
+			sanitizeJsonSchemaForMcp(toolDef.parameters),
+		);
 		if (!validation.valid) {
 			binding.onRejectedCall?.(toolName);
 			res.writeHead(200);

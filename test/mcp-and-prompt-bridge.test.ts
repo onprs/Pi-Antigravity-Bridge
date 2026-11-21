@@ -9,7 +9,11 @@ import type { SystemMessage, Tool } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildAgySpawnSpec, resolveAgyBinary } from "../src/acp/binary-resolver.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
-import { LocalHttpMcpBridge, type ParkedToolCall } from "../src/mcp/http-mcp-bridge.ts";
+import {
+	LocalHttpMcpBridge,
+	sanitizeJsonSchemaForMcp,
+	type ParkedToolCall,
+} from "../src/mcp/http-mcp-bridge.ts";
 import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
 import { validateToolArguments } from "../src/mcp/schema-validator.ts";
 import { buildInlineStdioShimCommand } from "../src/mcp/stdio-shim.ts";
@@ -715,6 +719,94 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 				}
 			}
 			await bridge.dispose();
+		}
+	});
+
+	it("适配 pi-traffic-optimization：规整 context_recall 的 TypeBox 字面量 anyOf 为标准 enum，并在纯净模式注入 ctx:// 召回指引", () => {
+		const recallRawSchema = {
+			$schema: "http://json-schema.org/draft-07/schema#",
+			type: "object",
+			properties: {
+				id: { type: "string" },
+				part: {
+					anyOf: [
+						{ const: "content", type: "string" },
+						{ const: "arguments", type: "string" },
+						{ const: "structured", type: "string" },
+					],
+				},
+				imageVersion: {
+					anyOf: [{ const: "optimized" }, { const: "original" }],
+				},
+				view: {
+					anyOf: [{ const: "snapshot" }, { const: "current" }, { const: "diff" }],
+				},
+				fixedVersion: { const: 1 },
+				mixedUnion: {
+					anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+				},
+			},
+		};
+
+		const sanitized = sanitizeJsonSchemaForMcp(recallRawSchema) as {
+			$schema?: unknown;
+			properties: Record<string, Record<string, unknown>>;
+		};
+		assert.equal(sanitized.$schema, undefined);
+		assert.deepEqual(sanitized.properties.part, {
+			type: "string",
+			enum: ["content", "arguments", "structured"],
+		});
+		assert.deepEqual(sanitized.properties.imageVersion, {
+			type: "string",
+			enum: ["optimized", "original"],
+		});
+		assert.deepEqual(sanitized.properties.view, {
+			type: "string",
+			enum: ["snapshot", "current", "diff"],
+		});
+		assert.deepEqual(sanitized.properties.fixedVersion, {
+			type: "integer",
+			enum: [1],
+		});
+		// 非字面量联合必须完整保留 anyOf，绝不破坏普通复合类型
+		assert.ok(Array.isArray(sanitized.properties.mixedUnion.anyOf));
+
+		// 规整后的 Schema 预校验必须放行合法枚举并拦截非法值
+		assert.equal(
+			validateToolArguments("context_recall", { id: "ctx://tool/abc", view: "diff", part: "content" }, sanitized).valid,
+			true,
+		);
+		const invalidView = validateToolArguments("context_recall", { view: "invalid_mode" }, sanitized);
+		assert.equal(invalidView.valid, false);
+		assert.ok(invalidView.formattedError?.includes('"diff"'));
+
+		// 验证 pi-tools 纯净模式下包含 context_recall 时，会在用户上下文 <tool_guidelines> 中附带 ctx:// 优先召回指引
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-traffic-opt-guide-"));
+		try {
+			const cfg: BridgeConfig = {
+				...DEFAULT_BRIDGE_CONFIG,
+				toolMode: "pi-tools",
+				geminiDir: path.join(tmpRoot, ".gemini"),
+			};
+			const sysMsg: SystemMessage = {
+				role: "system",
+				content: "",
+				timestamp: 1,
+				toolsAdded: [
+					{ name: "read", description: "Read", parameters: { type: "object", properties: {} } as never },
+					{
+						name: "context_recall",
+						description: "Recall archived context",
+						parameters: recallRawSchema as never,
+					},
+				],
+			};
+			const mount = prepareCustomizationMount([sysMsg], cfg, tmpRoot);
+			assert.ok(mount.workspaceContextBlock?.includes("ctx://"));
+			assert.ok(mount.workspaceContextBlock?.includes("context_recall"));
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
 });

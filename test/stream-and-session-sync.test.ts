@@ -25,6 +25,7 @@ import {
 	buildFreshReplayPromptBlocks,
 	computeTranscriptDigest,
 	extractAuxiliaryTaskInstructions,
+	inspectTrafficOptProjectionState,
 	isAuxiliarySingleTurnRequest,
 } from "../src/session/reconcile.ts";
 import {
@@ -153,6 +154,23 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 		assert.equal(finalUsage.cacheRead, 800);
 		assert.equal(finalUsage.reasoning, 150);
 		assert.equal(finalUsage.totalTokens, 2350);
+
+		// 验证带真实定价的模型在 finishWithToolUse 与 finishTurn 时自动计算 usage.cost
+		const pricedModel = {
+			...mockModel,
+			cost: { input: 3, output: 15, cacheRead: 0.15, cacheWrite: 0 },
+		};
+		const pricedWriter = new StepStreamWriter(pricedModel);
+		pricedWriter.appendTextDelta("Costed reply");
+		pricedWriter.finishTurn("end_turn", {
+			inputTokens: 1_000_000,
+			outputTokens: 100_000,
+			cachedReadTokens: 2_000_000,
+		});
+		assert.ok(Math.abs(pricedWriter.message.usage.cost.input - 3) < 1e-6);
+		assert.ok(Math.abs(pricedWriter.message.usage.cost.output - 1.5) < 1e-6);
+		assert.ok(Math.abs(pricedWriter.message.usage.cost.cacheRead - 0.3) < 1e-6);
+		assert.ok(Math.abs(pricedWriter.message.usage.cost.total - 4.8) < 1e-6);
 	});
 });
 
@@ -473,5 +491,99 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
+	});
+
+	it("适配 pi-traffic-optimization：图片压缩与归档占位符保持结构摘要恒定、精准统计投影指纹且重放不裁切 ctx:// 句柄", () => {
+		const hash64 = "a".repeat(64);
+		const imgHash64 = "b".repeat(64);
+
+		const rawUserPng: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "看看这张截图" },
+				{ type: "image", data: "RAW_PNG_DATA", mimeType: "image/png" },
+			],
+			timestamp: 1,
+		};
+		const compressedUserWebp: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "看看这张截图" },
+				{ type: "image", data: "SMALL_WEBP_DATA", mimeType: "image/webp" },
+			],
+			timestamp: 1,
+		};
+		const projectedUserImg: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "看看这张截图" },
+				{
+					type: "text",
+					text: `[已归档图片 ctx://image/${imgHash64}] 1920x1080 image/webp optimized_bytes=12345 source=user；context_recall({id:"ctx://image/${imgHash64}"}) 可重新查看。`,
+				},
+			],
+			timestamp: 1,
+		};
+
+		// 原始 PNG、WebP 压缩图与归档占位符在结构摘要上必须 100% 恒定，确保 turn_end 锚点跨重启与开关切换精准命中
+		const digestRaw = computeTranscriptDigest([rawUserPng]);
+		assert.equal(computeTranscriptDigest([compressedUserWebp]), digestRaw);
+		assert.equal(computeTranscriptDigest([projectedUserImg]), digestRaw);
+
+		const longPlaceholder = `[已归档 ctx://tool/${hash64}]\n${JSON.stringify({
+			tool: "read",
+			call: "call-1",
+			preview: "x".repeat(5000),
+		})}\n这是历史结果。精确取回：context_recall({id:"ctx://tool/${hash64}"})；query/offset/limit 可局部取回。`;
+
+		const assistantStep: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "big.ts" } }],
+			api: "antigravity-acp",
+			provider: "antigravity",
+			model: "gemini-4-neon",
+			usage: {
+				input: 100,
+				output: 20,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 120,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		const projectedToolRes = {
+			role: "toolResult" as const,
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text" as const, text: longPlaceholder }],
+			isError: false,
+			timestamp: 3,
+		};
+		const followUser: UserMessage = { role: "user", content: "继续分析", timestamp: 4 };
+
+		const projState = inspectTrafficOptProjectionState([
+			projectedUserImg,
+			assistantStep,
+			projectedToolRes,
+			followUser,
+		]);
+		assert.equal(projState.archivedCount, 2);
+		assert.ok(projState.projectionDigest.length === 64);
+
+		// FreshReplay 必须完整保留超长 ctx:// 归档占位符末尾的 context_recall 指引，绝不截断破坏句柄
+		const replayBlocks = buildFreshReplayPromptBlocks([
+			projectedUserImg,
+			assistantStep,
+			projectedToolRes,
+			followUser,
+		]);
+		const mergedReplayText = replayBlocks
+			.filter((b): b is { type: "text"; text: string } => b.type === "text")
+			.map((b) => b.text)
+			.join("\n");
+		assert.ok(mergedReplayText.includes(`context_recall({id:"ctx://tool/${hash64}"})`));
+		assert.ok(!mergedReplayText.includes("[tool output truncated in replay]"));
 	});
 });

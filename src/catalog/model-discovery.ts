@@ -1,6 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
+import {
+	type BuiltinProvider,
+	getBuiltinModels,
+	getBuiltinProviders,
+} from "@earendil-works/pi-ai/providers/all";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 export type ChatModelConfig = Extract<ProviderModelConfig, { reasoning: boolean }>;
@@ -32,6 +37,143 @@ const EFFORT_ORDER: readonly EffortSuffix[] = [
 	"xhigh",
 	"max",
 ];
+
+const ZERO_MODEL_COST: ChatModelConfig["cost"] = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+};
+
+/** 从 Pi 内置官方目录查找参考定价时的 Provider 优先级（优先官方直连定价，规避区域溢价与批量折扣条目） */
+const PRICING_PROVIDER_PRIORITY: readonly string[] = [
+	"google",
+	"anthropic",
+	"google-vertex",
+	"openai",
+	"radius",
+	"groq",
+	"together",
+	"openrouter",
+];
+
+let cachedBuiltinCostIndex: Map<string, ChatModelConfig["cost"]> | undefined;
+
+function cloneModelCost(cost: ChatModelConfig["cost"]): ChatModelConfig["cost"] {
+	return {
+		input: cost.input,
+		output: cost.output,
+		cacheRead: cost.cacheRead,
+		cacheWrite: cost.cacheWrite,
+		...(cost.tiers && cost.tiers.length > 0
+			? { tiers: cost.tiers.map((tier) => ({ ...tier })) }
+			: {}),
+	};
+}
+
+function hasNonZeroModelCost(cost: ChatModelConfig["cost"] | undefined): boolean {
+	if (!cost) return false;
+	return cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0;
+}
+
+function getBuiltinCostIndex(): Map<string, ChatModelConfig["cost"]> {
+	if (cachedBuiltinCostIndex) {
+		return cachedBuiltinCostIndex;
+	}
+	const index = new Map<string, ChatModelConfig["cost"]>();
+	try {
+		const availableProviders = new Set<string>(getBuiltinProviders());
+		for (const provider of PRICING_PROVIDER_PRIORITY) {
+			if (!availableProviders.has(provider)) continue;
+			const models = getBuiltinModels(provider as BuiltinProvider);
+			for (const m of models) {
+				const rawId = m.id.toLowerCase();
+				if (rawId.includes(":batch") || rawId.endsWith("-batch")) continue;
+				if (!hasNonZeroModelCost(m.cost)) continue;
+				if (!index.has(rawId)) {
+					index.set(rawId, m.cost);
+				}
+				const slashIdx = rawId.lastIndexOf("/");
+				if (slashIdx !== -1 && slashIdx < rawId.length - 1) {
+					const bareId = rawId.slice(slashIdx + 1);
+					if (!index.has(bareId)) {
+						index.set(bareId, m.cost);
+					}
+				}
+			}
+		}
+	} catch {
+		// 若上游 pi-ai 目录结构变化则安全回退至零费用，绝不阻塞模型注册
+	}
+	cachedBuiltinCostIndex = index;
+	return index;
+}
+
+function buildPricingLookupCandidates(modelId: string, displayName?: string): string[] {
+	const candidates: string[] = [];
+	const push = (id: string) => {
+		const normalized = id.trim().toLowerCase();
+		if (normalized && !candidates.includes(normalized)) {
+			candidates.push(normalized);
+		}
+	};
+
+	const raw = modelId.trim().toLowerCase();
+	const bases: string[] = [raw];
+
+	// 去除 -thinking 尾缀（如 claude-opus-4-6-thinking -> claude-opus-4-6）
+	if (raw.endsWith("-thinking") && raw.length > "-thinking".length) {
+		bases.push(raw.slice(0, -"-thinking".length));
+	}
+	// 去除固定单档位后缀（如 gpt-oss-120b-medium -> gpt-oss-120b）
+	const effortSplit = splitEffortSuffix(raw);
+	if (effortSplit) {
+		bases.push(effortSplit.baseId);
+	}
+
+	for (const base of bases) {
+		push(base);
+		// 点号/连字符版本互转（如 claude-sonnet-4.6 <-> claude-sonnet-4-6）
+		const dashedVer = base.replace(/(\d)\.(\d)/g, "$1-$2");
+		const dottedVer = base.replace(/-(\d+)-(\d+)(?=$|-)/g, "-$1.$2");
+		push(dashedVer);
+		push(dottedVer);
+		if (!base.endsWith("-preview")) {
+			push(`${base}-preview`);
+		}
+	}
+
+	// Antigravity Orchestrator 封装项按底层对应代号匹配 Gemini 4 同级参考定价
+	if (raw.includes("orchestrator")) {
+		const hint = `${raw} ${(displayName ?? "").toLowerCase()}`;
+		const flavorMatch = hint.match(/\b(neon|carbon|argon|hydrogen)\b/);
+		if (flavorMatch) {
+			push(`gemini-4-${flavorMatch[1]}`);
+		} else {
+			push("gemini-4-carbon");
+		}
+	}
+
+	return candidates;
+}
+
+/**
+ * 从 Pi 内置模型目录动态解析 Antigravity 模型对应的官方参考定价（美元/百万 Token，含缓存读写与阶梯价）。
+ * 订阅制账号在 Pi 状态栏中会自动附加 `(sub)` 标记，并支持 `/model`、`/usage` 与缓存浪费统计展示。
+ */
+export function resolveBuiltinModelCost(
+	modelId: string,
+	displayName?: string,
+): ChatModelConfig["cost"] {
+	const index = getBuiltinCostIndex();
+	for (const key of buildPricingLookupCandidates(modelId, displayName)) {
+		const matched = index.get(key);
+		if (matched) {
+			return cloneModelCost(matched);
+		}
+	}
+	return cloneModelCost(ZERO_MODEL_COST);
+}
 
 export interface DiscoveredCatalogSnapshot {
 	version: 1;
@@ -151,12 +293,7 @@ function makeChatModelConfig(
 		reasoning: hasReasoning,
 		thinkingLevelMap: hasReasoning ? buildThinkingLevelMap(efforts) : undefined,
 		input: specs.supportsImage ? ["text", "image"] : ["text"],
-		cost: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-		},
+		cost: resolveBuiltinModelCost(id, name),
 		contextWindow: specs.contextWindow,
 		maxTokens: specs.maxTokens,
 	};
@@ -289,9 +426,10 @@ export function readCachedCatalog(env: NodeJS.ProcessEnv = process.env): Discove
 		if (!fs.existsSync(cachePath)) return undefined;
 		const raw = JSON.parse(fs.readFileSync(cachePath, "utf8")) as DiscoveredCatalogSnapshot;
 		if (raw?.version === 1 && Array.isArray(raw.models) && raw.models.length > 0) {
-			// 应用最新观测到的窗口校准
+			// 应用最新观测到的窗口校准，并为旧版零费用缓存自动补全 Pi 内置目录参考定价
 			const calibrated = raw.models.map((m) => ({
 				...m,
+				cost: hasNonZeroModelCost(m.cost) ? m.cost : resolveBuiltinModelCost(m.id, m.name),
 				contextWindow: getObservedContextWindow(m.id) ?? m.contextWindow,
 			}));
 			return { ...raw, models: calibrated };

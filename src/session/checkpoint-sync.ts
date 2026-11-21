@@ -35,6 +35,10 @@ export interface AgySessionAnchor {
 	toolsDigest: string;
 	/** 是否为通过 `/agy sessions` 刚导入尚未经历首轮请求对齐的原始会话锚点 */
 	importedRaw?: boolean;
+	/** 可选：该 AGY 会话实际承载的 `pi-traffic-optimization` 归档投影指纹 */
+	projectionDigest?: string;
+	/** 可选：该 AGY 会话实际承载的 `pi-traffic-optimization` 归档占位符总数 */
+	projectedCount?: number;
 	/** 可选的本地 SQLite 会话数据库检查点水位 */
 	dbCheckpoint?: SqliteDbCheckpoint;
 }

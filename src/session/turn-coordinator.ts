@@ -75,7 +75,9 @@ import {
 	convertUserMessagesToPromptBlocks,
 	extractAuxiliaryTaskInstructions,
 	extractVisibleMessages,
+	inspectTrafficOptProjectionState,
 	isAuxiliarySingleTurnRequest,
+	type TrafficOptProjectionState,
 } from "./reconcile.ts";
 
 type PumpQueueItem =
@@ -184,6 +186,9 @@ interface ManagedSessionLedger {
 	appliedExecMode?: string;
 	syncedMessageCount: number;
 	syncedTranscriptDigest: string;
+	/** 当前 AGY 会话实际承载的 `pi-traffic-optimization` 归档投影指纹与计数 */
+	syncedProjectionDigest: string;
+	syncedProjectedCount: number;
 	usedTokens?: number;
 	windowSize?: number;
 	/** 当前会话已进入后端 Prompt Cache 的前缀 Token 水位（供无本地库回退路径估算缓存命中率） */
@@ -208,6 +213,33 @@ interface ManagedSessionLedger {
 }
 
 const DEFAULT_SESSION_KEY = "__default_pi_session__";
+
+/**
+ * 判断是否应因 `pi-traffic-optimization` 归档投影状态变更而按需重建瘦身后的 AGY 会话：
+ * - 非 GC 轮次（投影指纹一致或无新归档）严格返回 `false`，零打扰热缓存；
+ * - 发生批量 GC 归档（新增归档 >= 4 项，或已用窗口 >= 32k 且有新增归档）时返回 `true`，让 AGY 真实释放旧工具输出与旧图片上下文；
+ * - 用户关闭 `/traffic-opt` 恢复完整上下文（原会话承载归档占位符且现已全部恢复原文）时返回 `true`，重建完整上下文。
+ */
+function shouldRebuildForProjectionSync(
+	syncedDigest: string,
+	syncedCount: number,
+	current: TrafficOptProjectionState,
+	usedTokens?: number,
+): boolean {
+	if (current.projectionDigest === syncedDigest) {
+		return false;
+	}
+	const delta = current.archivedCount - syncedCount;
+	if (delta > 0) {
+		if (delta >= 4) return true;
+		if (typeof usedTokens === "number" && usedTokens >= 32_000) return true;
+		return false;
+	}
+	if (syncedCount > 0 && current.archivedCount === 0) {
+		return true;
+	}
+	return false;
+}
 
 /**
  * 双模会话与流式推理总协调器。
@@ -365,6 +397,12 @@ export class TurnCoordinator {
 			messageCount: ledger.syncedMessageCount,
 			mountDigest: ledger.mountDigest,
 			toolsDigest: ledger.toolsDigest,
+			...(ledger.syncedProjectedCount > 0
+				? {
+						projectionDigest: ledger.syncedProjectionDigest,
+						projectedCount: ledger.syncedProjectedCount,
+					}
+				: {}),
 			dbCheckpoint,
 		};
 
@@ -414,10 +452,7 @@ export class TurnCoordinator {
 		this.abortLedgerTurnNonBlocking(ledger);
 	}
 
-	private abortLedgerTurnNonBlocking(
-		ledger: ManagedSessionLedger,
-		preserveSlicePool = false,
-	): void {
+	private abortLedgerTurnNonBlocking(ledger: ManagedSessionLedger): void {
 		this.httpMcpBridge.markSessionTurnCancelled(ledger.agySessionId);
 		this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "Aborted");
 		for (const [, parked] of ledger.parkedCalls) {
@@ -427,9 +462,7 @@ export class TurnCoordinator {
 			});
 		}
 		ledger.parkedCalls.clear();
-		if (!preserveSlicePool) {
-			ledger.pendingGenSlicePool = undefined;
-		}
+		ledger.pendingGenSlicePool = undefined;
 		if (ledger.activePump) {
 			ledger.activePump.finished = true;
 		}
@@ -755,7 +788,7 @@ export class TurnCoordinator {
 			if (existing.activePump) {
 				const { trailingUsers } = this.collectRecentToolResultsAndSteeringUsers(visibleMessages);
 				if (trailingUsers.length > 0) {
-					this.abortLedgerTurnNonBlocking(existing, true);
+					this.abortLedgerTurnNonBlocking(existing);
 					const idleOk = await this.waitForInFlightPrompt(existing, 2_500, options?.signal);
 					if (!idleOk) {
 						if (options?.signal?.aborted) {
@@ -799,6 +832,7 @@ export class TurnCoordinator {
 		const mountInfo = prepareCustomizationMount(context.messages, this.currentConfig, cwd);
 
 		// 2c. 连续正常追问：先确认上一轮在途请求已完全收敛；若底层卡死则自动驱逐重建，否则直接复用会话与缓存
+		let skipAnchorRestoreForProjectionSync = false;
 		const idleCandidate = this.ledgers.get(piSessionKey);
 		if (
 			idleCandidate &&
@@ -819,26 +853,20 @@ export class TurnCoordinator {
 					visibleMessages,
 				);
 				if (continuationPrompts) {
-					if (idleCandidate.toolsDigest === toolsDigest) {
-						await this.executePromptOnLedger(
-							idleCandidate,
-							continuationPrompts,
-							visibleMessages,
-							writer,
-							model,
-							options,
-						);
-						return;
-					}
-
-					// 跨轮次仅动态工具集合变化：优先通过活跃 SSE 或原地 session/resume 重拉 tools/list，零历史丢失
-					const syncedTools = await this.syncLedgerToolsBetweenTurns(
-						idleCandidate,
-						hostMcpTools,
-						toolsDigest,
-						options?.signal,
+					const prefixProjection = inspectTrafficOptProjectionState(
+						visibleMessages.slice(0, idleCandidate.syncedMessageCount),
 					);
-					if (syncedTools) {
+					if (
+						shouldRebuildForProjectionSync(
+							idleCandidate.syncedProjectionDigest,
+							idleCandidate.syncedProjectedCount,
+							prefixProjection,
+							idleCandidate.usedTokens,
+						)
+					) {
+						// pi-traffic-optimization 触发批量 GC（或用户关闭优化恢复原文）：在空闲轮次边界重建瘦身/还原后的新 AGY 会话
+						skipAnchorRestoreForProjectionSync = true;
+					} else if (idleCandidate.toolsDigest === toolsDigest) {
 						await this.executePromptOnLedger(
 							idleCandidate,
 							continuationPrompts,
@@ -848,12 +876,31 @@ export class TurnCoordinator {
 							options,
 						);
 						return;
+					} else {
+						// 跨轮次仅动态工具集合变化：优先通过活跃 SSE 或原地 session/resume 重拉 tools/list，零历史丢失
+						const syncedTools = await this.syncLedgerToolsBetweenTurns(
+							idleCandidate,
+							hostMcpTools,
+							toolsDigest,
+							options?.signal,
+						);
+						if (syncedTools) {
+							await this.executePromptOnLedger(
+								idleCandidate,
+								continuationPrompts,
+								visibleMessages,
+								writer,
+								model,
+								options,
+							);
+							return;
+						}
 					}
 				}
 			}
 		}
 
-		// 3. 会话不存在、工具集/模式变更或历史分支偏离：安全拆解旧会话并按三级状态机重建/恢复
+		// 3. 会话不存在、工具集/模式变更、归档投影瘦身或历史分支偏离：安全拆解旧会话并按三级状态机重建/恢复
 		const stillExisting = this.ledgers.get(piSessionKey);
 		if (stillExisting) {
 			const settled = await this.waitForInFlightPrompt(stillExisting, 1_500, options?.signal);
@@ -875,6 +922,7 @@ export class TurnCoordinator {
 			mountDigest: mountInfo.mountDigest,
 			additionalDirectories: mountInfo.additionalDirectories,
 			workspaceContextBlock: mountInfo.workspaceContextBlock,
+			skipAnchorRestore: skipAnchorRestoreForProjectionSync,
 			signal: options?.signal,
 		});
 
@@ -1260,7 +1308,7 @@ export class TurnCoordinator {
 			} finally {
 				ledger.steeringCutInPending = false;
 			}
-			this.abortLedgerTurnNonBlocking(ledger, true);
+			this.abortLedgerTurnNonBlocking(ledger);
 			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 			if (!idleOk) {
 				if (options?.signal?.aborted) {
@@ -1332,7 +1380,7 @@ export class TurnCoordinator {
 			} finally {
 				ledger.steeringCutInPending = false;
 			}
-			this.abortLedgerTurnNonBlocking(ledger, true);
+			this.abortLedgerTurnNonBlocking(ledger);
 			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 			if (idleOk) {
 				const reloaded = await this.reloadLedgerSessionForTools(
@@ -1414,6 +1462,7 @@ export class TurnCoordinator {
 		mountDigest: string;
 		additionalDirectories: string[];
 		workspaceContextBlock?: string;
+		skipAnchorRestore?: boolean;
 		signal?: AbortSignal;
 	}): Promise<{ ledger: ManagedSessionLedger; initialPromptBlocks: AcpPromptBlock[] }> {
 		const conn = await this.processManager.acquire(
@@ -1515,9 +1564,10 @@ export class TurnCoordinator {
 			.slice(tailStartIdx)
 			.filter((m): m is UserMessage => m.role === "user");
 
+		const priorProjection = inspectTrafficOptProjectionState(priorHistory);
 		const branchEntries = this.activeContext?.sessionManager?.getBranch?.() ?? [];
 		const anchorMatch =
-			priorHistory.length > 0 && pendingUserMessages.length > 0
+			!params.skipAnchorRestore && priorHistory.length > 0 && pendingUserMessages.length > 0
 				? findBranchAnchorForHistory({
 						branchEntries,
 						priorMessages: priorHistory,
@@ -1532,9 +1582,19 @@ export class TurnCoordinator {
 
 		let sessionInfo: AcpSessionNewResult | undefined;
 		let initialPromptBlocks: AcpPromptBlock[] | undefined;
+		let syncedProjectionDigest = priorProjection.projectionDigest;
+		let syncedProjectedCount = priorProjection.archivedCount;
 
-		// 路径 1：精确命中分支末尾锚点 -> 调用 session/resume 零历史回放开销恢复
-		if (anchorMatch.kind === "exact" && conn.capabilities?.sessionCapabilities?.resume) {
+		// 路径 1：精确命中分支末尾锚点且未发生需同步的新一轮归档 GC -> 调用 session/resume 零历史回放开销恢复
+		if (
+			anchorMatch.kind === "exact" &&
+			conn.capabilities?.sessionCapabilities?.resume &&
+			!shouldRebuildForProjectionSync(
+				anchorMatch.anchor.projectionDigest ?? "",
+				anchorMatch.anchor.projectedCount ?? 0,
+				priorProjection,
+			)
+		) {
 			try {
 				sessionInfo = await conn.request<AcpSessionResumeResult>(
 					"session/resume",
@@ -1547,42 +1607,64 @@ export class TurnCoordinator {
 					{ timeoutMs: 20_000, signal: params.signal },
 				);
 				initialPromptBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
+				syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+				syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
 			} catch {
 				sessionInfo = undefined;
 			}
 		}
 
-		// 路径 2：命中历史中间锚点 -> 只读 VACUUM INTO 快照分叉截断 + session/resume
+		// 路径 2：命中历史中间锚点且锚点前缀未落后于新一轮归档 GC -> 只读 VACUUM INTO 快照分叉截断 + session/resume
 		if (
 			!sessionInfo &&
 			anchorMatch.kind === "forkable" &&
 			anchorMatch.anchor.dbCheckpoint &&
 			conn.capabilities?.sessionCapabilities?.resume
 		) {
-			const forkedId = await forkSqliteConversationAtCheckpoint(
-				this.currentConfig,
-				anchorMatch.anchor.agySessionId,
-				anchorMatch.anchor.dbCheckpoint,
+			const forkPrefixProjection = inspectTrafficOptProjectionState(
+				priorHistory.slice(0, anchorMatch.anchor.messageCount),
 			);
-			if (forkedId) {
-				try {
-					sessionInfo = await conn.request<AcpSessionResumeResult>(
-						"session/resume",
-						{
-							sessionId: forkedId,
-							cwd: params.cwd,
-							mcpServers,
-							additionalDirectories: addDirs,
-						},
-						{ timeoutMs: 20_000, signal: params.signal },
-					);
-					const remainingAfterFork = params.visibleMessages.slice(
-						anchorMatch.anchor.messageCount,
-					);
-					initialPromptBlocks = buildFreshReplayPromptBlocks(remainingAfterFork);
-				} catch {
-					sessionInfo = undefined;
-					removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+			const forkStaleByProjection = shouldRebuildForProjectionSync(
+				anchorMatch.anchor.projectionDigest ?? "",
+				anchorMatch.anchor.projectedCount ?? 0,
+				forkPrefixProjection,
+			);
+			if (!forkStaleByProjection) {
+				const forkedId = await forkSqliteConversationAtCheckpoint(
+					this.currentConfig,
+					anchorMatch.anchor.agySessionId,
+					anchorMatch.anchor.dbCheckpoint,
+				);
+				if (forkedId) {
+					try {
+						sessionInfo = await conn.request<AcpSessionResumeResult>(
+							"session/resume",
+							{
+								sessionId: forkedId,
+								cwd: params.cwd,
+								mcpServers,
+								additionalDirectories: addDirs,
+							},
+							{ timeoutMs: 20_000, signal: params.signal },
+						);
+						const remainingAfterFork = params.visibleMessages.slice(
+							anchorMatch.anchor.messageCount,
+						);
+						initialPromptBlocks = buildFreshReplayPromptBlocks(remainingAfterFork);
+						if (
+							forkPrefixProjection.projectionDigest ===
+							(anchorMatch.anchor.projectionDigest ?? "")
+						) {
+							syncedProjectionDigest = priorProjection.projectionDigest;
+							syncedProjectedCount = priorProjection.archivedCount;
+						} else {
+							syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+							syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+						}
+					} catch {
+						sessionInfo = undefined;
+						removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+					}
 				}
 			}
 		}
@@ -1609,6 +1691,8 @@ export class TurnCoordinator {
 			initialPromptBlocks = params.workspaceContextBlock
 				? [{ type: "text", text: params.workspaceContextBlock }, ...replayBlocks]
 				: replayBlocks;
+			syncedProjectionDigest = priorProjection.projectionDigest;
+			syncedProjectedCount = priorProjection.archivedCount;
 		}
 
 		conn.trackSession(sessionInfo.sessionId);
@@ -1643,6 +1727,8 @@ export class TurnCoordinator {
 			availableModels: sessionInfo.models?.availableModels ?? [],
 			syncedMessageCount: priorHistory.length,
 			syncedTranscriptDigest: computeTranscriptDigest(priorHistory),
+			syncedProjectionDigest,
+			syncedProjectedCount,
 			cachedPrefixTokens: 0,
 			lastConsumedStepIdx: initialMaxStepIdx,
 			tier,
@@ -2074,7 +2160,10 @@ export class TurnCoordinator {
 				) {
 					const raw = convertAcpUsageToPiUsage(item.response.usage);
 					const rawPromptTotal = raw.input + raw.cacheRead + raw.cacheWrite;
-					if (rawPromptTotal > 0 && raw.cacheRead > 0) {
+					if (
+						rawPromptTotal > 0 &&
+						(pump.intermediateStepCount === 0 || !pump.hasSqliteGenTelemetry)
+					) {
 						ledger.lastObservedCacheRatio = Math.min(
 							1,
 							Math.max(0, raw.cacheRead / rawPromptTotal),
@@ -2087,6 +2176,7 @@ export class TurnCoordinator {
 						if (writer.estimatedOutputTokens > 0) {
 							writer.appendTextDelta("\n\n");
 						}
+						ledger.pendingGenSlicePool = undefined;
 						pump.accountedOutputTokens = 0;
 						pump.intermediateStepCount = 0;
 						pump.lastAccountedWindowUsed = undefined;
@@ -2150,20 +2240,30 @@ export class TurnCoordinator {
 
 	/**
 	 * 为多步工具调用循环中的单个中间 `toolUse` 步构建精确归因 `Usage`：
-	 * 1. 优先从会话只读 SQLite `steps.metadata` 与 `step_payload`（`step_type = 15`）直接提取上游逐次生成明细与该次生成的工具总数；
-	 * 2. 若单次模型生成包含多个顺序执行的工具调用，按精确整数守恒池向后续子步预留等比例切片（`<= 1000` Token），使每一步均具备有效提示词与真实命中率，彻底消除 UI 状态栏缓存命中率闪烁消失且保证累计 Token 100% 守恒；
-	 * 3. 在无本地库的环境下平滑回退至窗口差分估算。
+	 * 1. 优先从会话只读 SQLite `steps.metadata` 与 `step_payload`（`step_type = 15`）提取当前最新一次生成的上游明细与工具总数（非切片路径带短 WAL 重试，避免大 WAL 锁竞争误落回退）；
+	 * 2. 若单次模型生成包含多个顺序执行的工具调用，按整数守恒池向后续子步预留等比例切片（单切片 `<= 1000`、总预留控制 `<= 1000`），保持缓存命中率稳定、累计守恒且降低对 Pi `cache-stats` 的干扰；
+	 * 3. 在无本地库的环境下仅依据真实观测到的上游命中率（含 `0%` 未命中）平滑回退，绝不凭空伪造命中率。
 	 */
 	private async buildIntermediateStepUsage(
 		ledger: ManagedSessionLedger,
 		pump: ActiveTurnPump,
 		writer: StepStreamWriter,
 	): Promise<Usage> {
-		const dbGens = await readSqliteGenerationUsagesSince(
-			this.currentConfig,
-			ledger.agySessionId,
-			ledger.lastConsumedStepIdx,
-		);
+		const hasPendingSlices =
+			ledger.pendingGenSlicePool !== undefined &&
+			ledger.pendingGenSlicePool.remainingSlices > 0;
+		const dbGens = hasPendingSlices
+			? await readSqliteGenerationUsagesSince(
+					this.currentConfig,
+					ledger.agySessionId,
+					ledger.lastConsumedStepIdx,
+				)
+			: await readSqliteGenerationUsagesSinceWithRetry(
+					this.currentConfig,
+					ledger.agySessionId,
+					ledger.lastConsumedStepIdx,
+					[20, 40],
+				);
 
 		const liveWindowUsed =
 			typeof ledger.usedTokens === "number" && ledger.usedTokens > 0
@@ -2171,55 +2271,34 @@ export class TurnCoordinator {
 				: 0;
 
 		if (dbGens.length > 0) {
-			const carry = this.drainPendingSlicePool(ledger);
-			const gensToAccount =
-				!pump.hasSqliteGenTelemetry && pump.intermediateStepCount > 0
-					? [dbGens[dbGens.length - 1]]
-					: dbGens;
+			// 新生成已落盘，丢弃上一生成未耗尽的旧切片池，绝不跨生成混算污染当次缓存命中率
+			ledger.pendingGenSlicePool = undefined;
 			pump.hasSqliteGenTelemetry = true;
 			pump.intermediateStepCount++;
 			if (liveWindowUsed > 0) {
 				pump.lastAccountedWindowUsed = liveWindowUsed;
 			}
-			ledger.lastConsumedStepIdx = dbGens[dbGens.length - 1].stepIdx;
 
-			let genInput = 0;
-			let genOutput = 0;
-			let genCacheWrite = 0;
-			let genCacheRead = 0;
-			let thoughtSum = 0;
-			let hasThought = false;
-			for (const g of gensToAccount) {
-				genInput += g.inputTokens;
-				genOutput += g.outputTokens;
-				genCacheWrite += g.cacheWriteTokens;
-				genCacheRead += g.cacheReadTokens;
-				if (g.thoughtTokens !== undefined) {
-					hasThought = true;
-					thoughtSum += g.thoughtTokens;
-				}
-			}
+			// 始终以最新一条真实生成作为本步归因，避免多行叠加混算导致虚假均值命中率
+			const lastGen = dbGens[dbGens.length - 1];
+			ledger.lastConsumedStepIdx = lastGen.stepIdx;
+
+			const genInput = lastGen.inputTokens;
+			const genOutput = lastGen.outputTokens;
+			const genCacheWrite = lastGen.cacheWriteTokens;
+			const genCacheRead = lastGen.cacheReadTokens;
+			const hasThought = lastGen.thoughtTokens !== undefined;
+			const thoughtSum = lastGen.thoughtTokens ?? 0;
 
 			const genPromptSum = genInput + genCacheRead + genCacheWrite;
-			if (genPromptSum > 0 && genCacheRead > 0) {
+			if (genPromptSum > 0) {
 				ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, genCacheRead / genPromptSum));
 			}
-			// 多条 SQLite 生成并入单步时，上下文窗口基数取最新一条生成的窗口值，杜绝无 usage_update 时窗口翻倍误触发压缩
-			const lastGen = gensToAccount[gensToAccount.length - 1];
-			const latestGenWindowTotal =
-				lastGen.inputTokens +
-				lastGen.cacheReadTokens +
-				lastGen.cacheWriteTokens +
-				lastGen.outputTokens;
+
+			const latestGenWindowTotal = genPromptSum + genOutput;
 			const effectiveWindow = liveWindowUsed > 0 ? liveWindowUsed : latestGenWindowTotal;
 			pump.accountedOutputTokens += genOutput;
 			ledger.cachedPrefixTokens = Math.max(ledger.cachedPrefixTokens, effectiveWindow);
-
-			const totalIn = genInput + carry.input;
-			const totalCr = genCacheRead + carry.cacheRead;
-			const totalCw = genCacheWrite + carry.cacheWrite;
-			const totalOut = genOutput + carry.output;
-			const totalPrompt = totalIn + totalCr + totalCw;
 
 			const emittedToolCount = Math.max(
 				1,
@@ -2228,20 +2307,29 @@ export class TurnCoordinator {
 			const plannedTools = lastGen.plannedToolCalls ?? 1;
 			const remainingSlices = Math.max(0, plannedTools - emittedToolCount);
 
-			if (remainingSlices > 0 && totalPrompt >= (remainingSlices + 1) * 20) {
-				const sliceBudget = Math.min(1_000, Math.floor(totalPrompt / (remainingSlices + 1)));
-				const ratioCr = totalPrompt > 0 ? totalCr / totalPrompt : 0;
-				const ratioCw = totalPrompt > 0 ? totalCw / totalPrompt : 0;
+			if (remainingSlices > 0 && genPromptSum >= (remainingSlices + 1) * 20) {
+				// 尽量将全部预留切片总扣减控制在 <= 1000（低于 Pi cache-stats 的 1024 噪声门限），
+				// 且单切片保持在 [100, 1000] 内兼顾状态栏显示精度与不自触发假未命中告警
+				const targetPerSlice = Math.min(
+					1_000,
+					Math.max(100, Math.floor(1_000 / remainingSlices)),
+				);
+				const sliceBudget = Math.min(
+					targetPerSlice,
+					Math.floor(genPromptSum / (remainingSlices + 1)),
+				);
+				const ratioCr = genPromptSum > 0 ? genCacheRead / genPromptSum : 0;
+				const ratioCw = genPromptSum > 0 ? genCacheWrite / genPromptSum : 0;
 				const perCr = Math.round(sliceBudget * ratioCr);
 				const perCw = Math.min(sliceBudget - perCr, Math.round(sliceBudget * ratioCw));
 				const perIn = Math.max(0, sliceBudget - perCr - perCw);
 
-				const resCr = Math.min(totalCr, remainingSlices * perCr);
-				const resCw = Math.min(totalCw, remainingSlices * perCw);
-				const resIn = Math.min(totalIn, remainingSlices * perIn);
+				const resCr = Math.min(genCacheRead, remainingSlices * perCr);
+				const resCw = Math.min(genCacheWrite, remainingSlices * perCw);
+				const resIn = Math.min(genInput, remainingSlices * perIn);
 				// 严格保证第 1 步 output >= reasoning，仅在扣除思考 Token 仍有余量时才向后续切片预留 output
 				const minStepOut = Math.max(1, hasThought ? thoughtSum : 1);
-				const resOut = Math.min(remainingSlices, Math.max(0, totalOut - minStepOut));
+				const resOut = Math.min(remainingSlices, Math.max(0, genOutput - minStepOut));
 
 				ledger.pendingGenSlicePool = {
 					remainingSlices,
@@ -2252,24 +2340,24 @@ export class TurnCoordinator {
 					windowTotal: effectiveWindow,
 				};
 
-				const stepOut = Math.max(1, totalOut - resOut);
+				const stepOut = Math.max(1, genOutput - resOut);
 				return {
-					input: totalIn - resIn,
+					input: genInput - resIn,
 					output: stepOut,
-					cacheRead: totalCr - resCr,
-					cacheWrite: totalCw - resCw,
+					cacheRead: genCacheRead - resCr,
+					cacheWrite: genCacheWrite - resCw,
 					reasoning: hasThought ? Math.min(stepOut, thoughtSum) : undefined,
 					totalTokens: effectiveWindow,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};
 			}
 
-			const finalStepOut = Math.max(1, totalOut);
+			const finalStepOut = Math.max(1, genOutput);
 			return {
-				input: totalIn,
+				input: genInput,
 				output: finalStepOut,
-				cacheRead: totalCr,
-				cacheWrite: totalCw,
+				cacheRead: genCacheRead,
+				cacheWrite: genCacheWrite,
 				reasoning: hasThought ? Math.min(finalStepOut, thoughtSum) : undefined,
 				totalTokens: effectiveWindow,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -2307,10 +2395,13 @@ export class TurnCoordinator {
 				};
 			}
 
-			// 切片池耗尽或无本地库回退路径下的同次生成拆分步：若会话已有缓存命中记录，返回极小整数比例样本维持 UI 缓存命中率不闪烁
-			if (ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0) {
+			// 切片池耗尽或无本地库回退路径下的同次生成拆分步：若会话已有真实缓存观测值（含 0%），返回极小整数比例样本维持 UI 显示稳定
+			if (ledger.lastObservedCacheRatio !== undefined) {
 				const win = liveWindowUsed > 0 ? liveWindowUsed : ledger.cachedPrefixTokens;
-				const cr = Math.max(1, Math.min(100, Math.round(100 * ledger.lastObservedCacheRatio)));
+				const cr =
+					ledger.lastObservedCacheRatio > 0
+						? Math.max(1, Math.min(100, Math.round(100 * ledger.lastObservedCacheRatio)))
+						: 0;
 				return {
 					input: 100 - cr,
 					output: 0,
@@ -2351,13 +2442,11 @@ export class TurnCoordinator {
 		const prevCachedPrefix = ledger.cachedPrefixTokens;
 		const stepTotal = Math.max(output + 1, liveWindowUsed || prevCachedPrefix + output);
 		const promptTokens = Math.max(1, stepTotal - output);
-		let cacheRead = 0;
-		if (ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0) {
-			cacheRead = Math.min(promptTokens, Math.round(promptTokens * ledger.lastObservedCacheRatio));
-		} else if (prevCachedPrefix > 0) {
-			// 无历史命中率时按前序已缓存前缀的保守折算估算，避免 100% 虚高或首轮冷启动把后续锁死为 0%
-			cacheRead = Math.min(promptTokens, Math.round(Math.min(promptTokens, prevCachedPrefix) * 0.85));
-		}
+		// 仅依据已真实观测到的上游缓存命中率折算（含 0% 未命中）；尚未获得任何上游缓存遥测时绝不硬编码伪造命中率
+		const cacheRead =
+			ledger.lastObservedCacheRatio !== undefined
+				? Math.min(promptTokens, Math.round(promptTokens * ledger.lastObservedCacheRatio))
+				: 0;
 		const input = Math.max(0, promptTokens - cacheRead);
 		const totalTokens = input + cacheRead + output;
 		ledger.cachedPrefixTokens = Math.max(prevCachedPrefix, totalTokens);
@@ -2375,8 +2464,8 @@ export class TurnCoordinator {
 
 	/**
 	 * 为最终 `stop` 步校准 `Usage`：
-	 * 1. 优先读取本地 SQLite `steps.metadata` 中末步真实生成明细（精确匹配上游单步命中率与真实 `output`）；
-	 * 2. 回退路径下：单步轮次保留官方汇总，多步轮次采用末步自身估算 `output` 与当前窗口对齐，绝不将整轮累计 `output` 余量倒灌至最后一条消息。
+	 * 1. 优先读取本地 SQLite `steps.metadata` 中末步真实生成明细（精确匹配上游单步命中率与真实 `output`，含 `0%` 未命中且不混入跨生成旧切片）；
+	 * 2. 回退路径下：单步轮次或无 SQLite 环境才从 `acpUsage` 更新观测比率，多步 SQLite WAL 延迟回退时保留精确单步观测比率且绝不将整轮累计 `output` 余量倒灌至最后一条消息。
 	 */
 	private async buildFinalStepUsage(
 		ledger: ManagedSessionLedger,
@@ -2386,9 +2475,6 @@ export class TurnCoordinator {
 	): Promise<Usage> {
 		const raw = convertAcpUsageToPiUsage(acpUsage);
 		const rawPromptTotal = raw.input + raw.cacheRead + raw.cacheWrite;
-		if (rawPromptTotal > 0 && raw.cacheRead > 0) {
-			ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, raw.cacheRead / rawPromptTotal));
-		}
 
 		const liveWindowUsed =
 			typeof ledger.usedTokens === "number" && ledger.usedTokens > 0
@@ -2402,50 +2488,33 @@ export class TurnCoordinator {
 		);
 
 		if (dbGens.length > 0) {
-			const carry = this.drainPendingSlicePool(ledger);
-			const gensToAccount =
-				!pump.hasSqliteGenTelemetry && pump.intermediateStepCount > 0
-					? [dbGens[dbGens.length - 1]]
-					: dbGens;
+			// 新生成已落盘，丢弃上一生成未耗尽的旧切片池并取最新一条真实生成，确保末步命中率与输出 100% 纯净
+			ledger.pendingGenSlicePool = undefined;
 			pump.hasSqliteGenTelemetry = true;
-			ledger.lastConsumedStepIdx = dbGens[dbGens.length - 1].stepIdx;
+			const lastGen = dbGens[dbGens.length - 1];
+			ledger.lastConsumedStepIdx = lastGen.stepIdx;
 
-			let input = 0;
-			let output = 0;
-			let cacheWrite = 0;
-			let cacheRead = 0;
-			let thoughtSum = 0;
-			let hasThought = false;
-			for (const g of gensToAccount) {
-				input += g.inputTokens;
-				output += g.outputTokens;
-				cacheWrite += g.cacheWriteTokens;
-				cacheRead += g.cacheReadTokens;
-				if (g.thoughtTokens !== undefined) {
-					hasThought = true;
-					thoughtSum += g.thoughtTokens;
-				}
+			const promptSum =
+				lastGen.inputTokens + lastGen.cacheReadTokens + lastGen.cacheWriteTokens;
+			if (promptSum > 0) {
+				ledger.lastObservedCacheRatio = Math.min(
+					1,
+					Math.max(0, lastGen.cacheReadTokens / promptSum),
+				);
 			}
-			const promptSum = input + cacheRead + cacheWrite;
-			if (promptSum > 0 && cacheRead > 0) {
-				ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, cacheRead / promptSum));
-			}
-			const lastGen = gensToAccount[gensToAccount.length - 1];
-			const latestGenWindowTotal =
-				lastGen.inputTokens +
-				lastGen.cacheReadTokens +
-				lastGen.cacheWriteTokens +
-				lastGen.outputTokens;
+			const latestGenWindowTotal = promptSum + lastGen.outputTokens;
 			const effectiveWindow = liveWindowUsed ?? latestGenWindowTotal;
 			ledger.cachedPrefixTokens = effectiveWindow;
 
-			const totalOut = output + carry.output;
+			const hasThought = lastGen.thoughtTokens !== undefined;
 			return {
-				input: input + carry.input,
-				output: totalOut,
-				cacheRead: cacheRead + carry.cacheRead,
-				cacheWrite: cacheWrite + carry.cacheWrite,
-				reasoning: hasThought ? Math.min(totalOut, thoughtSum) : undefined,
+				input: lastGen.inputTokens,
+				output: lastGen.outputTokens,
+				cacheRead: lastGen.cacheReadTokens,
+				cacheWrite: lastGen.cacheWriteTokens,
+				reasoning: hasThought
+					? Math.min(lastGen.outputTokens, lastGen.thoughtTokens!)
+					: undefined,
 				totalTokens: effectiveWindow,
 				cost: raw.cost,
 			};
@@ -2468,10 +2537,18 @@ export class TurnCoordinator {
 			if (
 				writer.estimatedOutputTokens === 0 &&
 				raw.output === 0 &&
-				!(ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0)
+				ledger.lastObservedCacheRatio === undefined
 			) {
 				return createZeroUsage();
 			}
+		}
+
+		// 仅在单步轮次或无 SQLite 遥测时才从整轮汇总 acpUsage 更新观测比率（含 0%），避免多步累计均值污染 SQLite 单步基准
+		if (
+			rawPromptTotal > 0 &&
+			(pump.intermediateStepCount === 0 || !pump.hasSqliteGenTelemetry)
+		) {
+			ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, raw.cacheRead / rawPromptTotal));
 		}
 
 		const cacheRatio = ledger.lastObservedCacheRatio ?? 0;

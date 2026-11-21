@@ -26,8 +26,13 @@ import {
 function writeMockAgyExecutable(dir: string): string {
 	const scriptPath = path.join(dir, "mock-agy.mjs");
 	const scriptSource = `#!/usr/bin/env node
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as readline from "node:readline";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 
+const mockRootDir = path.dirname(fileURLToPath(import.meta.url));
 const isModeA = !process.argv.some((arg) => arg.startsWith("pi-bridge"));
 const sessions = new Map();
 
@@ -447,6 +452,105 @@ rl.on("line", async (line) => {
         jsonrpc: "2.0",
         id: msg.id,
         result: { stopReason: "end_turn", usage: { inputTokens: 600, cachedReadTokens: 31400, outputTokens: 40 } }
+      });
+      return;
+    }
+
+    if (lastBlockText.startsWith("SEQ_TOOLS:") && !isModeA && sess?.mcpHttp) {
+      const count = Math.max(1, Number.parseInt(lastBlockText.slice("SEQ_TOOLS:".length), 10) || 1);
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      for (let i = 1; i <= count; i++) {
+        if (sess.inFlightPromptId !== myPromptId) return;
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "seq_" + myPromptId + "_" + i, title: "mcp_pi_tools_read" } }
+        });
+        await fetch(sess.mcpHttp.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authHeader },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 500 + i,
+            method: "tools/call",
+            params: { name: "read", arguments: { path: "seq-" + i + ".ts" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+          })
+        }).then((r) => r.json());
+      }
+      if (sess.inFlightPromptId !== myPromptId) return;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Seq done " + count } } }
+      });
+      sess.inFlightPromptId = undefined;
+      sess.cancelablePromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: {
+          stopReason: "end_turn",
+          usage: { inputTokens: 10000, cachedReadTokens: 190000, outputTokens: 500 }
+        }
+      });
+      return;
+    }
+
+    if (lastBlockText === "DELAYED_WAL_TOOL" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "wal_1", title: "mcp_pi_tools_read" } }
+      });
+      const dbPath = path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations", sessionId + ".db");
+      setTimeout(() => {
+        try {
+          const encodeVarint = (n) => {
+            const out = [];
+            let v = n;
+            while (v >= 0x80) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); }
+            out.push(v);
+            return out;
+          };
+          const f9 = Buffer.from([
+            (2 << 3) | 0, ...encodeVarint(3000),
+            (3 << 3) | 0, ...encodeVarint(220),
+            (5 << 3) | 0, ...encodeVarint(97000),
+          ]);
+          const meta = Buffer.from([(9 << 3) | 2, ...encodeVarint(f9.length), ...f9]);
+          const tcSub = Buffer.from([(7 << 3) | 2, 2, 0x08, 0x01]);
+          const payload = Buffer.from([...encodeVarint((20 << 3) | 2), ...encodeVarint(tcSub.length), ...tcSub]);
+          const db = new DatabaseSync(dbPath);
+          db.prepare("INSERT OR REPLACE INTO steps VALUES (99, 15, 3, ?, ?)").run(payload, meta);
+          db.close();
+        } catch {}
+      }, 28);
+      await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 601,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "wal.ts" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "WAL ok" } } }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: { stopReason: "end_turn", usage: { inputTokens: 3000, cachedReadTokens: 97000, outputTokens: 250 } }
       });
       return;
     }
@@ -880,7 +984,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("运行中插入用户消息 (Steering) 不中断当前多步任务、实时估算首轮缓存命中且后续追问正常吐字", async () => {
+	it("运行中插入用户消息 (Steering) 不中断当前多步任务、未观测缓存前不伪造命中且后续追问正常吐字", async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-steer-"));
 		const binPath = writeMockAgyExecutable(tmpRoot);
 		const cfg: BridgeConfig = {
@@ -940,10 +1044,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(msg2.stopReason, "toolUse");
 			const tc2 = msg2.content.find((c): c is ToolCall => c.type === "toolCall")!;
 			assert.equal(tc2.arguments.path, "b.ts");
-			// 关键断言 2：首轮第 2 步基于前序窗口前缀保守估算非零 cacheRead（0.85 折算，不虚报 100%）
-			assert.ok(
-				msg2.usage.cacheRead >= 16000 && msg2.usage.cacheRead < 20000,
-				`预期首轮第 2 步 cacheRead 落在保守区间 [16000, 20000)，实际为 ${msg2.usage.cacheRead}`,
+			// 关键断言 2：在无 SQLite 库且本会话尚未观测到任何上游缓存信号前，绝不硬编码伪造 85% 假缓存命中
+			assert.equal(
+				msg2.usage.cacheRead,
+				0,
+				`未观测到任何上游缓存信号时不应伪造 cacheRead，实际为 ${msg2.usage.cacheRead}`,
 			);
 
 			// Step 3：完成 b.ts 工具执行，收口整轮输出（包含原任务结果与运行中消息响应）
@@ -1495,6 +1600,401 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			} finally {
 				await hybridCoord.dispose();
 			}
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("缓存命中率精度闭环：0% 未命中清零基准、跨生成不混入旧切片、多行 SQLite 仅取末条、大批量切片总扣减 <=1000 及中间步 WAL 延迟重试", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-cache-accuracy-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const encodeVarint = (n: number): number[] => {
+			const out: number[] = [];
+			let v = n;
+			while (v >= 0x80) {
+				out.push((v & 0x7f) | 0x80);
+				v = Math.floor(v / 128);
+			}
+			out.push(v);
+			return out;
+		};
+		const makeStepBlobs = (
+			inputTokens: number,
+			cacheReadTokens: number,
+			outputTokens: number,
+			plannedTools: number,
+		) => {
+			const f9 = Buffer.from([
+				(2 << 3) | 0, ...encodeVarint(inputTokens),
+				(3 << 3) | 0, ...encodeVarint(outputTokens),
+				(5 << 3) | 0, ...encodeVarint(cacheReadTokens),
+			]);
+			const meta = Buffer.from([(9 << 3) | 2, ...encodeVarint(f9.length), ...f9]);
+			const tcSub = Buffer.from([(7 << 3) | 2, 2, 0x08, 0x01]);
+			const f20 = Buffer.concat(Array.from({ length: plannedTools }, () => tcSub));
+			const payload = Buffer.from([
+				...encodeVarint((20 << 3) | 2),
+				...encodeVarint(f20.length),
+				...f20,
+			]);
+			return { payload, meta };
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+			];
+			const mkTr = (tc: ToolCall, text: string, ts: number) => ({
+				role: "toolResult" as const,
+				toolCallId: tc.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text }],
+				isError: false,
+				timestamp: ts,
+			});
+
+			// 先建立会话以获取 agySessionId，并初始化 SQLite steps 表
+			const uInit = { role: "user" as const, content: "FOLLOWUP_MSG:init", timestamp: 1 };
+			const initMsg = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: [uInit] }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			const agyId = initMsg.responseId!;
+			const convDir = path.join(cfg.geminiDir, "antigravity-cli", "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+			const dbPath = path.join(convDir, `${agyId}.db`);
+			const initDb = new DatabaseSync(dbPath);
+			initDb.exec(
+				"CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL, status integer NOT NULL, step_payload blob, metadata blob);",
+			);
+			initDb.close();
+
+			const insertGen = (
+				idx: number,
+				inTok: number,
+				crTok: number,
+				outTok: number,
+				plannedTools: number,
+			) => {
+				const { payload, meta } = makeStepBlobs(inTok, crTok, outTok, plannedTools);
+				const db = new DatabaseSync(dbPath);
+				db.prepare("INSERT OR REPLACE INTO steps VALUES (?, 15, 3, ?, ?)").run(idx, payload, meta);
+				db.close();
+			};
+
+			// 场景 1：98% 命中后发生真实 0% 缓存失效，且末步 WAL 缺失而 acpUsage 汇报整轮 95% 累计均值 -> 末步不得伪造 98% 或 95%，必须保持 0%
+			insertGen(10, 2000, 98000, 300, 1);
+			const hist: Array<any> = [uInit, initMsg];
+			const u1 = { role: "user" as const, content: "SEQ_TOOLS:2", timestamp: 2 };
+			hist.push(u1);
+			const s1 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(s1.usage.input, 2000);
+			assert.equal(s1.usage.cacheRead, 98000);
+			const tc1 = s1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			hist.push(s1, mkTr(tc1, "r1", 3));
+
+			// 写入真实 0% 缓存未命中记录（idx=20）
+			insertGen(20, 100000, 0, 250, 1);
+			const s2 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(s2.usage.input, 100000);
+			assert.equal(s2.usage.cacheRead, 0);
+			const tc2 = s2.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			hist.push(s2, mkTr(tc2, "r2", 4));
+
+			// 末步故意不写入新 SQLite 行（模拟 WAL 延迟），而 mock 的 acpUsage 汇报整轮累计 95% 命中；
+			// 必须严格维持上一步刚观测到的 0% 基准，绝不回弹成 98% 或整轮均值 95%！
+			const s3 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(s3.stopReason, "stop");
+			assert.equal(s3.usage.cacheRead, 0, `真实 0% 未命中后末步回退不得伪造 cacheRead，实际为 ${s3.usage.cacheRead}`);
+			hist.push(s3);
+
+			// 场景 2：上一生成残留 pendingGenSlicePool（planned=4 但仅执行 1 个工具后进入新生成），新生成 0% 未命中绝不混入旧切片 cacheRead
+			insertGen(30, 2000, 98000, 300, 4);
+			const u2 = { role: "user" as const, content: "SEQ_TOOLS:2", timestamp: 5 };
+			hist.push(u2);
+			const gA1 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			const gATc1 = gA1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			hist.push(gA1, mkTr(gATc1, "ga1", 6));
+
+			// 在第 2 个工具到达前已有新生成 B（0% 未命中）落盘，旧生成 A 剩余 3 个切片不得混入生成 B
+			insertGen(40, 10000, 0, 180, 1);
+			const gB1 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(gB1.usage.input, 10000);
+			assert.equal(gB1.usage.cacheRead, 0, "新生成 0% 未命中绝不能混入旧生成残留切片的 cacheRead");
+			const gBTc1 = gB1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			hist.push(gB1, mkTr(gBTc1, "gb1", 7));
+
+			// 场景 3：同时存在 2 条未消费 SQLite 生成（idx=50 0% + idx=60 96%），必须仅汇报末条 idx=60 的纯净命中率与输出，不混合求平均
+			insertGen(50, 50000, 0, 500, 0);
+			insertGen(60, 2000, 48000, 120, 0);
+			const gFinal = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(gFinal.stopReason, "stop");
+			assert.equal(gFinal.usage.input, 2000);
+			assert.equal(gFinal.usage.cacheRead, 48000);
+			assert.equal(gFinal.usage.output, 120);
+			hist.push(gFinal);
+
+			// 场景 4：大批量 5 工具单次生成，全部预留切片总扣减 <= 1000（低于 Pi cache-stats 1024 噪声门限）且 5 步之和 100% 守恒
+			insertGen(70, 4000, 96000, 500, 5);
+			const u5 = { role: "user" as const, content: "SEQ_TOOLS:5", timestamp: 8 };
+			hist.push(u5);
+			let sumIn = 0;
+			let sumCr = 0;
+			let sumOut = 0;
+			for (let i = 1; i <= 5; i++) {
+				const stepMsg = await coord
+					.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+						sessionId: "pi-sess-cache-acc",
+					})
+					.result();
+				assert.equal(stepMsg.stopReason, "toolUse");
+				const p = stepMsg.usage.input + stepMsg.usage.cacheRead;
+				if (i === 1) {
+					assert.ok(p >= 99000, `第 1 步总扣减应 <= 1000，实际第 1 步 prompt=${p}`);
+				} else {
+					assert.ok(p > 0 && p <= 1000, `第 ${i} 个切片应保持在 (0, 1000]，实际 ${p}`);
+				}
+				const rate = (stepMsg.usage.cacheRead / p) * 100;
+				assert.ok(Math.abs(rate - 96.0) < 0.6, `第 ${i} 步命中率应接近 96.0%，实际 ${rate}`);
+				sumIn += stepMsg.usage.input;
+				sumCr += stepMsg.usage.cacheRead;
+				sumOut += stepMsg.usage.output;
+				const tc = stepMsg.content.find((c): c is ToolCall => c.type === "toolCall")!;
+				hist.push(stepMsg, mkTr(tc, `batch-${i}`, 8 + i));
+			}
+			assert.equal(sumIn, 4000);
+			assert.equal(sumCr, 96000);
+			assert.equal(sumOut, 500);
+			insertGen(75, 1000, 99000, 80, 0);
+			const u5End = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(u5End.stopReason, "stop");
+			hist.push(u5End);
+
+			// 场景 5：中间步 SQLite WAL 延迟 10ms 才落盘（idx=99），buildIntermediateStepUsage 必须通过短重试精准捕获
+			const uWal = { role: "user" as const, content: "DELAYED_WAL_TOOL", timestamp: 20 };
+			hist.push(uWal);
+			const walStep = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(walStep.stopReason, "toolUse");
+			assert.equal(walStep.usage.input, 3000);
+			assert.equal(walStep.usage.cacheRead, 97000);
+			assert.equal(walStep.usage.output, 220);
+			const walTc = walStep.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			hist.push(walStep, mkTr(walTc, "wal-res", 21));
+			const walEnd = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: hist }), {
+					sessionId: "pi-sess-cache-acc",
+				})
+				.result();
+			assert.equal(walEnd.stopReason, "stop");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("适配 pi-traffic-optimization 端到端：图片压缩零断连、批量 GC 在空闲边界按需重建瘦身会话、冷却期复用热缓存且关闭优化后还原完整上下文", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-traffic-opt-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const capturedPayloads: Array<{ sessionId: string; prompt: Array<{ type: string; text?: string; mimeType?: string }> }> = [];
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+				{
+					name: "context_recall",
+					description: "Recall archived context",
+					parameters: {
+						type: "object",
+						properties: {
+							id: { type: "string" },
+							view: { anyOf: [{ const: "snapshot" }, { const: "current" }, { const: "diff" }] },
+						},
+					},
+				},
+			];
+			const mkTr = (tc: ToolCall, text: string, ts: number) => ({
+				role: "toolResult" as const,
+				toolCallId: tc.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text }],
+				isError: false,
+				timestamp: ts,
+			});
+
+			const runStep = (messages: any[]) =>
+				coord
+					.streamSimple(TEST_MODEL, normalizeContext({ tools, messages }), {
+						sessionId: "pi-sess-topt",
+						onPayload: (payload) => {
+							capturedPayloads.push(payload as any);
+						},
+					})
+					.result();
+
+			// Turn 1：发送带 PNG 图片 + 4 个顺序工具调用建立有状态会话
+			const u1Raw: any = {
+				role: "user",
+				content: [
+					{ type: "image", data: "RAW_PNG_BYTES", mimeType: "image/png" },
+					{ type: "text", text: "SEQ_TOOLS:4" },
+				],
+				timestamp: 1,
+			};
+			const hist: any[] = [u1Raw];
+			const toolResults: Array<{ idx: number; callId: string; rawText: string }> = [];
+			for (let i = 1; i <= 4; i++) {
+				const step = await runStep(hist);
+				assert.equal(step.stopReason, "toolUse");
+				const tc = step.content.find((c): c is ToolCall => c.type === "toolCall")!;
+				const tr = mkTr(tc, `RAW_LARGE_FILE_CONTENT_${i}_${"Z".repeat(6000)}`, 1 + i);
+				hist.push(step, tr);
+				toolResults.push({ idx: hist.length - 1, callId: tc.id, rawText: tr.content[0].text });
+			}
+			const t1End = await runStep(hist);
+			assert.equal(t1End.stopReason, "stop");
+			const originalAgyId = t1End.responseId!;
+			hist.push(t1End);
+
+			// Turn 2：pi-traffic-optimization 仅压缩历史用户图片 PNG -> WebP（未触发 GC），必须复用同一原会话保热缓存
+			const histCompressed = hist.map((m, idx) =>
+				idx === 0
+					? {
+							...m,
+							content: [
+								{ type: "image", data: "COMPRESSED_WEBP_BYTES", mimeType: "image/webp" },
+								{ type: "text", text: "SEQ_TOOLS:4" },
+							],
+						}
+					: m,
+			);
+			const u2 = { role: "user", content: "FOLLOWUP_MSG:after-webp", timestamp: 10 };
+			const t2End = await runStep([...histCompressed, u2]);
+			assert.equal(t2End.stopReason, "stop");
+			assert.equal(t2End.responseId, originalAgyId, "仅图片压缩不应拆毁热缓存会话");
+			histCompressed.push(u2, t2End);
+
+			// Turn 3：pi-traffic-optimization 触发批量 GC，将 4 条旧 toolResult 替换为紧凑 [已归档 ctx://tool/...] 占位符
+			const histProjected = histCompressed.map((m) => ({ ...m }));
+			for (let i = 0; i < toolResults.length; i++) {
+				const trMeta = toolResults[i];
+				const h = `${i + 1}`.repeat(64);
+				histProjected[trMeta.idx] = {
+					...histProjected[trMeta.idx],
+					content: [
+						{
+							type: "text",
+							text: `[已归档 ctx://tool/${h}]\n{"tool":"read","call":"${trMeta.callId}"}\n这是历史结果。精确取回：context_recall({id:"ctx://tool/${h}"})`,
+						},
+					],
+				};
+			}
+			const u3 = { role: "user", content: "FOLLOWUP_MSG:after-gc", timestamp: 20 };
+			const payloadCountBeforeGc = capturedPayloads.length;
+			const t3End = await runStep([...histProjected, u3]);
+			assert.equal(t3End.stopReason, "stop");
+			const slimAgyId = t3End.responseId!;
+			assert.notEqual(slimAgyId, originalAgyId, "批量 GC 后应重建瘦身后的新 AGY 会话以释放后端上下文");
+			// 验证重建的 FreshReplay 确实携带了 ctx:// 归档占位符，且不再携带 6KB 原始大输出
+			const gcReplayText = capturedPayloads
+				.slice(payloadCountBeforeGc)
+				.flatMap((p) => p.prompt)
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			assert.ok(gcReplayText.includes("ctx://tool/1111111111111111"));
+			assert.ok(!gcReplayText.includes("RAW_LARGE_FILE_CONTENT_1_"));
+			histProjected.push(u3, t3End);
+
+			// Turn 4：GC 冷却期内投影指纹保持不变，必须继续复用瘦身会话（零重复重建、保持热缓存）
+			const u4 = { role: "user", content: "FOLLOWUP_MSG:cooldown-hit", timestamp: 30 };
+			const t4End = await runStep([...histProjected, u4]);
+			assert.equal(t4End.stopReason, "stop");
+			assert.equal(t4End.responseId, slimAgyId, "冷却期内投影未变化必须复用瘦身会话保热缓存");
+			histProjected.push(u4, t4End);
+
+			// Turn 5：用户执行 /traffic-opt 关，历史占位符全部还原为完整原始工具结果 -> 应按需重建恢复完整上下文
+			const histRestored = histProjected.map((m) => ({ ...m }));
+			for (const trMeta of toolResults) {
+				histRestored[trMeta.idx] = {
+					...histRestored[trMeta.idx],
+					content: [{ type: "text", text: trMeta.rawText }],
+				};
+			}
+			const u5 = { role: "user", content: "FOLLOWUP_MSG:traffic-opt-off", timestamp: 40 };
+			const t5End = await runStep([...histRestored, u5]);
+			assert.equal(t5End.stopReason, "stop");
+			assert.notEqual(t5End.responseId, slimAgyId, "关闭优化恢复完整上下文后应重建会话以还原完整内容");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

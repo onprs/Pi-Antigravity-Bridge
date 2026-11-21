@@ -24,11 +24,82 @@ export function extractVisibleMessages(
 	);
 }
 
+const TRAFFIC_OPT_TOOL_PLACEHOLDER_REGEX =
+	/^\[(?:已归档|历史 recall 页)\s+(ctx:\/\/tool\/[a-f0-9]{16,64})\]/;
+const TRAFFIC_OPT_IMAGE_PLACEHOLDER_REGEX =
+	/^\[已归档图片\s+(ctx:\/\/image\/[a-f0-9]{16,64})\]/;
+
+/** 判断文本块是否为 `pi-traffic-optimization` 归档投影生成的工具/recall 页占位符 */
+export function isTrafficOptToolPlaceholder(text: string): boolean {
+	return TRAFFIC_OPT_TOOL_PLACEHOLDER_REGEX.test(text);
+}
+
+/** 判断文本块是否为 `pi-traffic-optimization` 归档投影生成的图片占位符 */
+export function isTrafficOptImagePlaceholder(text: string): boolean {
+	return TRAFFIC_OPT_IMAGE_PLACEHOLDER_REGEX.test(text);
+}
+
+export interface TrafficOptProjectionState {
+	/** 消息序列中存在的归档投影占位符总数（工具结果、历史 recall 页与图片） */
+	archivedCount: number;
+	/** 有序归档占位符集合的确定性 SHA-256 指纹（无投影时为空字符串） */
+	projectionDigest: string;
+}
+
+/**
+ * 扫描模型可见消息中的 `pi-traffic-optimization` 归档投影状态，
+ * 用于在批量 GC 触发后精准检测投影变化并驱动有状态 AGY 会话按需瘦身重建，同时在非 GC 轮次零打扰热缓存。
+ */
+export function inspectTrafficOptProjectionState(
+	visibleMessages: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
+): TrafficOptProjectionState {
+	const entries: string[] = [];
+	for (let i = 0; i < visibleMessages.length; i++) {
+		const msg = visibleMessages[i];
+		if (msg.role === "toolResult") {
+			for (let j = 0; j < msg.content.length; j++) {
+				const part = msg.content[j];
+				if (part.type !== "text") continue;
+				const toolMatch = TRAFFIC_OPT_TOOL_PLACEHOLDER_REGEX.exec(part.text);
+				if (toolMatch) {
+					entries.push(`t:${msg.toolCallId}:${j}:${toolMatch[1]}`);
+					continue;
+				}
+				const imgMatch = TRAFFIC_OPT_IMAGE_PLACEHOLDER_REGEX.exec(part.text);
+				if (imgMatch) {
+					entries.push(`ti:${msg.toolCallId}:${j}:${imgMatch[1]}`);
+				}
+			}
+		} else if (msg.role === "user" && Array.isArray(msg.content)) {
+			for (let j = 0; j < msg.content.length; j++) {
+				const part = msg.content[j];
+				if (part.type !== "text") continue;
+				const imgMatch = TRAFFIC_OPT_IMAGE_PLACEHOLDER_REGEX.exec(part.text);
+				if (imgMatch) {
+					entries.push(`ui:${i}:${j}:${imgMatch[1]}`);
+				}
+			}
+		}
+	}
+	if (entries.length === 0) {
+		return { archivedCount: 0, projectionDigest: "" };
+	}
+	const hash = crypto.createHash("sha256");
+	for (const item of entries) {
+		hash.update(`${item}\n`);
+	}
+	return {
+		archivedCount: entries.length,
+		projectionDigest: hash.digest("hex"),
+	};
+}
+
 /**
  * 提取对话结构身份特征用于会话连续性与分支锚点校验。
- * 对 `ToolResultMessage` 与历史图片块仅采集不可变结构标识（`toolCallId`、`toolName`、`isError` 与图片占位标记），
- * 确保 `pi-traffic-optimization`（工具输出归档投影）或 `pi-orca-images`（历史图片重压缩）等 `context` 阶段钩子改写载荷后，
- * 仍能 100% 精确命中活跃会话与历史锚点，绝不误拆健康热缓存会话。
+ * 对 `ToolResultMessage` 与历史图片块仅采集不可变结构标识（忽略图片压缩后的 `mimeType` 变更，
+ * 并将用户图片归档占位符归一为 `{ type: "image" }`），
+ * 确保 `pi-traffic-optimization`（图片 WebP 压缩、工具输出/图片归档投影）或 `pi-orca-images` 等 `context` 钩子改写载荷后，
+ * 原始 `turn_end` 锚点与投影后的 `streamSimple` 上下文仍 100% 精确匹配，绝不误拆健康热缓存会话。
  */
 function canonicalizeMessage(msg: UserMessage | AssistantMessage | ToolResultMessage): unknown {
 	if (msg.role === "user") {
@@ -38,8 +109,8 @@ function canonicalizeMessage(msg: UserMessage | AssistantMessage | ToolResultMes
 		return {
 			role: "user",
 			parts: msg.content.map((part) =>
-				part.type === "image"
-					? { type: "image", mimeType: part.mimeType }
+				part.type === "image" || isTrafficOptImagePlaceholder(part.text)
+					? { type: "image" }
 					: { type: "text", text: part.text },
 			),
 		};
@@ -231,6 +302,8 @@ export function buildDetachedToolResultBlocks(
 
 /** 历史检查点重放文本最大 UTF-8 字节预算（严防超出后端单次 Prompt 上限导致尾部最新用户提问被硬截断） */
 export const MAX_FRESH_REPLAY_HISTORY_BYTES = 120_000;
+/** 当历史已由 `pi-traffic-optimization` 归档瘦身时适当放宽重放预算，尽量完整保留全部紧凑 `ctx://` 句柄 */
+export const MAX_PROJECTED_REPLAY_HISTORY_BYTES = 180_000;
 /** 历史检查点重放最多保留的近期历史图片数（更早图片转为占位文本，防单行 JSON-RPC 体积失控） */
 const MAX_FRESH_REPLAY_HISTORY_IMAGES = 6;
 const MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES = 4_000;
@@ -311,11 +384,14 @@ function serializeReplayHistoryEntry(
 			.filter((c): c is TextContent => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
-		const cappedTexts = truncateUtf8Middle(
-			rawTexts,
-			MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES,
-			"\n...[tool output truncated in replay]...\n",
-		);
+		// 对 pi-traffic-optimization 已生成的紧凑 ctx:// 归档占位符保留原文不裁切，确保 handle 与 context_recall 指引完整
+		const cappedTexts = isTrafficOptToolPlaceholder(rawTexts)
+			? rawTexts
+			: truncateUtf8Middle(
+					rawTexts,
+					MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES,
+					"\n...[tool output truncated in replay]...\n",
+				);
 		entryBlocks.push({
 			type: "text",
 			text: `<tool_result id="${msg.toolCallId}" tool="${msg.toolName}" status="${status}">\n${cappedTexts}\n</tool_result>`,
@@ -343,11 +419,16 @@ function serializeReplayHistoryEntry(
  */
 export function buildFreshReplayPromptBlocks(
 	visibleMessages: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
-	maxHistoryBytes = MAX_FRESH_REPLAY_HISTORY_BYTES,
+	maxHistoryBytes?: number,
 ): AcpPromptBlock[] {
 	if (visibleMessages.length === 0) {
 		return [{ type: "text", text: "Continue." }];
 	}
+	const effectiveMaxHistoryBytes =
+		maxHistoryBytes ??
+		(inspectTrafficOptProjectionState(visibleMessages).archivedCount > 0
+			? MAX_PROJECTED_REPLAY_HISTORY_BYTES
+			: MAX_FRESH_REPLAY_HISTORY_BYTES);
 
 	// 若仅有单轮用户消息，直接原样发送无需包裹检查点标签
 	const allUsers = visibleMessages.every((m) => m.role === "user");
@@ -383,7 +464,7 @@ export function buildFreshReplayPromptBlocks(
 			}
 			if (
 				selectedReversed.length > 0 &&
-				usedHistoryBytes + serialized.textBytes > maxHistoryBytes
+				usedHistoryBytes + serialized.textBytes > effectiveMaxHistoryBytes
 			) {
 				omittedCount = i + 1;
 				break;

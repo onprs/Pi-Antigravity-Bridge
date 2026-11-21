@@ -1,16 +1,17 @@
-import type {
-	Api,
-	AssistantMessage,
-	AssistantMessageEventStream,
-	JsonObject,
-	Model,
-	ModelThinkingLevel,
-	ThinkingContent,
-	TextContent,
-	ToolCall,
-	Usage,
+import {
+	calculateCost,
+	createAssistantMessageEventStream,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type JsonObject,
+	type Model,
+	type ModelThinkingLevel,
+	type ThinkingContent,
+	type TextContent,
+	type ToolCall,
+	type Usage,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { AcpPromptStopReason, AcpPromptUsage } from "../acp/protocol.ts";
 
 /**
@@ -215,6 +216,7 @@ export function convertAcpUsageToPiUsage(acpUsage?: AcpPromptUsage): Usage {
 export class StepStreamWriter {
 	readonly stream: AssistantMessageEventStream;
 	readonly message: AssistantMessage;
+	private readonly model: Model<Api>;
 	private started = false;
 	private terminated = false;
 	private openBlock?: { kind: "thinking" | "text"; index: number };
@@ -231,6 +233,7 @@ export class StepStreamWriter {
 			thinkingLevel?: ModelThinkingLevel;
 		} = {},
 	) {
+		this.model = model;
 		this.stream = createAssistantMessageEventStream();
 		this.message = {
 			role: "assistant",
@@ -452,8 +455,9 @@ export class StepStreamWriter {
 		this.closeOpenBlock();
 
 		if (stepUsage) {
-			this.message.usage = stepUsage;
+			this.message.usage = { ...stepUsage, cost: { ...stepUsage.cost } };
 		}
+		calculateCost(this.model, this.message.usage);
 		this.message.stopReason = "toolUse";
 		this.terminated = true;
 		this.stream.push({
@@ -484,10 +488,11 @@ export class StepStreamWriter {
 		this.message.endTurn = reason === "stop";
 
 		if (usageOrRaw && "cost" in usageOrRaw && "cacheRead" in usageOrRaw) {
-			this.message.usage = usageOrRaw;
+			this.message.usage = { ...usageOrRaw, cost: { ...usageOrRaw.cost } };
 		} else {
 			this.message.usage = convertAcpUsageToPiUsage(usageOrRaw as AcpPromptUsage | undefined);
 		}
+		calculateCost(this.model, this.message.usage);
 
 		this.terminated = true;
 		this.stream.push({
