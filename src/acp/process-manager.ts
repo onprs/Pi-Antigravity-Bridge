@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type { BridgeConfig } from "../config.ts";
 import { resolveEffectiveFlags } from "../config.ts";
-import { type ResolvedBinary, resolveAgyBinary } from "./binary-resolver.ts";
+import { buildAgySpawnSpec, type ResolvedBinary, resolveAgyBinary } from "./binary-resolver.ts";
 import {
 	type AcpElicitationCreateParams,
 	type AcpElicitationCreateResult,
@@ -23,7 +23,7 @@ import {
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.4";
+export const CLIENT_INFO_VERSION = "0.1.5";
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -251,6 +251,52 @@ function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	return result;
 }
 
+function racePromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		return Promise.reject(signal.reason ?? new Error("请求已取消"));
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			reject(signal.reason ?? new Error("请求已取消"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(val) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(val);
+			},
+			(err) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(err);
+			},
+		);
+	});
+}
+
+function scheduleOrphanedSessionDbCleanup(
+	geminiDir: string,
+	appDataDirName: string,
+	sessionId: string,
+): void {
+	const convDir = path.join(geminiDir, appDataDirName || "antigravity-cli", "conversations");
+	const tryUnlink = () => {
+		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
+			try {
+				const target = path.join(convDir, `${sessionId}${suffix}`);
+				if (fs.existsSync(target)) {
+					fs.unlinkSync(target);
+				}
+			} catch {
+				// Windows 下 worker 退出前可能短暂持有文件句柄，由后续延时重试兜底
+			}
+		}
+	};
+	tryUnlink();
+	setTimeout(tryUnlink, 700).unref();
+	setTimeout(tryUnlink, 1_800).unref();
+}
+
 /** 封装单个已握手 `agy acp` 子进程连接 */
 export class AcpClientConnection {
 	readonly binary: ResolvedBinary;
@@ -258,6 +304,8 @@ export class AcpClientConnection {
 	private readonly proc: ChildProcessWithoutNullStreams;
 	private readonly managedAgentDir?: string;
 	private readonly pending = new Map<JsonRpcId, PendingRpc>();
+	/** 记录调用方提前 abort 或超时的 `session/new` / `session/resume` 请求，在后端迟到回包时立即关闭孤儿 worker */
+	private readonly orphanedSessionOpenRpcs = new Map<JsonRpcId, string>();
 	private readonly activeSessions = new Set<string>();
 	private readonly stderrTail: string[] = [];
 	private nextRpcId = 1;
@@ -300,15 +348,12 @@ export class AcpClientConnection {
 			args.push("--app-data-dir", profile.appDataDirName);
 		}
 
-		const spawnCmd =
-			binary.isWindowsWrapperScript && binary.binPath.includes(" ")
-				? `"${binary.binPath}"`
-				: binary.binPath;
+		const spawnSpec = buildAgySpawnSpec(binary, args, env);
 
-		this.proc = spawn(spawnCmd, args, {
+		this.proc = spawn(spawnSpec.command, spawnSpec.args, {
 			env: appendNoProxyLoopback(env),
 			stdio: ["pipe", "pipe", "pipe"],
-			shell: binary.isWindowsWrapperScript,
+			windowsVerbatimArguments: spawnSpec.windowsVerbatimArguments,
 			detached: process.platform !== "win32",
 			windowsHide: true,
 		});
@@ -383,6 +428,9 @@ export class AcpClientConnection {
 		if (this.initResult) {
 			return this.initResult;
 		}
+		if (signal?.aborted) {
+			throw signal.reason ?? new Error("请求已取消");
+		}
 		if (!this.initPromise) {
 			this.initPromise = this.request<AcpInitializeResult>(
 				"initialize",
@@ -396,13 +444,18 @@ export class AcpClientConnection {
 						version: CLIENT_INFO_VERSION,
 					},
 				},
-				{ timeoutMs: 20_000, signal },
-			).then((res) => {
-				this.initResult = res;
-				return res;
-			});
+				{ timeoutMs: 20_000 },
+			)
+				.then((res) => {
+					this.initResult = res;
+					return res;
+				})
+				.catch((err) => {
+					this.initPromise = undefined;
+					throw err;
+				});
 		}
-		return this.initPromise;
+		return racePromiseWithSignal(this.initPromise, signal);
 	}
 
 	request<TResult = unknown>(
@@ -418,6 +471,8 @@ export class AcpClientConnection {
 		}
 
 		const id = this.nextRpcId++;
+		const tracksSessionOpen = method === "session/new" || method === "session/resume";
+
 		return new Promise<TResult>((resolve, reject) => {
 			const entry: PendingRpc = {
 				method,
@@ -428,6 +483,9 @@ export class AcpClientConnection {
 			if (options.timeoutMs && options.timeoutMs > 0) {
 				entry.timer = setTimeout(() => {
 					this.pending.delete(id);
+					if (tracksSessionOpen) {
+						this.orphanedSessionOpenRpcs.set(id, method);
+					}
 					entry.cleanupAbort?.();
 					reject(new Error(`ACP 请求 ${method} 超时 (${options.timeoutMs}ms)`));
 				}, options.timeoutMs);
@@ -437,6 +495,9 @@ export class AcpClientConnection {
 				const onAbort = () => {
 					if (!this.pending.has(id)) return;
 					this.pending.delete(id);
+					if (tracksSessionOpen) {
+						this.orphanedSessionOpenRpcs.set(id, method);
+					}
 					if (entry.timer) clearTimeout(entry.timer);
 					reject(options.signal?.reason ?? new Error(`ACP 请求 ${method} 已中止`));
 				};
@@ -580,7 +641,28 @@ export class AcpClientConnection {
 		if ("id" in msg && ("result" in msg || "error" in msg) && !("method" in msg)) {
 			if (msg.id === null) return;
 			const entry = this.pending.get(msg.id);
-			if (!entry) return;
+			if (!entry) {
+				// 回收调用方已被 abort/timeout 放弃但后端仍创建成功的孤儿会话，防止泄漏 agy acp --worker 子进程与空 .db
+				const orphanedMethod = this.orphanedSessionOpenRpcs.get(msg.id);
+				if (orphanedMethod) {
+					this.orphanedSessionOpenRpcs.delete(msg.id);
+					if ("result" in msg && msg.result && typeof msg.result === "object") {
+						const sid = (msg.result as { sessionId?: unknown }).sessionId;
+						if (typeof sid === "string" && sid.length > 0) {
+							void this.closeSessionSafe(sid).finally(() => {
+								if (orphanedMethod === "session/new") {
+									scheduleOrphanedSessionDbCleanup(
+										this.profile.geminiDir,
+										this.profile.appDataDirName,
+										sid,
+									);
+								}
+							});
+						}
+					}
+				}
+				return;
+			}
 			this.pending.delete(msg.id);
 			if (entry.timer) clearTimeout(entry.timer);
 			entry.cleanupAbort?.();
@@ -707,6 +789,7 @@ export function resolveProcessProfileForConfig(
 /** 管理不同 Profile 的常驻 `agy acp` 进程池与统一释放 */
 export class AcpProcessManager {
 	private readonly pool = new Map<string, AcpClientConnection>();
+	private readonly initializing = new Map<string, Promise<AcpClientConnection>>();
 	private sharedHandlers: AcpServerHandlers = {};
 
 	setHandlers(handlers: AcpServerHandlers): void {
@@ -734,6 +817,10 @@ export class AcpProcessManager {
 		profileOverride?: Partial<AcpProcessProfile>,
 		signal?: AbortSignal,
 	): Promise<AcpClientConnection> {
+		if (signal?.aborted) {
+			throw signal.reason ?? new Error("请求已取消");
+		}
+
 		const baseProfile = resolveProcessProfileForConfig(config);
 		const profile: AcpProcessProfile = { ...baseProfile, ...profileOverride };
 		const key = buildProfileKey(profile);
@@ -744,18 +831,26 @@ export class AcpProcessManager {
 			return existing;
 		}
 
-		const binary = this.resolveBinary(config);
-		const conn = new AcpClientConnection(binary, profile, this.sharedHandlers);
-		this.pool.set(key, conn);
-
-		try {
-			await conn.ensureInitialized(signal);
-			return conn;
-		} catch (error) {
-			this.pool.delete(key);
-			await conn.dispose();
-			throw error;
+		let initTask = this.initializing.get(key);
+		if (!initTask) {
+			initTask = (async () => {
+				const binary = this.resolveBinary(config);
+				const conn = new AcpClientConnection(binary, profile, this.sharedHandlers);
+				try {
+					await conn.ensureInitialized();
+					this.pool.set(key, conn);
+					return conn;
+				} catch (error) {
+					await conn.dispose();
+					throw error;
+				} finally {
+					this.initializing.delete(key);
+				}
+			})();
+			this.initializing.set(key, initTask);
 		}
+
+		return racePromiseWithSignal(initTask, signal);
 	}
 
 	/** 从连接池驱逐并强制销毁已卡死或状态异常的单个子进程连接 */

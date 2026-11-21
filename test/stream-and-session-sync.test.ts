@@ -17,6 +17,8 @@ import {
 	captureSqliteCheckpoint,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
+	parseStepMetadataGenerationUsage,
+	readSqliteGenerationUsagesSince,
 } from "../src/session/checkpoint-sync.ts";
 import {
 	buildFreshReplayPromptBlocks,
@@ -56,6 +58,18 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 		const q1 = quoteFilter.push("常见报错如下：\n```\n⚠ RESOURCE_EXHAUSTED (code 429): sample\n```\nRESOURCE_EXHAUSTED (code 429): discussed inline\n");
 		assert.equal(q1.quotaError, undefined);
 		assert.ok(q1.safeText.includes("discussed inline"));
+
+		// 验证跨 chunk 切分的行内 ⚠ 示例及跨 chunk 切分的 ``` 代码块围栏均不会误判
+		const splitFilter = new QuotaSoftErrorFilter();
+		const s1 = splitFilter.push("Inline example: ");
+		const s2 = splitFilter.push("⚠ RESOURCE_EXHAUSTED (code 429): not at line start\n``");
+		const s3 = splitFilter.push("`text\n⚠ RESOURCE_EXHAUSTED (code 429): inside split fence\n``");
+		const s4 = splitFilter.push("`\nStill alive!\n");
+		assert.equal(s1.quotaError, undefined);
+		assert.equal(s2.quotaError, undefined);
+		assert.equal(s3.quotaError, undefined);
+		assert.equal(s4.quotaError, undefined);
+		assert.ok((s1.safeText + s2.safeText + s3.safeText + s4.safeText).includes("Still alive!"));
 	});
 
 	it("StepStreamWriter 支持两阶段工具调用流式采样、代码块平衡与分步 Usage 写入", async () => {
@@ -178,16 +192,76 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			timestamp: 300,
 		};
 
-		// 时间戳改变不影响摘要一致性
-		const d1 = computeTranscriptDigest([u1, a1]);
-		const d2 = computeTranscriptDigest([{ ...u1, timestamp: 9999 }, { ...a1, timestamp: 8888 }]);
+		// 时间戳改变、context 阶段归档工具输出或重压缩历史图片均不影响会话结构摘要一致性
+		const trRaw = {
+			role: "toolResult" as const,
+			toolCallId: "call_big_1",
+			toolName: "read",
+			content: [{ type: "text" as const, text: "x".repeat(50_000) }],
+			isError: false,
+			timestamp: 250,
+		};
+		const trArchived = {
+			...trRaw,
+			content: [{ type: "text" as const, text: "[已归档 ctx://tool/call_big_1]" }],
+		};
+		const u1Recompressed: UserMessage = {
+			...u1,
+			content: [
+				{ type: "text", text: "Look at this screenshot" },
+				{ type: "image", data: "cmVjb21wcmVzc2Vk", mimeType: "image/png" },
+			],
+		};
+		const d1 = computeTranscriptDigest([u1, a1, trRaw]);
+		const d2 = computeTranscriptDigest([
+			{ ...u1Recompressed, timestamp: 9999 },
+			{ ...a1, timestamp: 8888 },
+			trArchived,
+		]);
 		assert.equal(d1, d2);
+		assert.notEqual(
+			d1,
+			computeTranscriptDigest([u1, a1, { ...trRaw, isError: true }]),
+		);
 
 		const replayBlocks = buildFreshReplayPromptBlocks([u1, a1, u2]);
 		assert.ok(replayBlocks.some((b) => b.type === "image" && b.data === "aW1n"));
 		assert.ok(
 			replayBlocks.some((b) => b.type === "text" && b.text.includes("<conversation-checkpoint>")),
 		);
+
+		// 验证 FreshReplay 字节预算保护：裁剪早期超长历史，但 100% 完整保留最近消息与末尾最新用户提问
+		const hugeHistory: (UserMessage | AssistantMessage)[] = [];
+		for (let i = 0; i < 30; i++) {
+			hugeHistory.push({
+				role: "user",
+				content: `Turn ${i}: ${"H".repeat(2_000)}`,
+				timestamp: i * 2 + 1,
+			});
+			hugeHistory.push({
+				...a1,
+				content: [{ type: "text", text: `Reply ${i}: ${"R".repeat(2_000)}` }],
+				timestamp: i * 2 + 2,
+			});
+		}
+		const finalPrompt: UserMessage = {
+			role: "user",
+			content: "CRITICAL_FINAL_USER_QUESTION_MUST_NEVER_BE_TRUNCATED",
+			timestamp: 99999,
+		};
+		const budgetedBlocks = buildFreshReplayPromptBlocks([...hugeHistory, finalPrompt], 18_000);
+		const joinedBudgetText = budgetedBlocks
+			.filter((b): b is { type: "text"; text: string } => b.type === "text")
+			.map((b) => b.text)
+			.join("\n");
+		assert.ok(joinedBudgetText.includes("earlier historical messages were omitted"));
+		assert.ok(!joinedBudgetText.includes("Turn 0:"));
+		assert.ok(joinedBudgetText.includes("Reply 29:"));
+		const tailBlock = budgetedBlocks[budgetedBlocks.length - 1];
+		assert.equal(tailBlock.type, "text");
+		if (tailBlock.type === "text") {
+			assert.equal(tailBlock.text, "CRITICAL_FINAL_USER_QUESTION_MUST_NEVER_BE_TRUNCATED");
+		}
 	});
 
 	it("利用 node:sqlite VACUUM INTO 安全分叉截断会话数据库且原库保持只读不变", async () => {
@@ -210,7 +284,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			const initDb = new DatabaseSync(origDbPath);
 			initDb.exec(`
 				CREATE TABLE trajectory_meta (trajectory_id text, cascade_id text, trajectory_type integer, source integer, PRIMARY KEY (trajectory_id));
-				CREATE TABLE steps (idx integer, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, step_payload blob, PRIMARY KEY (idx));
+				CREATE TABLE steps (idx integer, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, step_payload blob, metadata blob, PRIMARY KEY (idx));
 				CREATE TABLE gen_metadata (idx integer, data blob, size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx));
 				CREATE TABLE executor_metadata (idx integer, data blob, PRIMARY KEY (idx));
 				CREATE TABLE parent_references (idx integer, data blob, PRIMARY KEY (idx));
@@ -219,7 +293,9 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			initDb
 				.prepare("INSERT INTO trajectory_meta VALUES (?, ?, 1, 1)")
 				.run(origSessionId, origSessionId);
-			initDb.prepare("INSERT INTO steps VALUES (0, 1, 2, X'0102'), (1, 2, 2, X'030405')").run();
+			initDb
+				.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (0, 1, 2, X'0102'), (1, 2, 2, X'030405')")
+				.run();
 			initDb.prepare("INSERT INTO gen_metadata VALUES (0, X'AA', 2)").run();
 			initDb.prepare("INSERT INTO executor_metadata VALUES (0, X'BB')").run();
 			initDb.prepare("INSERT INTO parent_references VALUES (0, X'CC'), (1, X'DD')").run();
@@ -230,12 +306,51 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			assert.ok(cpTurn1);
 			assert.equal(cpTurn1.steps, 2);
 
-			// 模拟会话继续推进到了第 2 轮（新增 idx=2, 3）
+			// 模拟会话继续推进到了第 2 轮（新增 idx=2, 3，并在 idx=3 写入真实编码的 step_type=15 metadata）
+			const encodeVarint = (n: number): number[] => {
+				const out: number[] = [];
+				let v = n;
+				while (v >= 0x80) {
+					out.push((v & 0x7f) | 0x80);
+					v = Math.floor(v / 128);
+				}
+				out.push(v);
+				return out;
+			};
+			const innerUsageBytes = Buffer.from([
+				(2 << 3) | 0, ...encodeVarint(3353), // field 2: inputTokens = 3353
+				(3 << 3) | 0, ...encodeVarint(445),  // field 3: outputTokens = 445
+				(5 << 3) | 0, ...encodeVarint(10441), // field 5: cacheReadTokens = 10441
+				(9 << 3) | 0, ...encodeVarint(255),  // field 9: thoughtTokens = 255
+				(10 << 3) | 0, ...encodeVarint(190), // field 10: responseTokens = 190
+			]);
+			const stepMetaBlob = Buffer.from([
+				(9 << 3) | 2, ...encodeVarint(innerUsageBytes.length), ...innerUsageBytes,
+			]);
+			const directParsed = parseStepMetadataGenerationUsage(stepMetaBlob, 3);
+			assert.deepEqual(directParsed, {
+				stepIdx: 3,
+				inputTokens: 3353,
+				outputTokens: 445,
+				cacheWriteTokens: 0,
+				cacheReadTokens: 10441,
+				thoughtTokens: 255,
+			});
+
 			const appendDb = new DatabaseSync(origDbPath);
-			appendDb.prepare("INSERT INTO steps VALUES (2, 1, 2, X'06'), (3, 2, 2, X'0708')").run();
+			appendDb
+				.prepare("INSERT INTO steps (idx, step_type, status, step_payload, metadata) VALUES (2, 14, 2, X'06', NULL), (3, 15, 2, X'0708', ?)")
+				.run(stepMetaBlob);
 			appendDb.prepare("INSERT INTO gen_metadata VALUES (1, X'EE', 2)").run();
 			appendDb.prepare("INSERT INTO parent_references VALUES (2, X'FF'), (3, X'11')").run();
 			appendDb.close();
+
+			const gensSince1 = await readSqliteGenerationUsagesSince(cfg, origSessionId, 1);
+			assert.equal(gensSince1.length, 1);
+			assert.equal(gensSince1[0].inputTokens, 3353);
+			assert.equal(gensSince1[0].cacheReadTokens, 10441);
+			assert.equal(gensSince1[0].outputTokens, 445);
+			assert.equal(gensSince1[0].thoughtTokens, 255);
 
 			// 从第 1 轮检查点执行快照分叉
 			const forkedId = await forkSqliteConversationAtCheckpoint(cfg, origSessionId, cpTurn1);

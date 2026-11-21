@@ -142,13 +142,57 @@ export function resolveAgyBinary(options: ResolveBinaryOptions = {}): ResolvedBi
 	return undefined;
 }
 
+export interface AgySpawnSpec {
+	command: string;
+	args: string[];
+	windowsVerbatimArguments?: boolean;
+}
+
+/**
+ * 为 Windows `cmd.exe /d /s /c` 安全引用单个命令行参数（处理含空格路径与双引号，且无需设置 `shell: true`，彻底规避 Node 22+ DEP0190）。
+ */
+export function quoteWindowsCmdArg(arg: string): string {
+	if (arg.length === 0) return '""';
+	if (!/[\s"&|<>^()]/.test(arg)) return arg;
+	return `"${arg.replace(/"/g, '""')}"`;
+}
+
+/**
+ * 构造跨平台安全的 `spawn` / `spawnSync` 调用参数：
+ * - 原生可执行文件（`.exe` 或 POSIX 二进制）：直接传参数数组，`shell: false`；
+ * - Windows `.cmd` / `.bat` 包装脚本：通过 `cmd.exe /d /s /c "..."` + `windowsVerbatimArguments: true` 调用，完整保护 `binPath` 与 `--gemini-dir` 等含空格路径。
+ */
+export function buildAgySpawnSpec(
+	binary: ResolvedBinary,
+	args: readonly string[],
+	env: NodeJS.ProcessEnv = process.env,
+): AgySpawnSpec {
+	if (!binary.isWindowsWrapperScript) {
+		return {
+			command: binary.binPath,
+			args: [...args],
+		};
+	}
+
+	const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
+	const innerCommand = [quoteWindowsCmdArg(binary.binPath), ...args.map(quoteWindowsCmdArg)].join(
+		" ",
+	);
+	return {
+		command: comspec,
+		args: ["/d", "/s", "/c", `"${innerCommand}"`],
+		windowsVerbatimArguments: true,
+	};
+}
+
 /** 读取本机 `agy --version` 版本字符串 */
 export function probeAgyVersion(binary: ResolvedBinary, timeoutMs = 4_000): string | undefined {
 	try {
-		const result = spawnSync(binary.binPath, ["--version"], {
+		const spec = buildAgySpawnSpec(binary, ["--version"]);
+		const result = spawnSync(spec.command, spec.args, {
 			encoding: "utf8",
 			timeout: timeoutMs,
-			shell: binary.isWindowsWrapperScript,
+			windowsVerbatimArguments: spec.windowsVerbatimArguments,
 			windowsHide: true,
 		});
 		if (result.status === 0 && result.stdout) {

@@ -13,7 +13,7 @@ import type {
 	ProviderConfig,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { resolveAgyBinary } from "./acp/binary-resolver.ts";
+import { buildAgySpawnSpec, resolveAgyBinary } from "./acp/binary-resolver.ts";
 import { AcpProcessManager } from "./acp/process-manager.ts";
 import {
 	ANTIGRAVITY_API_ID,
@@ -109,11 +109,21 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		models,
 		streamSimple: (model, context, options) => coordinator.streamSimple(model, context, options),
 		async refreshModels(refreshCtx) {
+			if (!refreshCtx.allowNetwork) {
+				const disk = readCachedCatalog();
+				if (disk?.tier) {
+					coordinator.setLatestTier(disk.tier);
+				}
+				if (disk?.models && disk.models.length > 0) {
+					currentModels = disk.models;
+				}
+				return currentModels;
+			}
 			const snapshot = await probeLiveAntigravityCatalog(
 				processManager,
 				coordinator.config,
 				process.cwd(),
-				refreshCtx.signal,
+				{ signal: refreshCtx.signal, force: refreshCtx.force },
 			);
 			if (snapshot.tier) {
 				coordinator.setLatestTier(snapshot.tier);
@@ -164,18 +174,16 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 					);
 				}
 
-				const spawnCmd =
-					bin.isWindowsWrapperScript && bin.binPath.includes(" ")
-						? `"${bin.binPath}"`
-						: bin.binPath;
-				const res = spawnSync(
-					spawnCmd,
-					["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
-					{
-						stdio: "inherit",
-						shell: bin.isWindowsWrapperScript,
-					},
-				);
+				const loginSpec = buildAgySpawnSpec(bin, [
+					"acp",
+					"--login",
+					"--gemini-dir",
+					coordinator.config.geminiDir,
+				]);
+				const res = spawnSync(loginSpec.command, loginSpec.args, {
+					stdio: "inherit",
+					windowsVerbatimArguments: loginSpec.windowsVerbatimArguments,
+				});
 				if (res.status !== 0) {
 					throw new Error("官方 agy 登录未完成，可在独立终端运行 `agy acp --login` 后重试。");
 				}
@@ -217,7 +225,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			processManager,
 			coordinator.config,
 			ctx.cwd,
-			ctx.signal,
+			{ signal: ctx.signal, force: true },
 		);
 		if (snapshot.tier) {
 			coordinator.setLatestTier(snapshot.tier);
@@ -260,7 +268,7 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, currentConfig);
 
-		// 若首次加载尚无本地缓存快照，在后台静默执行一次零配额模型目录同步
+		// 若首次加载尚无本地缓存快照，复用内置 Singleflight 静默探测一次模型目录
 		if (!cachedCatalog) {
 			void refreshAndReRegisterModels(ctx).catch(() => {});
 		}
@@ -279,10 +287,11 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 
 	// 6. ACP 单会话单活跃轮次协议约束：运行中按 Enter 发送的新消息统一转入 Follow-up 排队队列，
 	// 保持原任务完整执行完毕后再自动开启下一轮真实用户请求（同时支持 Alt+Up 编辑队列与 Esc 撤回）。
-	pi.on("input", async (event, ctx) => {
+	pi.on("input", (event, ctx) => {
 		if (
 			ctx.model?.provider === ANTIGRAVITY_PROVIDER_ID &&
 			event.streamingBehavior === "steer" &&
+			event.source !== "extension" &&
 			!ctx.isIdle()
 		) {
 			const parts: Array<TextContent | ImageContent> = [];
@@ -292,12 +301,10 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			if (event.images && event.images.length > 0) {
 				parts.push(...event.images);
 			}
-			await Promise.resolve(
-				pi.sendUserMessage(parts.length > 0 ? parts : event.text, {
-					deliverAs: "followUp",
-					expandPromptTemplates: event.source === "interactive",
-				}),
-			);
+			pi.sendUserMessage(parts.length > 0 ? parts : event.text, {
+				deliverAs: "followUp",
+				expandPromptTemplates: event.source === "interactive",
+			});
 			return { action: "handled" };
 		}
 		return { action: "continue" };
@@ -310,8 +317,16 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
 			return;
 		}
-		if (stopReason === "aborted" || event.outcome === "aborted") {
-			coordinator.cancelActiveTurnForPiSession(ctx.sessionManager.getSessionId());
+		if (
+			stopReason === "aborted" ||
+			stopReason === "error" ||
+			event.outcome !== "completed"
+		) {
+			if (stopReason === "aborted" || event.outcome === "aborted") {
+				coordinator.cancelActiveTurnForPiSession(ctx.sessionManager.getSessionId());
+			}
+			updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+			return;
 		}
 		const visible = extractVisibleMessages(event.context.llmMessages);
 		await coordinator.persistTurnAnchor(visible, ctx.sessionManager.getSessionId());

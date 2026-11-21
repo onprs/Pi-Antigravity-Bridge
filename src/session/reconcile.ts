@@ -23,10 +23,12 @@ export function extractVisibleMessages(
 	);
 }
 
-function hashImageData(img: ImageContent): string {
-	return crypto.createHash("sha256").update(`${img.mimeType}:${img.data}`).digest("hex").slice(0, 24);
-}
-
+/**
+ * 提取对话结构身份特征用于会话连续性与分支锚点校验。
+ * 对 `ToolResultMessage` 与历史图片块仅采集不可变结构标识（`toolCallId`、`toolName`、`isError` 与图片占位标记），
+ * 确保 `pi-traffic-optimization`（工具输出归档投影）或 `pi-orca-images`（历史图片重压缩）等 `context` 阶段钩子改写载荷后，
+ * 仍能 100% 精确命中活跃会话与历史锚点，绝不误拆健康热缓存会话。
+ */
 function canonicalizeMessage(msg: UserMessage | AssistantMessage | ToolResultMessage): unknown {
 	if (msg.role === "user") {
 		if (typeof msg.content === "string") {
@@ -36,7 +38,7 @@ function canonicalizeMessage(msg: UserMessage | AssistantMessage | ToolResultMes
 			role: "user",
 			parts: msg.content.map((part) =>
 				part.type === "image"
-					? { type: "image", hash: hashImageData(part) }
+					? { type: "image", mimeType: part.mimeType }
 					: { type: "text", text: part.text },
 			),
 		};
@@ -67,11 +69,6 @@ function canonicalizeMessage(msg: UserMessage | AssistantMessage | ToolResultMes
 		toolCallId: msg.toolCallId,
 		toolName: msg.toolName,
 		isError: msg.isError,
-		parts: msg.content.map((part) =>
-			part.type === "image"
-				? { type: "image", hash: hashImageData(part) }
-				: { type: "text", text: part.text },
-		),
 	};
 }
 
@@ -211,12 +208,119 @@ export function buildDetachedToolResultBlocks(
 	return blocks;
 }
 
+/** 历史检查点重放文本最大 UTF-8 字节预算（严防超出后端单次 Prompt 上限导致尾部最新用户提问被硬截断） */
+export const MAX_FRESH_REPLAY_HISTORY_BYTES = 120_000;
+const MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES = 4_000;
+const MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES = 16_000;
+
+function truncateUtf8Middle(text: string, maxBytes: number, marker: string): string {
+	const totalBytes = Buffer.byteLength(text, "utf8");
+	if (totalBytes <= maxBytes) {
+		return text;
+	}
+	const markerBytes = Buffer.byteLength(marker, "utf8");
+	const budget = Math.max(128, maxBytes - markerBytes);
+	const headBudget = Math.floor(budget * 0.65);
+	const tailBudget = Math.max(64, budget - headBudget);
+	const buf = Buffer.from(text, "utf8");
+	// 使用 TextDecoder 自动处理多字节 UTF-8 边界，避免产生残缺代理对
+	const decoder = new TextDecoder("utf-8", { fatal: false });
+	const headStr = decoder.decode(buf.subarray(0, headBudget));
+	const tailStr = decoder.decode(buf.subarray(buf.length - tailBudget));
+	return `${headStr}${marker}${tailStr}`;
+}
+
+function serializeReplayHistoryEntry(
+	msg: UserMessage | AssistantMessage | ToolResultMessage,
+): { blocks: AcpPromptBlock[]; textBytes: number } {
+	const entryBlocks: AcpPromptBlock[] = [];
+
+	if (msg.role === "user") {
+		if (typeof msg.content === "string") {
+			const trimmed = truncateUtf8Middle(
+				msg.content,
+				MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+				"\n...[earlier user text truncated in replay]...\n",
+			);
+			entryBlocks.push({ type: "text", text: `<user>\n${trimmed}\n</user>` });
+		} else {
+			entryBlocks.push({ type: "text", text: "<user>" });
+			for (const part of msg.content) {
+				if (part.type === "text") {
+					const trimmed = truncateUtf8Middle(
+						part.text,
+						MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+						"\n...[earlier user text truncated in replay]...\n",
+					);
+					entryBlocks.push({ type: "text", text: trimmed });
+				} else if (part.type === "image") {
+					entryBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+				}
+			}
+			entryBlocks.push({ type: "text", text: "</user>" });
+		}
+	} else if (msg.role === "assistant") {
+		const segs: string[] = [];
+		for (const part of msg.content) {
+			if (part.type === "text" && part.text.trim()) {
+				segs.push(
+					truncateUtf8Middle(
+						part.text,
+						MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+						"\n...[assistant text truncated in replay]...\n",
+					),
+				);
+			} else if (part.type === "toolCall") {
+				const rawArgs = JSON.stringify(part.arguments);
+				const safeArgs = truncateUtf8Middle(rawArgs, 2_000, "...[truncated]...");
+				segs.push(`<tool_call id="${part.id}" name="${part.name}">${safeArgs}</tool_call>`);
+			}
+		}
+		if (segs.length > 0) {
+			entryBlocks.push({
+				type: "text",
+				text: `<assistant model="${msg.model}">\n${segs.join("\n")}\n</assistant>`,
+			});
+		}
+	} else if (msg.role === "toolResult") {
+		const status = msg.isError ? "error" : "ok";
+		const rawTexts = msg.content
+			.filter((c): c is TextContent => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
+		const cappedTexts = truncateUtf8Middle(
+			rawTexts,
+			MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES,
+			"\n...[tool output truncated in replay]...\n",
+		);
+		entryBlocks.push({
+			type: "text",
+			text: `<tool_result id="${msg.toolCallId}" tool="${msg.toolName}" status="${status}">\n${cappedTexts}\n</tool_result>`,
+		});
+		for (const part of msg.content) {
+			if (part.type === "image") {
+				entryBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+			}
+		}
+	}
+
+	let textBytes = 0;
+	for (const b of entryBlocks) {
+		if (b.type === "text") {
+			textBytes += Buffer.byteLength(b.text, "utf8") + 1;
+		}
+	}
+	return { blocks: entryBlocks, textBytes };
+}
+
 /**
  * 构建完整结构化历史重放（`FreshReplay`）的 ACP Prompt 块序列。
- * 用于跨 Provider 切入、无本地快照的分支回退及上下文压缩后的新会话冷启动，完整保留历史图片块。
+ * 内置字节预算保护：从最近的历史消息向前逆序纳管，超出预算时优先裁切最早的旧历史与超长工具输出，
+ * 100% 保证最近上下文与末尾最新用户提问永不被后端截断。
  */
 export function buildFreshReplayPromptBlocks(
 	visibleMessages: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
+	maxHistoryBytes = MAX_FRESH_REPLAY_HISTORY_BYTES,
 ): AcpPromptBlock[] {
 	if (visibleMessages.length === 0) {
 		return [{ type: "text", text: "Continue." }];
@@ -244,61 +348,40 @@ export function buildFreshReplayPromptBlocks(
 	const blocks: AcpPromptBlock[] = [];
 
 	if (historySlice.length > 0) {
+		const selectedReversed: AcpPromptBlock[][] = [];
+		let usedHistoryBytes = 0;
+		let omittedCount = 0;
+
+		for (let i = historySlice.length - 1; i >= 0; i--) {
+			const serialized = serializeReplayHistoryEntry(historySlice[i]);
+			if (serialized.blocks.length === 0) {
+				continue;
+			}
+			if (
+				selectedReversed.length > 0 &&
+				usedHistoryBytes + serialized.textBytes > maxHistoryBytes
+			) {
+				omittedCount = i + 1;
+				break;
+			}
+			selectedReversed.push(serialized.blocks);
+			usedHistoryBytes += serialized.textBytes;
+		}
+
 		blocks.push({
 			type: "text",
 			text: "<conversation-checkpoint>\nThe following is the prior conversation transcript from this session (preserved across model switch, compaction, or branch navigation):",
 		});
 
-		for (const msg of historySlice) {
-			if (msg.role === "user") {
-				if (typeof msg.content === "string") {
-					blocks.push({ type: "text", text: `<user>\n${msg.content}\n</user>` });
-				} else {
-					blocks.push({ type: "text", text: "<user>" });
-					for (const part of msg.content) {
-						if (part.type === "text") {
-							blocks.push({ type: "text", text: part.text });
-						} else if (part.type === "image") {
-							blocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
-						}
-					}
-					blocks.push({ type: "text", text: "</user>" });
-				}
-			} else if (msg.role === "assistant") {
-				const segs: string[] = [];
-				for (const part of msg.content) {
-					if (part.type === "thinking" && part.thinking.trim()) {
-						segs.push(`<thought>\n${part.thinking.trim()}\n</thought>`);
-					} else if (part.type === "text" && part.text.trim()) {
-						segs.push(part.text);
-					} else if (part.type === "toolCall") {
-						segs.push(
-							`<tool_call id="${part.id}" name="${part.name}">${JSON.stringify(part.arguments)}</tool_call>`,
-						);
-					}
-				}
-				if (segs.length > 0) {
-					blocks.push({
-						type: "text",
-						text: `<assistant model="${msg.model}">\n${segs.join("\n")}\n</assistant>`,
-					});
-				}
-			} else if (msg.role === "toolResult") {
-				const status = msg.isError ? "error" : "ok";
-				const texts = msg.content
-					.filter((c): c is TextContent => c.type === "text")
-					.map((c) => c.text)
-					.join("\n");
-				blocks.push({
-					type: "text",
-					text: `<tool_result id="${msg.toolCallId}" tool="${msg.toolName}" status="${status}">\n${texts}\n</tool_result>`,
-				});
-				for (const part of msg.content) {
-					if (part.type === "image") {
-						blocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
-					}
-				}
-			}
+		if (omittedCount > 0) {
+			blocks.push({
+				type: "text",
+				text: `[Note: ${omittedCount} earlier historical messages were omitted to stay within the prompt replay size budget.]`,
+			});
+		}
+
+		for (let i = selectedReversed.length - 1; i >= 0; i--) {
+			blocks.push(...selectedReversed[i]);
 		}
 
 		blocks.push({

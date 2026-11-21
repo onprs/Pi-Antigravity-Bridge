@@ -3,13 +3,20 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { resolveAgyBinary } from "../src/acp/binary-resolver.ts";
+import {
+	buildAgySpawnSpec,
+	quoteWindowsCmdArg,
+	resolveAgyBinary,
+} from "../src/acp/binary-resolver.ts";
+import { AcpProcessManager } from "../src/acp/process-manager.ts";
 import type { AcpAvailableModel, AcpConfigOption } from "../src/acp/protocol.ts";
 import {
 	aggregateAcpModels,
+	probeLiveAntigravityCatalog,
 	resolveSessionModelSelection,
 } from "../src/catalog/model-discovery.ts";
 import {
+	DEFAULT_BRIDGE_CONFIG,
 	loadBridgeConfig,
 	resolveEffectiveFlags,
 } from "../src/config.ts";
@@ -177,7 +184,164 @@ describe("跨平台可执行文件定位", () => {
 			assert.ok(foundCmd);
 			assert.equal(foundCmd.binPath, cmdPath);
 			assert.equal(foundCmd.isWindowsWrapperScript, true);
+
+			// 验证 Windows .cmd 包装脚本含空格路径参数通过 cmd.exe /d /s /c + windowsVerbatimArguments 安全引用
+			assert.equal(quoteWindowsCmdArg("C:\\Users\\John Doe\\.gemini"), '"C:\\Users\\John Doe\\.gemini"');
+			const cmdSpec = buildAgySpawnSpec(
+				{
+					binPath: "C:\\Users\\John Doe\\AppData\\Local\\Programs\\Antigravity\\bin\\agy.cmd",
+					isWindowsWrapperScript: true,
+					source: "standard-location",
+				},
+				["acp", "--gemini-dir", "C:\\Users\\John Doe\\.gemini"],
+				{ ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+			);
+			assert.equal(cmdSpec.command, "C:\\Windows\\System32\\cmd.exe");
+			assert.equal(cmdSpec.windowsVerbatimArguments, true);
+			assert.deepEqual(cmdSpec.args.slice(0, 3), ["/d", "/s", "/c"]);
+			assert.ok(
+				cmdSpec.args[3].includes('"C:\\Users\\John Doe\\AppData\\Local\\Programs\\Antigravity\\bin\\agy.cmd"'),
+			);
+			assert.ok(cmdSpec.args[3].includes('"C:\\Users\\John Doe\\.gemini"'));
+
+			const exeSpec = buildAgySpawnSpec(
+				{
+					binPath: "C:\\Users\\John Doe\\agy.exe",
+					isWindowsWrapperScript: false,
+					source: "standard-location",
+				},
+				["acp", "--gemini-dir", "C:\\Users\\John Doe\\.gemini"],
+			);
+			assert.equal(exeSpec.command, "C:\\Users\\John Doe\\agy.exe");
+			assert.equal(exeSpec.windowsVerbatimArguments, undefined);
 		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("并发进程获取隔离首个取消信号、合并并发模型探测并自动回收已取消的孤儿 session/new", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-probe-race-"));
+		const statePath = path.join(tmpRoot, "probe-state.json");
+		const mockBin = path.join(tmpRoot, "mock-probe-agy.mjs");
+		const convDir = path.join(tmpRoot, ".gemini", "antigravity-cli", "conversations");
+		fs.mkdirSync(convDir, { recursive: true });
+
+		const script = `#!/usr/bin/env node
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as readline from "node:readline";
+
+const stateFile = ${JSON.stringify(statePath)};
+const convDir = ${JSON.stringify(convDir)};
+const state = { initCount: 0, newCount: 0, closedIds: [] };
+function flushState() { fs.writeFileSync(stateFile, JSON.stringify(state)); }
+flushState();
+
+let seq = 0;
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    state.initCount++;
+    flushState();
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "Mock", version: "1.5.13" } }
+      }) + "\\n");
+    }, 35);
+    return;
+  }
+  if (msg.method === "session/new") {
+    state.newCount++;
+    const sid = "probe-sess-" + (++seq);
+    fs.writeFileSync(path.join(convDir, sid + ".db"), "sqlite-placeholder");
+    flushState();
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          sessionId: sid,
+          models: { availableModels: [{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" }] },
+          configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "gemini-4-neon", options: [{ value: "gemini-4-neon", name: "Gemini 4 Neon" }] }]
+        }
+      }) + "\\n");
+    }, 45);
+    return;
+  }
+  if (msg.method === "session/close") {
+    state.closedIds.push(msg.params?.sessionId);
+    flushState();
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
+  }
+});
+`;
+		fs.writeFileSync(mockBin, script, { mode: 0o755 });
+		let binToUse = mockBin;
+		if (process.platform === "win32") {
+			const cmdWrap = path.join(tmpRoot, "mock-probe-agy.cmd");
+			fs.writeFileSync(cmdWrap, `@node "${mockBin}" %*\r\n`);
+			binToUse = cmdWrap;
+		}
+
+		const cfg = {
+			...DEFAULT_BRIDGE_CONFIG,
+			agyBin: binToUse,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+		const pm = new AcpProcessManager();
+
+		try {
+			// 1. 并发 acquire：调用者 1 在 initialize 途中 abort，调用者 2 必须正常拿到同一健康连接
+			const ac1 = new AbortController();
+			const p1 = pm.acquire(cfg, undefined, ac1.signal);
+			const p2 = pm.acquire(cfg, undefined);
+			setTimeout(() => ac1.abort(), 10);
+			await assert.rejects(p1);
+			const conn = await p2;
+			assert.equal(conn.isAlive, true);
+
+			// 2. 调用者在 session/new 途中 abort：迟到响应到达后必须自动触发 session/close 并清理孤儿 .db
+			const acOrphan = new AbortController();
+			const orphanReq = conn.request("session/new", { cwd: tmpRoot, mcpServers: [] }, { signal: acOrphan.signal });
+			setTimeout(() => acOrphan.abort(), 10);
+			await assert.rejects(orphanReq);
+
+			const deadline = Date.now() + 3_000;
+			while (Date.now() < deadline) {
+				const st = JSON.parse(fs.readFileSync(statePath, "utf8")) as { closedIds: string[] };
+				if (st.closedIds.includes("probe-sess-1") && !fs.existsSync(path.join(convDir, "probe-sess-1.db"))) {
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 15));
+			}
+			const afterOrphan = JSON.parse(fs.readFileSync(statePath, "utf8")) as { closedIds: string[] };
+			assert.ok(afterOrphan.closedIds.includes("probe-sess-1"));
+			assert.equal(fs.existsSync(path.join(convDir, "probe-sess-1.db")), false);
+
+			// 3. 4 个并发模型探测共享单一 Singleflight，仅触发 1 次新的 session/new
+			const [s1, s2, s3, s4] = await Promise.all([
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
+			]);
+			assert.equal(s1.models.length, s2.models.length);
+			assert.equal(s3.models.length, s4.models.length);
+			const finalState = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+				initCount: number;
+				newCount: number;
+				closedIds: string[];
+			};
+			assert.equal(finalState.initCount, 1);
+			assert.equal(finalState.newCount, 2); // 1 次孤儿测试 + 1 次合并探测
+			assert.ok(finalState.closedIds.includes("probe-sess-2"));
+			assert.equal(fs.existsSync(path.join(convDir, "probe-sess-2.db")), false);
+		} finally {
+			await pm.disposeAll();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});

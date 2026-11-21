@@ -12,7 +12,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { probeAgyVersion, resolveAgyBinary } from "../acp/binary-resolver.ts";
+import { buildAgySpawnSpec, probeAgyVersion, resolveAgyBinary } from "../acp/binary-resolver.ts";
 import type { AcpProcessManager } from "../acp/process-manager.ts";
 import type {
 	AcpSessionListResult,
@@ -33,6 +33,8 @@ import {
 	type ToolMode,
 } from "../config.ts";
 import { isPiMcpRelatedTool } from "../mcp/pi-mcp-forwarder.ts";
+import { AGY_SESSION_ANCHOR_CUSTOM_TYPE, type AgySessionAnchor } from "../session/checkpoint-sync.ts";
+import { computeTranscriptDigest } from "../session/reconcile.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import { createZeroUsage } from "../stream/event-mapper.ts";
 import { AGY_MIRROR_TOOL_NAMES } from "../tools/agy-renderers.ts";
@@ -51,10 +53,12 @@ const OVERLAPPING_PI_BASE_TOOLS = new Set<string>([
 
 /**
  * 管理进入或退出 Antigravity 不同工具模式时的 Pi 激活工具集快照与自动恢复。
+ * 遵循 Pi 1.6.0 MCP 暴露策略（不强行激活 hidden/deferred 工具），并保留会话途中 `tool_search` 动态加载的工具。
  */
 export class ToolActivationController {
 	private readonly pi: ExtensionAPI;
 	private savedUserActiveTools?: string[];
+	private lastAppliedMode?: ToolMode;
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
@@ -65,6 +69,7 @@ export class ToolActivationController {
 
 		if (!isAgyModel || config.toolMode === "pi-tools") {
 			this.restoreUserTools();
+			this.lastAppliedMode = isAgyModel ? "pi-tools" : undefined;
 			return;
 		}
 
@@ -76,37 +81,62 @@ export class ToolActivationController {
 		}
 
 		const mirrorSet = new Set<string>(AGY_MIRROR_TOOL_NAMES);
+		const hasAnyMirror = current.some((t) => mirrorSet.has(t));
 		const nonMirrorCurrent = current.filter((t) => !mirrorSet.has(t));
 
 		if (!this.savedUserActiveTools && nonMirrorCurrent.length > 0) {
 			this.savedUserActiveTools = nonMirrorCurrent;
+		} else if (this.savedUserActiveTools && hasAnyMirror && nonMirrorCurrent.length > 0) {
+			const merged = new Set(this.savedUserActiveTools);
+			for (const name of nonMirrorCurrent) {
+				if (!OVERLAPPING_PI_BASE_TOOLS.has(name)) {
+					merged.add(name);
+				}
+			}
+			this.savedUserActiveTools = Array.from(merged);
 		}
 
-		const baseUserTools = this.savedUserActiveTools ?? nonMirrorCurrent;
+		// 将首次基线与当前运行态中已动态激活（如 tool_search 解锁）的非镜像工具合并，绝不回滚动态工具
+		const activePool = hasAnyMirror
+			? Array.from(new Set([...(this.savedUserActiveTools ?? []), ...nonMirrorCurrent]))
+			: (this.savedUserActiveTools ?? nonMirrorCurrent);
+
 		const flags = resolveEffectiveFlags(config);
 
 		if (config.toolMode === "agy-tools") {
 			if (flags.bridgePiMcp && config.piMcpBridgeStrategy === "via-host") {
-				let allRegisteredNames: string[] = [];
+				// 仅保留用户激活集（含 direct 暴露与 tool_search 已加载项）中的 MCP 工具，并补回可能因切换模式临时移除的 codemode/tool_search 入口
+				let registeredEntryTools: string[] = [];
 				try {
-					allRegisteredNames = this.pi.getAllTools().map((t) => t.name);
+					registeredEntryTools = this.pi
+						.getAllTools()
+						.map((t) => t.name)
+						.filter((name) => name === "codemode" || name === "tool_search");
 				} catch {
 					// 忽略未初始化运行态
 				}
-				const candidatePool = Array.from(new Set([...baseUserTools, ...allRegisteredNames]));
-				const mcpBridgedTools = candidatePool.filter(
-					(name) =>
-						isPiMcpRelatedTool(name) || name === "codemode" || name === "tool_search",
+				const mcpBridgedTools = Array.from(
+					new Set([
+						...activePool.filter(
+							(name) =>
+								isPiMcpRelatedTool(name) || name === "codemode" || name === "tool_search",
+						),
+						...registeredEntryTools,
+					]),
 				);
 				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES, ...mcpBridgedTools]);
 			} else {
 				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES]);
 			}
 		} else {
-			// hybrid：激活镜像工具 + 不与 AGY 内置基础读写冲突的 Pi 扩展工具
-			const extraTools = baseUserTools.filter((name) => !OVERLAPPING_PI_BASE_TOOLS.has(name));
+			// hybrid：激活镜像工具 + 当前活跃的非重叠扩展/动态工具（保留 tool_search 动态增量）
+			const sourceForHybrid =
+				this.lastAppliedMode === "hybrid" && hasAnyMirror ? nonMirrorCurrent : activePool;
+			const extraTools = sourceForHybrid.filter((name) => !OVERLAPPING_PI_BASE_TOOLS.has(name));
 			this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES, ...extraTools]);
 		}
+
+		this.lastAppliedMode = config.toolMode;
 	}
 
 	private restoreUserTools(): void {
@@ -119,15 +149,16 @@ export class ToolActivationController {
 
 		const mirrorSet = new Set<string>(AGY_MIRROR_TOOL_NAMES);
 		const hasAnyMirror = current.some((t) => mirrorSet.has(t));
+		const nonMirrorCurrent = current.filter((t) => !mirrorSet.has(t));
 
 		if (this.savedUserActiveTools) {
-			const restored = this.savedUserActiveTools;
+			const dynamicAdditions = nonMirrorCurrent.filter((t) => !OVERLAPPING_PI_BASE_TOOLS.has(t));
+			const restored = Array.from(new Set([...this.savedUserActiveTools, ...dynamicAdditions]));
 			this.savedUserActiveTools = undefined;
 			this.pi.setActiveTools(restored);
 		} else if (hasAnyMirror) {
-			const cleaned = current.filter((t) => !mirrorSet.has(t));
 			this.pi.setActiveTools(
-				cleaned.length > 0 ? cleaned : ["read", "bash", "edit", "write"],
+				nonMirrorCurrent.length > 0 ? nonMirrorCurrent : ["read", "bash", "edit", "write"],
 			);
 		}
 	}
@@ -237,7 +268,7 @@ export function registerAntigravityCommands(deps: CommandDependencies): void {
 					return;
 				}
 				case "bridge": {
-					await handleBridgeSubcommand(tokens.slice(1), ctx, coordinator);
+					await handleBridgeSubcommand(tokens.slice(1), ctx, coordinator, toolActivation);
 					return;
 				}
 				case "agent-mode": {
@@ -362,6 +393,7 @@ async function handleBridgeSubcommand(
 	args: string[],
 	ctx: ExtensionCommandContext,
 	coordinator: TurnCoordinator,
+	toolActivation: ToolActivationController,
 ): Promise<void> {
 	const keyMap: Record<string, keyof Pick<BridgeConfig, "bridgePiMcp" | "bridgePiSkills" | "bridgePiAgentsMd">> = {
 		mcp: "bridgePiMcp",
@@ -414,6 +446,8 @@ async function handleBridgeSubcommand(
 	};
 	coordinator.setConfig(nextConfig);
 	saveGlobalBridgeConfigPatch({ [targetFieldKey]: parsedVal });
+	toolActivation.syncForContext(ctx, nextConfig);
+	updateAntigravityStatusBar(ctx, nextConfig, coordinator.getTelemetrySnapshot());
 
 	const updatedFlags = resolveEffectiveFlags(nextConfig);
 	const effectiveNow =
@@ -487,24 +521,22 @@ async function handleLoginSubcommand(
 		);
 		if (!confirmed) return;
 
-		const spawnLoginCmd =
-			bin.isWindowsWrapperScript && bin.binPath.includes(" ")
-				? `"${bin.binPath}"`
-				: bin.binPath;
+		const loginSpec = buildAgySpawnSpec(bin, [
+			"acp",
+			"--login",
+			"--gemini-dir",
+			coordinator.config.geminiDir,
+		]);
 
 		const exitStatus = await ctx.ui.custom<number | null>((tui, _theme, _kb, done) => {
 			tui.stop();
 			process.stdout.write("\x1b[2J\x1b[H");
 			let status: number | null = null;
 			try {
-				const res = spawnSync(
-					spawnLoginCmd,
-					["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
-					{
-						stdio: "inherit",
-						shell: bin.isWindowsWrapperScript,
-					},
-				);
+				const res = spawnSync(loginSpec.command, loginSpec.args, {
+					stdio: "inherit",
+					windowsVerbatimArguments: loginSpec.windowsVerbatimArguments,
+				});
 				status = res.status;
 			} finally {
 				tui.start();
@@ -670,6 +702,17 @@ async function handleSessionsImportSubcommand(
 		await conn.closeSessionSafe(target.sessionId);
 	}
 
+	const importedAnchor: AgySessionAnchor = {
+		version: 1,
+		agySessionId: target.sessionId,
+		toolMode: coordinator.config.toolMode,
+		transcriptDigest: computeTranscriptDigest(replayedMessages),
+		messageCount: replayedMessages.length,
+		mountDigest: "",
+		toolsDigest: "",
+		importedRaw: true,
+	};
+
 	await ctx.newSession({
 		setup: async (sessionManager) => {
 			for (const msg of replayedMessages) {
@@ -678,14 +721,10 @@ async function handleSessionsImportSubcommand(
 			if (target.title?.trim()) {
 				sessionManager.appendSessionInfo(target.title.trim());
 			}
+			// 直接在 setup 阶段通过新会话自身的 sessionManager 写入恢复锚点，避免旧扩展闭包因 session 替换失效
+			sessionManager.appendCustomEntry(AGY_SESSION_ANCHOR_CUSTOM_TYPE, importedAnchor);
 		},
 		withSession: async (replacedCtx) => {
-			coordinator.registerImportedSessionAnchor({
-				agySessionId: target.sessionId,
-				visibleMessages: replayedMessages,
-				mountDigest: "",
-				importedRaw: true,
-			});
 			replacedCtx.ui.notify(
 				`已导入会话 "${target.title || target.sessionId.slice(0, 8)}"（共 ${replayedMessages.length} 条消息）。`,
 				"info",

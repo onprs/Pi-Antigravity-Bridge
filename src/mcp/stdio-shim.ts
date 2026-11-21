@@ -57,6 +57,41 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 		inflight.add(task);
 	};
 
+	const sseAbort = new AbortController();
+	const startSseNotificationPump = async (): Promise<void> => {
+		try {
+			const res = await fetch(targetUrl, {
+				method: "GET",
+				headers: {
+					Accept: "text/event-stream",
+					Authorization: `Bearer ${bearerToken}`,
+				},
+				signal: sseAbort.signal,
+			});
+			if (!res.ok || !res.body) return;
+			const sseDecoder = new StringDecoder("utf8");
+			let sseBuf = "";
+			for await (const chunk of res.body) {
+				sseBuf += sseDecoder.write(Buffer.from(chunk));
+				let nl = sseBuf.indexOf("\n");
+				while (nl !== -1) {
+					const rawLine = sseBuf.slice(0, nl).trim();
+					sseBuf = sseBuf.slice(nl + 1);
+					if (rawLine.startsWith("data:")) {
+						const payload = rawLine.slice(5).trim();
+						if (payload.length > 0) {
+							process.stdout.write(`${payload}\n`);
+						}
+					}
+					nl = sseBuf.indexOf("\n");
+				}
+			}
+		} catch {
+			// stdin 结束主动中断或宿主关闭连接时静默退出
+		}
+	};
+	void startSseNotificationPump();
+
 	process.stdin.on("data", (chunk: Buffer) => {
 		buffer += decoder.write(chunk);
 		let idx = buffer.indexOf("\n");
@@ -75,10 +110,13 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 		if (rest.length > 0) {
 			dispatchLine(rest);
 		}
+		void Promise.allSettled(Array.from(inflight)).finally(() => {
+			sseAbort.abort();
+		});
 	});
 }
 
-/** 生成一段内联 Node.js 启动脚本参数，使宿主无需依赖额外编译产物即可在任意平台启动并发 Stdio 转发桥 */
+/** 生成一段内联 Node.js 启动脚本参数，使宿主无需依赖额外编译产物即可在任意平台启动并发 Stdio 转发桥（含 SSE 工具变更通知订阅） */
 export function buildInlineStdioShimCommand(
 	targetUrl: string,
 	bearerToken: string,
@@ -87,6 +125,23 @@ export function buildInlineStdioShimCommand(
 		'const url = process.env.PI_AGY_MCP_URL;',
 		'const token = process.env.PI_AGY_MCP_TOKEN;',
 		'let buf = "";',
+		'const inflight = new Set();',
+		'const sseAc = new AbortController();',
+		'(async () => {',
+		'  try {',
+		'    const r = await fetch(url, { method: "GET", headers: { "Accept": "text/event-stream", "Authorization": "Bearer " + token }, signal: sseAc.signal });',
+		'    if (!r.ok || !r.body) return;',
+		'    let sb = ""; const td = new TextDecoder();',
+		'    for await (const ch of r.body) {',
+		'      sb += td.decode(ch, { stream: true });',
+		'      let k;',
+		'      while ((k = sb.indexOf("\\n")) !== -1) {',
+		'        const ln = sb.slice(0, k).trim(); sb = sb.slice(k + 1);',
+		'        if (ln.startsWith("data:")) { const d = ln.slice(5).trim(); if (d) process.stdout.write(d + "\\n"); }',
+		'      }',
+		'    }',
+		'  } catch {}',
+		'})();',
 		'async function send(line) {',
 		'  let msg; try { msg = JSON.parse(line); } catch { return; }',
 		'  const hasId = msg && msg.id !== undefined;',
@@ -98,13 +153,14 @@ export function buildInlineStdioShimCommand(
 		'    if (hasId) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e) } }) + "\\n");',
 		'  }',
 		'}',
+		'function dispatch(l) { const p = send(l).finally(() => inflight.delete(p)); inflight.add(p); }',
 		'function drain(flushAll) {',
 		'  let i;',
 		'  while ((i = buf.indexOf("\\n")) !== -1) {',
 		'    const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1);',
-		'    if (l) void send(l);',
+		'    if (l) dispatch(l);',
 		'  }',
-		'  if (flushAll) { const r = buf.trim(); buf = ""; if (r) void send(r); }',
+		'  if (flushAll) { const r = buf.trim(); buf = ""; if (r) dispatch(r); Promise.allSettled([...inflight]).finally(() => sseAc.abort()); }',
 		'}',
 		'process.stdin.setEncoding("utf8");',
 		'process.stdin.on("data", (c) => { buf += c; drain(false); });',

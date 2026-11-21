@@ -343,6 +343,8 @@ function buildPureModeWorkspaceContextBlock(params: {
 	rules: readonly ExtractedRuleSource[];
 	rawSkillsSection: string | null | undefined;
 	bridgeSkills: boolean;
+	rawMcpServersSection?: string | null | undefined;
+	bridgeMcp?: boolean;
 }): string {
 	const blocks: string[] = [
 		"<workspace_context>",
@@ -377,6 +379,16 @@ function buildPureModeWorkspaceContextBlock(params: {
 				? trimmedSkills
 				: `<skills>\n${trimmedSkills}\n</skills>`;
 			blocks.push(wrappedSkills);
+		}
+	}
+
+	if (params.bridgeMcp && params.rawMcpServersSection) {
+		const trimmedMcp = params.rawMcpServersSection.trim();
+		if (trimmedMcp.length > 0) {
+			const wrappedMcp = trimmedMcp.startsWith("<mcp_servers>")
+				? trimmedMcp
+				: `<mcp_servers>\n${trimmedMcp}\n</mcp_servers>`;
+			blocks.push(wrappedMcp);
 		}
 	}
 
@@ -446,6 +458,8 @@ export function prepareCustomizationMount(
 			rules: allPiRules,
 			rawSkillsSection: sections.skills,
 			bridgeSkills: flags.bridgePiSkills,
+			rawMcpServersSection: sections.mcp_servers,
+			bridgeMcp: flags.bridgePiMcp,
 		});
 
 		const mountDigest = crypto

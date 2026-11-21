@@ -316,60 +316,139 @@ export function writeCachedCatalog(
 	}
 }
 
-export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: string): void {
-	const convDir = resolveAgyConversationsDir(config);
-	for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
-		try {
-			const target = path.join(convDir, `${sessionId}${suffix}`);
-			if (fs.existsSync(target)) {
-				fs.unlinkSync(target);
-			}
-		} catch {
-			// 忽略文件清理异常
-		}
+const CATALOG_FRESH_TTL_MS = 15_000;
+let inFlightCatalogProbe: Promise<DiscoveredCatalogSnapshot> | undefined;
+let lastLiveProbeSnapshot: DiscoveredCatalogSnapshot | undefined;
+let lastLiveProbeAt = 0;
+
+function raceCatalogProbeWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		return Promise.reject(signal.reason ?? new Error("模型探测已取消"));
 	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			reject(signal.reason ?? new Error("模型探测已取消"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(v) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(v);
+			},
+			(err) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(err);
+			},
+		);
+	});
+}
+
+/**
+ * 清理指定会话（如零消息探针或分叉失败副本）的 SQLite 数据库文件。
+ * 支持延时异步重试，兼容 Windows 下 `agy acp --worker` 退出前短暂持有文件句柄的场景。
+ */
+export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: string): void {
+	if (!sessionId) return;
+	const convDir = resolveAgyConversationsDir(config);
+	const tryRemove = (): boolean => {
+		let allGone = true;
+		for (const suffix of [".db", ".db-wal", ".db-shm", ".db-journal"]) {
+			const target = path.join(convDir, `${sessionId}${suffix}`);
+			try {
+				if (fs.existsSync(target)) {
+					fs.unlinkSync(target);
+				}
+			} catch {
+				allGone = false;
+			}
+		}
+		return allGone;
+	};
+
+	if (!tryRemove()) {
+		setTimeout(() => {
+			if (!tryRemove()) {
+				setTimeout(() => {
+					tryRemove();
+				}, 1_200).unref();
+			}
+		}, 600).unref();
+	}
+}
+
+export interface ProbeCatalogOptions {
+	signal?: AbortSignal;
+	force?: boolean;
 }
 
 /**
  * 在线零配额探测当前账号可用的 AGY 模型与订阅层级。
- * 创建空 ACP 会话读取元数据后立即关闭并移除空数据库文件，不发送任何 `session/prompt`。
+ * 内置 Singleflight 并发合并与短时新鲜度缓存，彻底杜绝并发刷新产生多个孤儿 worker 与空数据库文件。
  */
 export async function probeLiveAntigravityCatalog(
 	processManager: AcpProcessManager,
 	config: BridgeConfig,
 	cwd: string,
-	signal?: AbortSignal,
+	signalOrOptions?: AbortSignal | ProbeCatalogOptions,
 ): Promise<DiscoveredCatalogSnapshot> {
-	const conn = await processManager.acquire(config, undefined, signal);
-	const sessionRes = await conn.request<AcpSessionNewResult>(
-		"session/new",
-		{
-			cwd,
-			mcpServers: [],
-		},
-		{ timeoutMs: 20_000, signal },
-	);
+	const opts: ProbeCatalogOptions =
+		signalOrOptions && "aborted" in signalOrOptions
+			? { signal: signalOrOptions }
+			: (signalOrOptions ?? {});
 
-	try {
-		const { models, modelEfforts } = aggregateAcpModels(
-			sessionRes.models?.availableModels ?? [],
-			sessionRes.configOptions ?? [],
-		);
-		const snapshot: DiscoveredCatalogSnapshot = {
-			version: 1,
-			updatedAt: Date.now(),
-			tier: sessionRes._meta?.antigravity?.tier,
-			models: models.length > 0 ? models : getSeedModels(),
-			modelEfforts,
-		};
-		writeCachedCatalog(snapshot);
-		return snapshot;
-	} finally {
-		if (sessionRes.sessionId) {
-			await conn.closeSessionSafe(sessionRes.sessionId);
-			removeEmptyProbeSessionFiles(config, sessionRes.sessionId);
-		}
+	if (opts.signal?.aborted) {
+		throw opts.signal.reason ?? new Error("模型探测已取消");
 	}
+
+	if (
+		!opts.force &&
+		lastLiveProbeSnapshot &&
+		Date.now() - lastLiveProbeAt < CATALOG_FRESH_TTL_MS
+	) {
+		return lastLiveProbeSnapshot;
+	}
+
+	if (!inFlightCatalogProbe) {
+		inFlightCatalogProbe = (async () => {
+			const conn = await processManager.acquire(config, undefined);
+			const sessionRes = await conn.request<AcpSessionNewResult>(
+				"session/new",
+				{
+					cwd,
+					mcpServers: [],
+				},
+				{ timeoutMs: 20_000 },
+			);
+
+			try {
+				const { models, modelEfforts } = aggregateAcpModels(
+					sessionRes.models?.availableModels ?? [],
+					sessionRes.configOptions ?? [],
+				);
+				const snapshot: DiscoveredCatalogSnapshot = {
+					version: 1,
+					updatedAt: Date.now(),
+					tier: sessionRes._meta?.antigravity?.tier,
+					models: models.length > 0 ? models : getSeedModels(),
+					modelEfforts,
+				};
+				writeCachedCatalog(snapshot);
+				lastLiveProbeSnapshot = snapshot;
+				lastLiveProbeAt = Date.now();
+				return snapshot;
+			} finally {
+				if (sessionRes.sessionId) {
+					await conn.closeSessionSafe(sessionRes.sessionId);
+					removeEmptyProbeSessionFiles(config, sessionRes.sessionId);
+				}
+			}
+		})().finally(() => {
+			inFlightCatalogProbe = undefined;
+		});
+	}
+
+	return raceCatalogProbeWithSignal(inFlightCatalogProbe, opts.signal);
 }
 
 export interface ResolvedModelSelection {

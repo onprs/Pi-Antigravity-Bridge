@@ -167,6 +167,70 @@ rl.on("line", async (line) => {
       return;
     }
 
+    if (lastBlockText === "SAME_GEN_DUAL_SEQ_TOOLS" && !isModeA && sess?.mcpHttp) {
+      sess.inFlightPromptId = msg.id;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      // 同一次 LLM 生成连续串行执行 2 个工具（used 窗口水位保持 50000 不变）
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 50000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "dup_1", title: "mcp_pi_tools_read" } }
+      });
+      await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 31,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "one.ts" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+
+      // 第 2 个工具在同一生成中紧随其后发出（无新 usage_update 或相同 used=50000）
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "dup_2", title: "mcp_pi_tools_read" } }
+      });
+      await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 32,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "two.ts" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "usage_update", used: 54000, size: 1048576 } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Summary ok." } } }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          stopReason: "end_turn",
+          usage: { inputTokens: 4000, cachedReadTokens: 100000, outputTokens: 8000, thoughtTokens: 1000 }
+        }
+      });
+      return;
+    }
+
     if (lastBlockText === "MULTI_STEP_WITH_STEER" && !isModeA && sess?.mcpHttp) {
       sess.inFlightPromptId = msg.id;
       const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
@@ -765,8 +829,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(msg2.stopReason, "toolUse");
 			const tc2 = msg2.content.find((c): c is ToolCall => c.type === "toolCall")!;
 			assert.equal(tc2.arguments.path, "b.ts");
-			// 关键断言 2：首轮第 2 步已基于前序窗口前缀估算非零 cacheRead，状态栏可实时显示缓存命中率
-			assert.ok(msg2.usage.cacheRead >= 19000, `预期首轮第 2 步 cacheRead > 0，实际为 ${msg2.usage.cacheRead}`);
+			// 关键断言 2：首轮第 2 步基于前序窗口前缀保守估算非零 cacheRead（0.85 折算，不虚报 100%）
+			assert.ok(
+				msg2.usage.cacheRead >= 16000 && msg2.usage.cacheRead < 20000,
+				`预期首轮第 2 步 cacheRead 落在保守区间 [16000, 20000)，实际为 ${msg2.usage.cacheRead}`,
+			);
 
 			// Step 3：完成 b.ts 工具执行，收口整轮输出（包含原任务结果与运行中消息响应）
 			const tr2 = {
@@ -861,6 +928,105 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.map((c) => c.text)
 				.join("");
 			assert.equal(text2, "Echo -> FOLLOWUP_MSG:取消后立刻重发");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("同次生成拆分多工具不重复累加 cacheRead、末步不倒灌累计 output 余量且 aborted 轮次绝不写入损坏锚点", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-telemetry-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const appendedEntries: Array<{ type: string; data: unknown }> = [];
+		const trackingPi = {
+			appendEntry(type: string, data: unknown) {
+				appendedEntries.push({ type, data });
+			},
+			getSessionName() {
+				return undefined;
+			},
+			setSessionName() {},
+		} as unknown as ExtensionAPI;
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(trackingPi, pm, broker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+			];
+
+			const u1 = { role: "user" as const, content: "SAME_GEN_DUAL_SEQ_TOOLS", timestamp: 1 };
+			const step1 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: [u1] }), {
+					sessionId: "pi-sess-tel",
+				})
+				.result();
+			const tc1 = step1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			assert.equal(step1.usage.totalTokens, 50000);
+
+			const tr1 = {
+				role: "toolResult" as const,
+				toolCallId: tc1.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "file-1" }],
+				isError: false,
+				timestamp: 2,
+			};
+			const step2 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: [u1, step1, tr1] }), {
+					sessionId: "pi-sess-tel",
+				})
+				.result();
+			const tc2 = step2.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			// 同一次生成拆出的第 2 个工具调用必须返回全零 Usage，杜绝 2x/3x cacheRead 虚高
+			assert.equal(step2.usage.totalTokens, 0);
+			assert.equal(step2.usage.cacheRead, 0);
+
+			const tr2 = {
+				role: "toolResult" as const,
+				toolCallId: tc2.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "file-2" }],
+				isError: false,
+				timestamp: 3,
+			};
+			const step3 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({ tools, messages: [u1, step1, tr1, step2, tr2] }),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			assert.equal(step3.stopReason, "stop");
+			// 末步绝不把整轮累计 outputTokens (8000) 倒灌进仅十余字符的最终回复，且总窗口严格等于 54000
+			assert.ok(step3.usage.output < 100, `末步 output 不应倒灌累计余量，实际为 ${step3.usage.output}`);
+			assert.equal(step3.usage.totalTokens, 54000);
+
+			// 正常完结轮次可写入 1 条锚点
+			await coord.persistTurnAnchor([u1, step1, tr1, step2, tr2, step3], "pi-sess-tel");
+			assert.equal(appendedEntries.length, 1);
+
+			// 按下 Esc 产生的 aborted 消息传入 persistTurnAnchor 时必须严格拦截，绝不追加损坏锚点
+			const fakeAborted = { ...step3, stopReason: "aborted" as const };
+			await coord.persistTurnAnchor([u1, step1, tr1, step2, tr2, step3, fakeAborted], "pi-sess-tel");
+			assert.equal(appendedEntries.length, 1);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

@@ -170,6 +170,195 @@ function verifyRequiredTables(db: import("node:sqlite").DatabaseSync): boolean {
 	return REQUIRED_TABLES.every((req) => names.has(req));
 }
 
+export interface SqliteGenerationUsage {
+	stepIdx: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheWriteTokens: number;
+	cacheReadTokens: number;
+	thoughtTokens?: number;
+}
+
+function readProtobufVarint(buf: Uint8Array, offset: number): [number, number] | undefined {
+	let result = 0;
+	let shift = 0;
+	let pos = offset;
+	while (pos < buf.length) {
+		const byte = buf[pos++];
+		result += (byte & 0x7f) * 2 ** shift;
+		if ((byte & 0x80) === 0) {
+			return [result, pos];
+		}
+		shift += 7;
+		if (shift > 53) return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * 解析 AGY `steps.metadata`（`step_type = 15` 即 `PLANNER_RESPONSE`）字段 9 中的上游 API 真实单步 Token 明细。
+ * 体积仅约 390 字节，在 Gemini 与 Claude 模型上均统一编码：
+ * - field 2: uncached inputTokens
+ * - field 3: total outputTokens（含思考，等于 field 9 + field 10）
+ * - field 4: cachedWriteTokens（可选）
+ * - field 5: cachedReadTokens（可选）
+ * - field 9: thoughtTokens（思考 Token，可选）
+ * - field 10: responseTokens（正文与工具调用 Token，可选）
+ */
+export function parseStepMetadataGenerationUsage(
+	metadata: Uint8Array,
+	stepIdx: number,
+): SqliteGenerationUsage | undefined {
+	let pos = 0;
+	while (pos < metadata.length) {
+		const tagRes = readProtobufVarint(metadata, pos);
+		if (!tagRes) return undefined;
+		const [tag, nextPos] = tagRes;
+		pos = nextPos;
+		const fieldNo = Math.floor(tag / 8);
+		const wireType = tag & 7;
+		if (fieldNo <= 0) return undefined;
+
+		if (wireType === 0) {
+			const valRes = readProtobufVarint(metadata, pos);
+			if (!valRes) return undefined;
+			pos = valRes[1];
+		} else if (wireType === 2) {
+			const lenRes = readProtobufVarint(metadata, pos);
+			if (!lenRes) return undefined;
+			const [len, subStart] = lenRes;
+			const subEnd = subStart + len;
+			if (subEnd > metadata.length) return undefined;
+			if (fieldNo === 9) {
+				const sub = metadata.subarray(subStart, subEnd);
+				let k = 0;
+				const fields = new Map<number, number>();
+				while (k < sub.length) {
+					const innerTag = readProtobufVarint(sub, k);
+					if (!innerTag) break;
+					k = innerTag[1];
+					const innerFn = Math.floor(innerTag[0] / 8);
+					const innerWt = innerTag[0] & 7;
+					if (innerWt === 0) {
+						const v = readProtobufVarint(sub, k);
+						if (!v) break;
+						k = v[1];
+						fields.set(innerFn, v[0]);
+					} else if (innerWt === 2) {
+						const l = readProtobufVarint(sub, k);
+						if (!l || l[1] + l[0] > sub.length) break;
+						k = l[1] + l[0];
+					} else if (innerWt === 5) {
+						k += 4;
+					} else if (innerWt === 1) {
+						k += 8;
+					} else {
+						break;
+					}
+				}
+				const inputTokens = fields.get(2) ?? 0;
+				const rawOutput = fields.get(3) ?? 0;
+				const cacheWriteTokens = fields.get(4) ?? 0;
+				const cacheReadTokens = fields.get(5) ?? 0;
+				const thoughtTokens = fields.get(9);
+				if (inputTokens + rawOutput + cacheWriteTokens + cacheReadTokens > 0) {
+					return {
+						stepIdx,
+						inputTokens,
+						outputTokens:
+							thoughtTokens !== undefined ? Math.max(rawOutput, thoughtTokens) : rawOutput,
+						cacheWriteTokens,
+						cacheReadTokens,
+						thoughtTokens,
+					};
+				}
+			}
+			pos = subEnd;
+		} else if (wireType === 5) {
+			pos += 4;
+		} else if (wireType === 1) {
+			pos += 8;
+		} else {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+/** 读取指定会话当前 `steps` 表的最大 `idx`（新建会话尚无记录时返回 `-1`），用于在 `session/resume` 时定位起始水位 */
+export async function readCurrentMaxSqliteStepIdx(
+	config: BridgeConfig,
+	agySessionId: string,
+): Promise<number> {
+	if (!agySessionId) return -1;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	if (!fs.existsSync(dbPath)) return -1;
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return -1;
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+		const row = db
+			.prepare("SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps")
+			.get() as { maxIdx: number } | undefined;
+		return typeof row?.maxIdx === "number" ? row.maxIdx : -1;
+	} catch {
+		return -1;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+/**
+ * 以只读方式读取指定水位之后新产生的全部 `PLANNER_RESPONSE`（`step_type = 15`）逐次生成统计。
+ * 若本地库不存在或跨版本字段变化则返回空数组，由调用方平滑回退至 ACP 窗口统计。
+ */
+export async function readSqliteGenerationUsagesSince(
+	config: BridgeConfig,
+	agySessionId: string,
+	afterStepIdx: number,
+): Promise<SqliteGenerationUsage[]> {
+	if (!agySessionId) return [];
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	if (!fs.existsSync(dbPath)) return [];
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return [];
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+		const rows = db
+			.prepare(
+				"SELECT idx, metadata FROM steps WHERE step_type = 15 AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
+			)
+			.all(afterStepIdx) as Array<{ idx: number; metadata: Uint8Array }>;
+
+		const parsed: SqliteGenerationUsage[] = [];
+		for (const row of rows) {
+			if (row.metadata && row.metadata.byteLength > 0) {
+				const u = parseStepMetadataGenerationUsage(row.metadata, row.idx);
+				if (u) {
+					parsed.push(u);
+				}
+			}
+		}
+		return parsed;
+	} catch {
+		return [];
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
 /**
  * 以只读模式采集 AGY 会话 SQLite 数据库的当前高水位检查点。
  * 遇到文件不存在、WAL 锁冲突或跨版本表结构差异时静默返回 `undefined`。

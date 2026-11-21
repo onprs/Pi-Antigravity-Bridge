@@ -43,10 +43,22 @@ function isQuotaExhaustedLine(line: string): boolean {
 	return QUOTA_ERROR_LINE_REGEX.test(trimmed) || LEGACY_ATTEMPT_QUOTA_REGEX.test(trimmed);
 }
 
-function mightBecomeQuotaErrorLine(lineFragment: string): boolean {
-	const trimmed = lineFragment.trimStart();
-	if (trimmed.length === 0) return false;
-	if (isQuotaExhaustedLine(trimmed)) return true;
+function mightBecomeFenceOrQuotaLine(lineStartFragment: string, inFenceBlock: boolean): boolean {
+	const trimmed = lineStartFragment.trimStart();
+	// 仅包含前导空白时，后续字符可能构成 ``` 围栏或 ⚠ 告警（限制最多暂扣 16 个前导空白）
+	if (trimmed.length === 0) {
+		return lineStartFragment.length <= 16;
+	}
+	// 跨 chunk 拆分的 ``` 围栏前缀（无论当前在代码块内外均需识别闭合/开启）
+	if ("```".startsWith(trimmed) || trimmed.startsWith("```")) {
+		return trimmed.length < 80;
+	}
+	if (inFenceBlock) {
+		return false;
+	}
+	if (isQuotaExhaustedLine(trimmed)) {
+		return true;
+	}
 	for (const prefix of SUSPICIOUS_LINE_PREFIXES) {
 		if (prefix.startsWith(trimmed) || trimmed.startsWith(prefix)) {
 			return trimmed.length < 240;
@@ -56,11 +68,12 @@ function mightBecomeQuotaErrorLine(lineFragment: string): boolean {
 }
 
 /**
- * 流式行尾缓冲与 429 配额软错误拦截器。
- * 普通文本与 Markdown 代码块内部内容零延迟透传；仅当代码块外行首命中 `⚠` 告警前缀时暂扣至行尾判定。
+ * 流式行首状态跟踪与 429 配额软错误拦截器。
+ * 严格维护 `atLineStart` 与代码块围栏状态：行中文本直接零延迟透传，不会因跨 chunk 切分把行内示例误判为行首 429 告警或漏计跨块围栏。
  */
 export class QuotaSoftErrorFilter {
 	private heldLine = "";
+	private atLineStart = true;
 	private detectedError?: string;
 	private inFenceBlock = false;
 
@@ -72,41 +85,48 @@ export class QuotaSoftErrorFilter {
 		if (this.detectedError) {
 			return { safeText: "", quotaError: this.detectedError };
 		}
+		if (!chunk) {
+			return { safeText: "" };
+		}
 
 		const combined = this.heldLine + chunk;
 		this.heldLine = "";
 
-		const lines = combined.split("\n");
+		const segments = combined.split("\n");
 		const safeParts: string[] = [];
 
-		for (let i = 0; i < lines.length - 1; i++) {
-			const fullLine = lines[i];
-			if (/^\s*```/.test(fullLine)) {
-				this.inFenceBlock = !this.inFenceBlock;
+		for (let i = 0; i < segments.length - 1; i++) {
+			const seg = segments[i];
+			if (this.atLineStart) {
+				if (/^\s*```/.test(seg)) {
+					this.inFenceBlock = !this.inFenceBlock;
+				} else if (!this.inFenceBlock && isQuotaExhaustedLine(seg)) {
+					this.detectedError = seg.replace(/^\s*⚠\s*/, "").trim();
+					return {
+						safeText: safeParts.join(""),
+						quotaError: this.detectedError,
+					};
+				}
 			}
-			if (!this.inFenceBlock && isQuotaExhaustedLine(fullLine)) {
-				this.detectedError = fullLine.replace(/^\s*⚠\s*/, "").trim();
-				return {
-					safeText: safeParts.join(""),
-					quotaError: this.detectedError,
-				};
-			}
-			safeParts.push(`${fullLine}\n`);
+			safeParts.push(`${seg}\n`);
+			this.atLineStart = true;
 		}
 
-		const tail = lines[lines.length - 1];
+		const tail = segments[segments.length - 1];
 		if (tail.length > 0) {
-			if (!this.inFenceBlock && isQuotaExhaustedLine(tail)) {
+			if (!this.atLineStart) {
+				safeParts.push(tail);
+			} else if (!this.inFenceBlock && isQuotaExhaustedLine(tail)) {
 				this.detectedError = tail.replace(/^\s*⚠\s*/, "").trim();
 				return {
 					safeText: safeParts.join(""),
 					quotaError: this.detectedError,
 				};
-			}
-			if (!this.inFenceBlock && mightBecomeQuotaErrorLine(tail)) {
+			} else if (mightBecomeFenceOrQuotaLine(tail, this.inFenceBlock)) {
 				this.heldLine = tail;
 			} else {
 				safeParts.push(tail);
+				this.atLineStart = false;
 			}
 		}
 
@@ -123,10 +143,15 @@ export class QuotaSoftErrorFilter {
 		if (!rem) {
 			return { safeText: "" };
 		}
-		if (!this.inFenceBlock && isQuotaExhaustedLine(rem)) {
-			this.detectedError = rem.replace(/^\s*⚠\s*/, "").trim();
-			return { safeText: "", quotaError: this.detectedError };
+		if (this.atLineStart) {
+			if (/^\s*```/.test(rem)) {
+				this.inFenceBlock = !this.inFenceBlock;
+			} else if (!this.inFenceBlock && isQuotaExhaustedLine(rem)) {
+				this.detectedError = rem.replace(/^\s*⚠\s*/, "").trim();
+				return { safeText: "", quotaError: this.detectedError };
+			}
 		}
+		this.atLineStart = false;
 		return { safeText: rem };
 	}
 }

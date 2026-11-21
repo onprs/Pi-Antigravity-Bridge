@@ -84,20 +84,26 @@ export function classifyAgyToolCall(input: {
 	const filePath =
 		locPath ||
 		pickFirstString(rawObj, ["Path", "path", "TargetFile", "AbsolutePath", "file_path", "uri"]);
-	const command = pickFirstString(rawObj, ["CommandLine", "command", "cmd", "Script"]);
+	const command = pickFirstString(rawObj, ["CommandLine", "command", "cmd"]);
 	const query = pickFirstString(rawObj, ["Query", "query", "Pattern", "pattern", "SearchPath"]);
-	const agentRole = pickFirstString(rawObj, ["Role", "TypeName", "name", "Description"]);
+	// 仅匹配明确的子代理专属字段，避免普通工具的通用 name / Description 字段误触发 agy_subagent
+	const agentRole = pickFirstString(rawObj, [
+		"Role",
+		"TypeName",
+		"SubagentType",
+		"subagent_type",
+		"agent_role",
+	]);
 
 	const hasDiffBlock = Boolean(input.content?.some((item) => item.type === "diff"));
+	const isExplicitSubagentTitle =
+		lowerTitle.includes("subagent") ||
+		lowerTitle.includes("swarm") ||
+		lowerTitle.includes("workflow");
 
 	let mirrorToolName: AgyMirrorToolName = "agy_tool";
 
-	if (
-		lowerTitle.includes("subagent") ||
-		lowerTitle.includes("swarm") ||
-		lowerTitle.includes("workflow") ||
-		agentRole !== undefined
-	) {
+	if (isExplicitSubagentTitle) {
 		mirrorToolName = "agy_subagent";
 	} else if (kind === "execute" || command !== undefined || lowerTitle.startsWith("run ")) {
 		mirrorToolName = "agy_bash";
@@ -116,6 +122,8 @@ export function classifyAgyToolCall(input: {
 		lowerTitle.includes("find")
 	) {
 		mirrorToolName = "agy_search";
+	} else if (agentRole !== undefined) {
+		mirrorToolName = "agy_subagent";
 	}
 
 	const args: Record<string, string | number> = {};

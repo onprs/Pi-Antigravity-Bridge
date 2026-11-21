@@ -7,13 +7,14 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { SystemMessage, Tool } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveAgyBinary } from "../src/acp/binary-resolver.ts";
+import { buildAgySpawnSpec, resolveAgyBinary } from "../src/acp/binary-resolver.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
 import { LocalHttpMcpBridge, type ParkedToolCall } from "../src/mcp/http-mcp-bridge.ts";
 import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
 import { validateToolArguments } from "../src/mcp/schema-validator.ts";
 import { buildInlineStdioShimCommand } from "../src/mcp/stdio-shim.ts";
 import { prepareCustomizationMount } from "../src/session/customization-mounter.ts";
+import { classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import { ToolActivationController } from "../src/ui/commands.ts";
 
 describe("MCP 工具参数 JSON Schema 预校验", () => {
@@ -277,6 +278,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 						`<available_skills><skill><name>calc-guard</name><location>${extSkillMd}</location></skill></available_skills>`,
 						"</skills>",
 					].join("\n"),
+					mcp_servers: "<mcp_servers>\n<server name=\"docs\" exposure=\"codemode\" />\n</mcp_servers>",
 				},
 				timestamp: 1,
 			};
@@ -291,12 +293,14 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			assert.equal(pureMount.mountedPluginPaths.length, 0);
 			assert.deepEqual(pureMount.additionalDirectories, [fs.realpathSync(extSkillDir)]);
 			assert.ok(pureMount.workspaceContextBlock);
-			// 绝不包含宿主系统提示词 preamble，同时完整保留工作区与全局 AGENTS.md 及外部技能索引
+			// 绝不包含宿主系统提示词 preamble，同时完整保留工作区与全局 AGENTS.md、外部技能索引与 MCP 服务器目录
 			assert.ok(!pureMount.workspaceContextBlock.includes("running inside pi"));
 			assert.ok(pureMount.workspaceContextBlock.includes("Keep commits atomic."));
 			assert.ok(pureMount.workspaceContextBlock.includes("Report progress briefly."));
 			assert.ok(pureMount.workspaceContextBlock.includes("calc-guard"));
 			assert.ok(pureMount.workspaceContextBlock.includes("<tool_guidelines>"));
+			assert.ok(pureMount.workspaceContextBlock.includes("<mcp_servers>"));
+			assert.ok(pureMount.workspaceContextBlock.includes('exposure="codemode"'));
 
 			// 验证 LocalHttpMcpBridge 对 edit 工具字符串化 edits 参数的自动兼容归一化
 			const bridge = new LocalHttpMcpBridge(5_000);
@@ -446,14 +450,17 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			// 若本机已安装 agy，执行官方严格插件校验器确认 0 error / 0 warning
 			const agyBin = resolveAgyBinary();
 			if (agyBin) {
-				const validateRes = spawnSync(
-					agyBin.binPath,
-					["plugin", "validate", pluginDir, "--strict", "--json"],
-					{
-						encoding: "utf8",
-						shell: agyBin.isWindowsWrapperScript,
-					},
-				);
+				const validateSpec = buildAgySpawnSpec(agyBin, [
+					"plugin",
+					"validate",
+					pluginDir,
+					"--strict",
+					"--json",
+				]);
+				const validateRes = spawnSync(validateSpec.command, validateSpec.args, {
+					encoding: "utf8",
+					windowsVerbatimArguments: validateSpec.windowsVerbatimArguments,
+				});
 				assert.equal(validateRes.status, 0, `agy plugin validate failed: ${validateRes.stderr}`);
 				const report = JSON.parse(validateRes.stdout) as {
 					components: { rules: number; skills: number };
@@ -479,7 +486,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		}
 	});
 
-	it("agy-tools 开启 bridgePiMcp 时保持 MCP 工具激活，且 Stdio 转发桥支持并发在途请求不阻塞", async () => {
+	it("agy-tools 开启 bridgePiMcp 时遵循 MCP 暴露策略、保留动态解锁工具，且 Stdio 转发桥支持并发与 SSE 变更通知", async () => {
 		let activeTools = ["read", "bash", "codemode", "mcp__github__search"];
 		const fakePi = {
 			getActiveTools: () => [...activeTools],
@@ -489,6 +496,8 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 				{ name: "codemode" },
 				{ name: "tool_search" },
 				{ name: "mcp__github__search" },
+				{ name: "mcp__deferred__secret_query" },
+				{ name: "mcp__hidden__internal_admin" },
 			],
 			setActiveTools: (next: string[]) => {
 				activeTools = [...next];
@@ -508,9 +517,40 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 		assert.ok(activeTools.includes("codemode"));
 		assert.ok(activeTools.includes("tool_search"));
 		assert.ok(activeTools.includes("mcp__github__search"));
+		// 未在用户激活集中的 deferred / hidden MCP 工具绝不强行激活
+		assert.ok(!activeTools.includes("mcp__deferred__secret_query"));
+		assert.ok(!activeTools.includes("mcp__hidden__internal_admin"));
 		assert.ok(!activeTools.includes("read"));
 
-		// 验证内联 Stdio 转发桥在首个请求挂起时不会阻塞后续并发 ping 请求
+		// 模拟会话途中 tool_search 动态激活了 mcp__deferred__secret_query，跨轮次及切入 hybrid 后必须持续保留
+		activeTools = [...activeTools, "mcp__deferred__secret_query"];
+		ctrl.syncForContext(fakeCtx, {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "hybrid",
+			bridgePiMcp: true,
+		});
+		assert.ok(activeTools.includes("mcp__deferred__secret_query"));
+		ctrl.syncForContext(fakeCtx, {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "hybrid",
+			bridgePiMcp: true,
+		});
+		assert.ok(activeTools.includes("mcp__deferred__secret_query"));
+
+		// 验证通用字段 name / Description 不会把普通原生工具误判为 agy_subagent
+		const bashWithDesc = classifyAgyToolCall({
+			title: "Execute command",
+			kind: "execute",
+			rawInput: { CommandLine: "npm test", Description: "Run unit tests", name: "test-step" },
+		});
+		assert.equal(bashWithDesc.mirrorToolName, "agy_bash");
+		const genericWithName = classifyAgyToolCall({
+			title: "Check status",
+			rawInput: { name: "build-check", Description: "Verify CI status" },
+		});
+		assert.equal(genericWithName.mirrorToolName, "agy_tool");
+
+		// 验证内联 Stdio 转发桥在首个请求挂起时不会阻塞后续并发 ping 请求，且支持 SSE tools/list_changed 推送
 		const bridge = new LocalHttpMcpBridge(5_000);
 		const parked: ParkedToolCall[] = [];
 		const token = bridge.registerSessionBinding({
@@ -539,7 +579,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			for (const pair of spec.env) envObj[pair.name] = pair.value;
 
 			child = spawn(spec.command, spec.args, { env: envObj, stdio: ["pipe", "pipe", "pipe"] });
-			const lines: Array<{ id: number }> = [];
+			const messages: Array<{ id?: number; method?: string }> = [];
 			child.stdout!.setEncoding("utf8");
 			let outBuf = "";
 			child.stdout!.on("data", (chunk: string) => {
@@ -548,7 +588,7 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 				while (nl !== -1) {
 					const raw = outBuf.slice(0, nl).trim();
 					outBuf = outBuf.slice(nl + 1);
-					if (raw) lines.push(JSON.parse(raw) as { id: number });
+					if (raw) messages.push(JSON.parse(raw) as { id?: number; method?: string });
 					nl = outBuf.indexOf("\n");
 				}
 			});
@@ -559,12 +599,17 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 
 			// 紧接着并发发送 ping (id=2)，必须在 id=1 仍处于挂起态时先行返回
 			child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping", params: {} })}\n`);
-			await waitUntil(() => lines.length === 1);
-			assert.equal(lines[0].id, 2);
+			await waitUntil(() => messages.some((m) => m.id === 2));
 
 			parked[0].settle({ content: [{ type: "text", text: "done" }] });
-			await waitUntil(() => lines.length === 2);
-			assert.equal(lines[1].id, 1);
+			await waitUntil(() => messages.some((m) => m.id === 1));
+
+			// 更新工具绑定列表，验证内联 Stdio 转发桥通过 GET /mcp SSE 收到 notifications/tools/list_changed
+			bridge.updateBindingTools(token, [
+				{ name: "slow_tool", description: "slow", parameters: { type: "object", properties: {} } },
+				{ name: "newly_unlocked_tool", description: "new", parameters: { type: "object", properties: {} } },
+			]);
+			await waitUntil(() => messages.some((m) => m.method === "notifications/tools/list_changed"));
 		} finally {
 			if (child) {
 				try {
