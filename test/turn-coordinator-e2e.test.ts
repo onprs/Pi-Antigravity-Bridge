@@ -141,15 +141,20 @@ rl.on("line", async (line) => {
       return;
     }
 
-    const fullPromptText = (prompt || []).map((b) => b.text || "").join("\\n");
+    const lastBlockText = prompt?.[prompt.length - 1]?.text || "";
 
-    if (fullPromptText.includes("HANG_FOREVER")) {
+    if (lastBlockText === "HANG_FOREVER") {
       if (sess) sess.inFlightPromptId = msg.id;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Hanging..." } } }
+      });
       // 模拟极端死锁：即使收到 session/cancel 也不回包
       return;
     }
 
-    if (fullPromptText.includes("CANCEL_RESPONSIVE")) {
+    if (lastBlockText === "CANCEL_RESPONSIVE") {
       if (sess) {
         sess.inFlightPromptId = msg.id;
         sess.cancelablePromptId = msg.id;
@@ -162,7 +167,7 @@ rl.on("line", async (line) => {
       return;
     }
 
-    if (fullPromptText.includes("MULTI_STEP_WITH_STEER") && !isModeA && sess?.mcpHttp) {
+    if (lastBlockText === "MULTI_STEP_WITH_STEER" && !isModeA && sess?.mcpHttp) {
       sess.inFlightPromptId = msg.id;
       const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
 
@@ -249,7 +254,7 @@ rl.on("line", async (line) => {
       return;
     }
 
-    if (fullPromptText.includes("顺便检查缓存显示") && sess) {
+    if (lastBlockText === "顺便检查缓存显示" && sess) {
       sess.inFlightPromptId = msg.id;
       send({
         jsonrpc: "2.0",
@@ -271,9 +276,7 @@ rl.on("line", async (line) => {
       return;
     }
 
-    const followIdx = fullPromptText.indexOf("FOLLOWUP_MSG:");
-    if (followIdx !== -1 && sess) {
-      const followLine = fullPromptText.slice(followIdx).split("\\n")[0];
+    if (lastBlockText.startsWith("FOLLOWUP_MSG:") && sess) {
       sess.inFlightPromptId = msg.id;
       send({
         jsonrpc: "2.0",
@@ -282,7 +285,7 @@ rl.on("line", async (line) => {
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Echo -> " + followLine }
+            content: { type: "text", text: "Echo -> " + lastBlockText }
           }
         }
       });
@@ -682,11 +685,15 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				signal: ac.signal,
 			});
 
-			// 等待请求已发往 mock-agy 进入挂起态
-			await new Promise((r) => setTimeout(r, 80));
-
-			const t0 = Date.now();
-			ac.abort();
+			// 确定性等待首个思考分片到达（证明请求已真正进入 mock-agy 挂起态，消除云端慢机器固定 sleep 竞态）
+			let t0 = 0;
+			for await (const ev of stream) {
+				if (ev.type === "thinking_delta") {
+					t0 = Date.now();
+					ac.abort();
+					break;
+				}
+			}
 			const abortedMsg = await stream.result();
 			const elapsed = Date.now() - t0;
 
@@ -831,8 +838,12 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				signal: ac.signal,
 			});
 
-			await new Promise((r) => setTimeout(r, 80));
-			ac.abort();
+			for await (const ev of stream1) {
+				if (ev.type === "text_delta") {
+					ac.abort();
+					break;
+				}
+			}
 			const abortedMsg = await stream1.result();
 			assert.equal(abortedMsg.stopReason, "aborted");
 

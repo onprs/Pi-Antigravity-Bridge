@@ -1340,6 +1340,12 @@ export class TurnCoordinator {
 		}
 
 		await this.syncSessionModelAndMode(ledger, model, options);
+		if (options?.signal?.aborted || writer.isTerminated) {
+			if (!writer.isTerminated) {
+				writer.fail("aborted", "Request aborted by user");
+			}
+			return;
+		}
 
 		writer.setResponseMetadata({
 			responseId: ledger.agySessionId,
@@ -1360,6 +1366,13 @@ export class TurnCoordinator {
 			) {
 				outboundPayload = replaced as { sessionId: string; prompt: AcpPromptBlock[] };
 			}
+		}
+
+		if (options?.signal?.aborted || writer.isTerminated) {
+			if (!writer.isTerminated) {
+				writer.fail("aborted", "Request aborted by user");
+			}
+			return;
 		}
 
 		const pump: ActiveTurnPump = {

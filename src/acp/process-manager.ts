@@ -23,7 +23,7 @@ import {
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.3";
+export const CLIENT_INFO_VERSION = "0.1.4";
 
 export class AcpRpcError extends Error {
 	readonly code: number;
