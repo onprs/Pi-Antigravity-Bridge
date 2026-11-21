@@ -18,6 +18,7 @@ import {
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
 	parseStepMetadataGenerationUsage,
+	parseStepPayloadPlannedToolCount,
 	readSqliteGenerationUsagesSince,
 } from "../src/session/checkpoint-sync.ts";
 import {
@@ -338,9 +339,19 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			});
 
 			const appendDb = new DatabaseSync(origDbPath);
+			// 构造包含 3 个 ToolCall (field 20 -> 3x field 7) 的 PlannerResponse payload
+			const toolEntry = Buffer.from([(7 << 3) | 2, 2, 0x08, 0x01]);
+			const plannerInner = Buffer.concat([toolEntry, toolEntry, toolEntry]);
+			const stepPayload3Tools = Buffer.from([
+				...encodeVarint((20 << 3) | 2),
+				...encodeVarint(plannerInner.length),
+				...plannerInner,
+			]);
+			assert.equal(parseStepPayloadPlannedToolCount(stepPayload3Tools), 3);
+
 			appendDb
-				.prepare("INSERT INTO steps (idx, step_type, status, step_payload, metadata) VALUES (2, 14, 2, X'06', NULL), (3, 15, 2, X'0708', ?)")
-				.run(stepMetaBlob);
+				.prepare("INSERT INTO steps (idx, step_type, status, step_payload, metadata) VALUES (2, 14, 2, X'06', NULL), (3, 15, 2, ?, ?)")
+				.run(stepPayload3Tools, stepMetaBlob);
 			appendDb.prepare("INSERT INTO gen_metadata VALUES (1, X'EE', 2)").run();
 			appendDb.prepare("INSERT INTO parent_references VALUES (2, X'FF'), (3, X'11')").run();
 			appendDb.close();
@@ -351,6 +362,7 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			assert.equal(gensSince1[0].cacheReadTokens, 10441);
 			assert.equal(gensSince1[0].outputTokens, 445);
 			assert.equal(gensSince1[0].thoughtTokens, 255);
+			assert.equal(gensSince1[0].plannedToolCalls, 3);
 
 			// 从第 1 轮检查点执行快照分叉
 			const forkedId = await forkSqliteConversationAtCheckpoint(cfg, origSessionId, cpTurn1);

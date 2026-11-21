@@ -2,10 +2,8 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
-	ImageContent,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
-	TextContent,
 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -283,31 +281,6 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (_event, ctx) => {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, coordinator.config);
-	});
-
-	// 6. ACP 单会话单活跃轮次协议约束：运行中按 Enter 发送的新消息统一转入 Follow-up 排队队列，
-	// 保持原任务完整执行完毕后再自动开启下一轮真实用户请求（同时支持 Alt+Up 编辑队列与 Esc 撤回）。
-	pi.on("input", (event, ctx) => {
-		if (
-			ctx.model?.provider === ANTIGRAVITY_PROVIDER_ID &&
-			event.streamingBehavior === "steer" &&
-			event.source !== "extension" &&
-			!ctx.isIdle()
-		) {
-			const parts: Array<TextContent | ImageContent> = [];
-			if (event.text.length > 0) {
-				parts.push({ type: "text", text: event.text });
-			}
-			if (event.images && event.images.length > 0) {
-				parts.push(...event.images);
-			}
-			pi.sendUserMessage(parts.length > 0 ? parts : event.text, {
-				deliverAs: "followUp",
-				expandPromptTemplates: event.source === "interactive",
-			});
-			return { action: "handled" };
-		}
-		return { action: "continue" };
 	});
 
 	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {

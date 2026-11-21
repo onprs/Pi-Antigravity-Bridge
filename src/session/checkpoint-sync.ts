@@ -177,6 +177,8 @@ export interface SqliteGenerationUsage {
 	cacheWriteTokens: number;
 	cacheReadTokens: number;
 	thoughtTokens?: number;
+	/** 该次 `PLANNER_RESPONSE` 内含的工具调用总数（用于多工具分步执行时的精确守恒分摊） */
+	plannedToolCalls?: number;
 }
 
 function readProtobufVarint(buf: Uint8Array, offset: number): [number, number] | undefined {
@@ -285,6 +287,73 @@ export function parseStepMetadataGenerationUsage(
 	return undefined;
 }
 
+/**
+ * 解析 `steps.step_payload`（`step_type = 15`）字段 20（`PlannerResponse`）中子字段 7（`repeated ToolCall`）的数量。
+ * 在 Gemini 与 Claude 模型上均统一编码，用于在单次生成拆出多个顺序工具步时按整数守恒分摊 Token，避免后续子步出现 0 提示词导致 UI 缓存命中率消失。
+ */
+export function parseStepPayloadPlannedToolCount(stepPayload: Uint8Array): number {
+	let pos = 0;
+	while (pos < stepPayload.length) {
+		const tagRes = readProtobufVarint(stepPayload, pos);
+		if (!tagRes) return 0;
+		pos = tagRes[1];
+		const fieldNo = Math.floor(tagRes[0] / 8);
+		const wireType = tagRes[0] & 7;
+		if (fieldNo <= 0) return 0;
+
+		if (wireType === 0) {
+			const v = readProtobufVarint(stepPayload, pos);
+			if (!v) return 0;
+			pos = v[1];
+		} else if (wireType === 2) {
+			const lenRes = readProtobufVarint(stepPayload, pos);
+			if (!lenRes) return 0;
+			const [len, subStart] = lenRes;
+			const subEnd = subStart + len;
+			if (subEnd > stepPayload.length) return 0;
+			if (fieldNo === 20) {
+				const sub = stepPayload.subarray(subStart, subEnd);
+				let k = 0;
+				let count = 0;
+				while (k < sub.length) {
+					const innerTag = readProtobufVarint(sub, k);
+					if (!innerTag) break;
+					k = innerTag[1];
+					const innerFn = Math.floor(innerTag[0] / 8);
+					const innerWt = innerTag[0] & 7;
+					if (innerWt === 0) {
+						const v = readProtobufVarint(sub, k);
+						if (!v) break;
+						k = v[1];
+					} else if (innerWt === 2) {
+						const l = readProtobufVarint(sub, k);
+						if (!l || l[1] + l[0] > sub.length) break;
+						if (innerFn === 7) {
+							count++;
+						}
+						k = l[1] + l[0];
+					} else if (innerWt === 5) {
+						k += 4;
+					} else if (innerWt === 1) {
+						k += 8;
+					} else {
+						break;
+					}
+				}
+				return count;
+			}
+			pos = subEnd;
+		} else if (wireType === 5) {
+			pos += 4;
+		} else if (wireType === 1) {
+			pos += 8;
+		} else {
+			return 0;
+		}
+	}
+	return 0;
+}
+
 /** 读取指定会话当前 `steps` 表的最大 `idx`（新建会话尚无记录时返回 `-1`），用于在 `session/resume` 时定位起始水位 */
 export async function readCurrentMaxSqliteStepIdx(
 	config: BridgeConfig,
@@ -334,15 +403,25 @@ export async function readSqliteGenerationUsagesSince(
 		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
 		const rows = db
 			.prepare(
-				"SELECT idx, metadata FROM steps WHERE step_type = 15 AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
+				"SELECT idx, metadata, step_payload FROM steps WHERE step_type = 15 AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
 			)
-			.all(afterStepIdx) as Array<{ idx: number; metadata: Uint8Array }>;
+			.all(afterStepIdx) as Array<{
+			idx: number;
+			metadata: Uint8Array;
+			step_payload?: Uint8Array | null;
+		}>;
 
 		const parsed: SqliteGenerationUsage[] = [];
 		for (const row of rows) {
 			if (row.metadata && row.metadata.byteLength > 0) {
 				const u = parseStepMetadataGenerationUsage(row.metadata, row.idx);
 				if (u) {
+					if (row.step_payload && row.step_payload.byteLength > 0) {
+						const toolCount = parseStepPayloadPlannedToolCount(row.step_payload);
+						if (toolCount > 0) {
+							u.plannedToolCalls = toolCount;
+						}
+					}
 					parsed.push(u);
 				}
 			}
@@ -356,6 +435,57 @@ export async function readSqliteGenerationUsagesSince(
 		} catch {
 			// 忽略
 		}
+	}
+}
+
+/**
+ * 在工具边界切入用户转向消息（`steer`）前，等待刚结算的 loopback HTTP 工具结果落盘为非进行中状态（`status != 1`），
+ * 确保随后的 `session/cancel` 不会误冲掉已完成工具的持久化输出。
+ */
+export async function waitForSqliteToolStepsSettled(
+	config: BridgeConfig,
+	agySessionId: string,
+	maxWaitMs = 160,
+): Promise<void> {
+	const dbPath = agySessionId
+		? path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`)
+		: "";
+	if (!dbPath || !fs.existsSync(dbPath)) {
+		await new Promise((r) => setTimeout(r, 25));
+		return;
+	}
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) {
+		await new Promise((r) => setTimeout(r, 25));
+		return;
+	}
+
+	await new Promise((r) => setTimeout(r, 20));
+	const deadline = Date.now() + Math.max(20, maxWaitMs - 20);
+	while (Date.now() < deadline) {
+		let hasRunningTool = false;
+		let db: import("node:sqlite").DatabaseSync | undefined;
+		try {
+			db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+			const busy = db
+				.prepare(
+					"SELECT 1 AS busy FROM steps WHERE step_type != 15 AND step_type != 14 AND status = 1 LIMIT 1",
+				)
+				.get() as { busy?: number } | undefined;
+			hasRunningTool = busy?.busy === 1;
+		} catch {
+			hasRunningTool = false;
+		} finally {
+			try {
+				db?.close();
+			} catch {
+				// 忽略
+			}
+		}
+		if (!hasRunningTool) {
+			return;
+		}
+		await new Promise((r) => setTimeout(r, 15));
 	}
 }
 

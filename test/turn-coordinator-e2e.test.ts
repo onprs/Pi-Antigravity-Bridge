@@ -2,6 +2,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import {
 	normalizeContext,
@@ -232,7 +233,9 @@ rl.on("line", async (line) => {
     }
 
     if (lastBlockText === "MULTI_STEP_WITH_STEER" && !isModeA && sess?.mcpHttp) {
-      sess.inFlightPromptId = msg.id;
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
       const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
 
       // Step 1：读取 a.ts
@@ -261,9 +264,27 @@ rl.on("line", async (line) => {
         })
       }).then((r) => r.json());
 
-      const combinedText1 = (res1.result?.content || []).map((c) => c.text || "").join("\\n");
+      sess.savedA = (res1.result?.content || []).map((c) => c.text || "").join("\\n");
+      // 等待短暂窗口以允许工具边界处的 session/cancel 即时介入（验证 steer 在第 1 个工具结束边界立即切入，而非拖到整轮末尾！）
+      await new Promise((r) => setTimeout(r, 80));
+      if (sess.inFlightPromptId !== myPromptId) {
+        return;
+      }
 
-      // Step 2：收到工具结果与捎带的运行中用户消息后，继续执行未完任务读取 b.ts（不中断原任务！）
+      sess.inFlightPromptId = undefined;
+      sess.cancelablePromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: { stopReason: "end_turn", usage: { inputTokens: 8000, cachedReadTokens: 12000, outputTokens: 50 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "顺便检查缓存显示" && !isModeA && sess?.mcpHttp) {
+      sess.inFlightPromptId = msg.id;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      // 转向消息立即在同一会话切入：保留已完成的 a.ts 结果（sess.savedA），继续读取未完成的 b.ts 并一并答复转向问题！
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -302,7 +323,7 @@ rl.on("line", async (line) => {
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Both done! A=" + combinedText1 + " B=" + combinedText2 }
+            content: { type: "text", text: "Both done! A=" + (sess.savedA || "") + " B=" + combinedText2 + "\\n\\nSteerAnswered=true" }
           }
         }
       });
@@ -310,32 +331,7 @@ rl.on("line", async (line) => {
       send({
         jsonrpc: "2.0",
         id: msg.id,
-        result: {
-          stopReason: "end_turn",
-          usage: { inputTokens: 8000, cachedReadTokens: 24000, outputTokens: 90, thoughtTokens: 10 }
-        }
-      });
-      return;
-    }
-
-    if (lastBlockText === "顺便检查缓存显示" && sess) {
-      sess.inFlightPromptId = msg.id;
-      send({
-        jsonrpc: "2.0",
-        method: "session/update",
-        params: {
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "SteerAnswered=true" }
-          }
-        }
-      });
-      sess.inFlightPromptId = undefined;
-      send({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: { stopReason: "end_turn", usage: { inputTokens: 600, cachedReadTokens: 32000, outputTokens: 20 } }
+        result: { stopReason: "end_turn", usage: { inputTokens: 600, cachedReadTokens: 31400, outputTokens: 40 } }
       });
       return;
     }
@@ -1027,6 +1023,153 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			const fakeAborted = { ...step3, stopReason: "aborted" as const };
 			await coord.persistTurnAnchor([u1, step1, tr1, step2, tr2, step3, fakeAborted], "pi-sess-tel");
 			assert.equal(appendedEntries.length, 1);
+
+			// 验证在已建立缓存命中率记录后的第 2 轮中，同次生成拆分多工具时每一步均具备有效正提示词与稳定命中率（绝不变为 0 触发 UI 隐藏闪烁）
+			const uWarm = { role: "user" as const, content: "SAME_GEN_DUAL_SEQ_TOOLS", timestamp: 4 };
+			const wStep1 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({ tools, messages: [u1, step1, tr1, step2, tr2, step3, uWarm] }),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			const wTc1 = wStep1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			const wPrompt1 = wStep1.usage.input + wStep1.usage.cacheRead;
+			assert.ok(wPrompt1 > 0 && wStep1.usage.cacheRead > 0);
+
+			const wTr1 = {
+				role: "toolResult" as const,
+				toolCallId: wTc1.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "warm-1" }],
+				isError: false,
+				timestamp: 5,
+			};
+			const wStep2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [u1, step1, tr1, step2, tr2, step3, uWarm, wStep1, wTr1],
+					}),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			const wTc2 = wStep2.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			const wPrompt2 = wStep2.usage.input + wStep2.usage.cacheRead;
+			// 第 2 个拆分步既不重复累加 50000 窗口（<= 100），又保持 promptTokens > 0 且命中率与上一轮一致（约 96%）
+			assert.ok(wPrompt2 > 0 && wPrompt2 <= 100);
+			assert.ok(wStep2.usage.cacheRead >= 90);
+			assert.equal(wStep2.usage.totalTokens, 50000);
+
+			const wTr2 = {
+				role: "toolResult" as const,
+				toolCallId: wTc2.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "warm-2" }],
+				isError: false,
+				timestamp: 6,
+			};
+			const wStep3 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [u1, step1, tr1, step2, tr2, step3, uWarm, wStep1, wTr1, wStep2, wTr2],
+					}),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			assert.equal(wStep3.stopReason, "stop");
+
+			// 验证存在本地 SQLite steps 表时，单次生成内含 2 个顺序工具按整数守恒分摊：两步均显示 95.7% 命中率且总和 100% 精确守恒
+			const agyId = step1.responseId!;
+			const convDir = path.join(cfg.geminiDir, "antigravity-cli", "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+			const dbPath = path.join(convDir, `${agyId}.db`);
+			const encodeVarint = (n: number): number[] => {
+				const out: number[] = [];
+				let v = n;
+				while (v >= 0x80) {
+					out.push((v & 0x7f) | 0x80);
+					v = Math.floor(v / 128);
+				}
+				out.push(v);
+				return out;
+			};
+			const f9Inner = Buffer.from([
+				(2 << 3) | 0, ...encodeVarint(6000),   // inputTokens = 6000
+				(3 << 3) | 0, ...encodeVarint(400),    // outputTokens = 400
+				(5 << 3) | 0, ...encodeVarint(134000), // cacheReadTokens = 134000 (95.7%)
+				(9 << 3) | 0, ...encodeVarint(150),    // thoughtTokens = 150
+			]);
+			const metaBlob = Buffer.from([(9 << 3) | 2, ...encodeVarint(f9Inner.length), ...f9Inner]);
+			const tcSub = Buffer.from([(7 << 3) | 2, 2, 0x08, 0x01]);
+			const f20Inner = Buffer.concat([tcSub, tcSub]); // plannedToolCalls = 2
+			const payloadBlob = Buffer.from([
+				...encodeVarint((20 << 3) | 2),
+				...encodeVarint(f20Inner.length),
+				...f20Inner,
+			]);
+
+			const db = new DatabaseSync(dbPath);
+			db.exec("CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL, status integer NOT NULL, step_payload blob, metadata blob);");
+			db.prepare("INSERT INTO steps VALUES (10, 15, 3, ?, ?)").run(payloadBlob, metaBlob);
+			db.close();
+
+			const uSql = { role: "user" as const, content: "SAME_GEN_DUAL_SEQ_TOOLS", timestamp: 7 };
+			const historyBeforeSql = [u1, step1, tr1, step2, tr2, step3, uWarm, wStep1, wTr1, wStep2, wTr2, wStep3];
+			const sqlS1 = await coord
+				.streamSimple(TEST_MODEL, normalizeContext({ tools, messages: [...historyBeforeSql, uSql] }), {
+					sessionId: "pi-sess-tel",
+				})
+				.result();
+			const sqlTc1 = sqlS1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			const sqlTr1 = {
+				role: "toolResult" as const,
+				toolCallId: sqlTc1.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "sql-1" }],
+				isError: false,
+				timestamp: 8,
+			};
+			const sqlS2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({ tools, messages: [...historyBeforeSql, uSql, sqlS1, sqlTr1] }),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			const sqlTc2 = sqlS2.content.find((c): c is ToolCall => c.type === "toolCall")!;
+
+			// 第 1 步与第 2 步各自均具备正提示词与约 95.7% 命中率（绝不为 0），且两步整数之和 100% 精确等于 (6000, 134000, 400)！
+			const rate1 = (sqlS1.usage.cacheRead / (sqlS1.usage.input + sqlS1.usage.cacheRead)) * 100;
+			const rate2 = (sqlS2.usage.cacheRead / (sqlS2.usage.input + sqlS2.usage.cacheRead)) * 100;
+			assert.ok(Math.abs(rate1 - 95.7) < 0.2, `第 1 步命中率应约为 95.7%，实际 ${rate1}`);
+			assert.ok(Math.abs(rate2 - 95.7) < 0.2, `第 2 步命中率应约为 95.7%，实际 ${rate2}`);
+			assert.equal(sqlS1.usage.input + sqlS2.usage.input, 6000);
+			assert.equal(sqlS1.usage.cacheRead + sqlS2.usage.cacheRead, 134000);
+			assert.equal(sqlS1.usage.output + sqlS2.usage.output, 400);
+
+			const sqlTr2 = {
+				role: "toolResult" as const,
+				toolCallId: sqlTc2.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: "sql-2" }],
+				isError: false,
+				timestamp: 9,
+			};
+			const sqlS3 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [...historyBeforeSql, uSql, sqlS1, sqlTr1, sqlS2, sqlTr2],
+					}),
+					{ sessionId: "pi-sess-tel" },
+				)
+				.result();
+			assert.equal(sqlS3.stopReason, "stop");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
