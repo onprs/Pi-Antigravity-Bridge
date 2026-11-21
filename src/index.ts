@@ -1,0 +1,236 @@
+import { spawnSync } from "node:child_process";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ProviderConfig,
+	TurnEndEvent,
+} from "@earendil-works/pi-coding-agent";
+import { resolveAgyBinary } from "./acp/binary-resolver.ts";
+import { AcpProcessManager } from "./acp/process-manager.ts";
+import {
+	ANTIGRAVITY_API_ID,
+	ANTIGRAVITY_BASE_URL,
+	ANTIGRAVITY_PROVIDER_ID,
+	type ChatModelConfig,
+	getSeedModels,
+	probeLiveAntigravityCatalog,
+	readCachedCatalog,
+} from "./catalog/model-discovery.ts";
+import { loadBridgeConfig } from "./config.ts";
+import { discoverAgySkillDirectoriesForPi } from "./session/customization-mounter.ts";
+import { extractVisibleMessages } from "./session/reconcile.ts";
+import { TurnCoordinator } from "./session/turn-coordinator.ts";
+import {
+	AgyTurnMirrorBroker,
+	createAgyMirrorToolDefinitions,
+} from "./tools/agy-mirror-tools.ts";
+import { createAgyToolRendererResolver } from "./tools/agy-renderers.ts";
+import {
+	registerAntigravityCommands,
+	ToolActivationController,
+} from "./ui/commands.ts";
+import { updateAntigravityStatusBar } from "./ui/status-bar.ts";
+
+const SENTINEL_API_KEY = "agy-managed";
+const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+
+/**
+ * Pi × Antigravity ACP 桥接扩展主入口。
+ */
+export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
+	let currentConfig = loadBridgeConfig();
+	const processManager = new AcpProcessManager();
+	const mirrorBroker = new AgyTurnMirrorBroker();
+	const coordinator = new TurnCoordinator(pi, processManager, mirrorBroker, currentConfig);
+	const toolActivation = new ToolActivationController(pi);
+
+	const cachedCatalog = readCachedCatalog();
+	if (cachedCatalog?.tier) {
+		coordinator.setLatestTier(cachedCatalog.tier);
+	}
+	let currentModels: ChatModelConfig[] = cachedCatalog?.models ?? getSeedModels();
+
+	const buildProviderConfig = (models: ChatModelConfig[]): ProviderConfig => ({
+		name: "Google Antigravity (ACP)",
+		baseUrl: ANTIGRAVITY_BASE_URL,
+		apiKey: SENTINEL_API_KEY,
+		api: ANTIGRAVITY_API_ID,
+		models,
+		streamSimple: (model, context, options) => coordinator.streamSimple(model, context, options),
+		async refreshModels(refreshCtx) {
+			const snapshot = await probeLiveAntigravityCatalog(
+				processManager,
+				coordinator.config,
+				process.cwd(),
+				refreshCtx.signal,
+			);
+			if (snapshot.tier) {
+				coordinator.setLatestTier(snapshot.tier);
+			}
+			currentModels = snapshot.models;
+			return snapshot.models;
+		},
+		oauth: {
+			name: "Google Antigravity CLI (agy)",
+			isSubscription: true,
+			async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+				callbacks.onProgress?.(
+					"认证由官方 agy CLI 本地自行管理，本扩展不读取或存储任何 OAuth 令牌。",
+				);
+				const bin = resolveAgyBinary({
+					configuredBin: coordinator.config.agyBin,
+					geminiDir: coordinator.config.geminiDir,
+				});
+				if (!bin) {
+					throw new Error("未找到本机 agy 可执行文件，请先安装 Antigravity CLI。");
+				}
+
+				// 先探测当前本机 agy 是否已处于有效登录态
+				try {
+					const snapshot = await probeLiveAntigravityCatalog(
+						processManager,
+						coordinator.config,
+						process.cwd(),
+						callbacks.signal,
+					);
+					if (snapshot.models.length > 0) {
+						currentModels = snapshot.models;
+						if (snapshot.tier) coordinator.setLatestTier(snapshot.tier);
+						return {
+							access: SENTINEL_API_KEY,
+							refresh: SENTINEL_API_KEY,
+							expires: Date.now() + TEN_YEARS_MS,
+						};
+					}
+				} catch {
+					// 未登录或探测失败时引导终端登录
+				}
+
+				const res = spawnSync(
+					bin.binPath,
+					["acp", "--login", "--gemini-dir", coordinator.config.geminiDir],
+					{
+						stdio: "inherit",
+						shell: bin.isWindowsWrapperScript,
+					},
+				);
+				if (res.status !== 0) {
+					throw new Error("官方 agy 登录未完成，可在独立终端运行 `agy acp --login` 后重试。");
+				}
+
+				return {
+					access: SENTINEL_API_KEY,
+					refresh: SENTINEL_API_KEY,
+					expires: Date.now() + TEN_YEARS_MS,
+				};
+			},
+			async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+				return {
+					...credentials,
+					access: SENTINEL_API_KEY,
+					expires: Date.now() + TEN_YEARS_MS,
+				};
+			},
+			getApiKey(): string {
+				return SENTINEL_API_KEY;
+			},
+		},
+	});
+
+	// 1. 注册 Antigravity 自定义 Provider
+	pi.registerProvider(ANTIGRAVITY_PROVIDER_ID, buildProviderConfig(currentModels));
+
+	// 2. 注册模式 A 镜像工具定义与全局渲染器（支持历史回放与 HTML 导出渲染）
+	const mirrorTools = createAgyMirrorToolDefinitions(mirrorBroker, (agySessionId) => {
+		coordinator.cancelAgySessionById(agySessionId);
+	});
+	for (const tool of mirrorTools) {
+		pi.registerTool(tool);
+	}
+	pi.registerToolRenderer(createAgyToolRendererResolver());
+
+	// 3. 注册 `/agy` 命令族
+	const refreshAndReRegisterModels = async (ctx: ExtensionContext): Promise<number> => {
+		const snapshot = await probeLiveAntigravityCatalog(
+			processManager,
+			coordinator.config,
+			ctx.cwd,
+			ctx.signal,
+		);
+		if (snapshot.tier) {
+			coordinator.setLatestTier(snapshot.tier);
+		}
+		currentModels = snapshot.models;
+		pi.registerProvider(ANTIGRAVITY_PROVIDER_ID, buildProviderConfig(currentModels));
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+		return currentModels.length;
+	};
+
+	registerAntigravityCommands({
+		pi,
+		processManager,
+		coordinator,
+		toolActivation,
+		onRefreshProviderModels: refreshAndReRegisterModels,
+	});
+
+	// 4. 注册可选的反向 AGY Skills 发现钩子
+	pi.on("resources_discover", (event) => {
+		const cfg = loadBridgeConfig({ cwd: event.cwd, isProjectTrusted: false });
+		const skillDirs = discoverAgySkillDirectoriesForPi(cfg, event.cwd);
+		if (skillDirs.length === 0) {
+			return undefined;
+		}
+		return { skillPaths: skillDirs };
+	});
+
+	// 5. 会话生命周期与状态栏同步钩子
+	pi.on("session_start", (_event, ctx) => {
+		currentConfig = loadBridgeConfig({
+			cwd: ctx.cwd,
+			isProjectTrusted: ctx.isProjectTrusted(),
+		});
+		coordinator.setConfig(currentConfig);
+		coordinator.setActiveContext(ctx);
+		toolActivation.syncForContext(ctx, currentConfig);
+
+		// 若首次加载尚无本地缓存快照，在后台静默执行一次零配额模型目录同步
+		if (!cachedCatalog) {
+			void refreshAndReRegisterModels(ctx).catch(() => {});
+		}
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		coordinator.setActiveContext(ctx);
+		toolActivation.syncForContext(ctx, coordinator.config);
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+	});
+
+	pi.on("before_agent_start", (_event, ctx) => {
+		coordinator.setActiveContext(ctx);
+		toolActivation.syncForContext(ctx, coordinator.config);
+	});
+
+	pi.on("turn_end", async (event: TurnEndEvent, ctx) => {
+		if (ctx.model?.provider !== ANTIGRAVITY_PROVIDER_ID) return;
+		const visible = extractVisibleMessages(event.context.llmMessages);
+		await coordinator.persistTurnAnchor(visible);
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		// 上下文压缩完成后关闭旧 ACP 会话，使下一轮请求自动携带压缩摘要开启轻装新会话
+		await coordinator.invalidatePiSession(ctx.sessionManager.getSessionId());
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		coordinator.setActiveContext(ctx);
+		updateAntigravityStatusBar(ctx, coordinator.config, coordinator.getTelemetrySnapshot());
+	});
+
+	pi.on("session_shutdown", async () => {
+		await coordinator.dispose();
+	});
+}

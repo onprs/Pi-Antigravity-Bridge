@@ -1,0 +1,698 @@
+import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import type { BridgeConfig } from "../config.ts";
+import { resolveEffectiveFlags } from "../config.ts";
+import { type ResolvedBinary, resolveAgyBinary } from "./binary-resolver.ts";
+import {
+	type AcpElicitationCreateParams,
+	type AcpElicitationCreateResult,
+	type AcpInitializeResult,
+	type AcpRequestPermissionParams,
+	type AcpRequestPermissionResult,
+	type AcpSessionUpdateNotification,
+	type JsonRpcErrorObject,
+	type JsonRpcId,
+	type JsonRpcMessage,
+	type JsonRpcRequest,
+	NdjsonLineParser,
+} from "./protocol.ts";
+
+export const BRIDGE_AGENT_NAME = "pi-bridge";
+export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
+export const CLIENT_INFO_VERSION = "0.1.0";
+
+export class AcpRpcError extends Error {
+	readonly code: number;
+	readonly data?: unknown;
+
+	constructor(err: JsonRpcErrorObject) {
+		super(err.message || `ACP RPC error (${err.code})`);
+		this.name = "AcpRpcError";
+		this.code = err.code;
+		this.data = err.data;
+	}
+}
+
+/** 单个 `agy acp` 进程的配置特征描述 */
+export interface AcpProcessProfile {
+	/** 用户显式指定的原生自定义 Agent 名称 */
+	userAgentName?: string;
+	/** 是否清空内置工具以由宿主 MCP 工具主控（对应 pi-tools 模式） */
+	disableBuiltinTools: boolean;
+	/** 是否排除 AGY 内置默认系统组件以保持纯净底座（对应 pi-tools 模式） */
+	excludeDefaultComponents: boolean;
+	/** 是否继承 AGY 自身的全局与工作区 Customizations */
+	inheritCustomizations: boolean;
+	/** 是否继承 AGY 自身的 mcp_config.json */
+	inheritMcp: boolean;
+	/** 通过官方 Plugin 机制挂载的外部 Customization 插件目录列表 */
+	mountedPluginPaths: string[];
+	/** 是否包含 AGY 内置默认 Customizations */
+	includeDefaultCustomizations: boolean;
+	/** 是否开启每会话独立 Worker 进程（支持 HTTP MCP） */
+	processPerSession: boolean;
+	/** 是否启用终端沙箱 */
+	sandbox: boolean;
+	/** 自定义 Gemini 目录 */
+	geminiDir: string;
+	/** 应用数据目录名 */
+	appDataDirName: string;
+}
+
+export interface AcpServerHandlers {
+	onSessionUpdate?: (notification: AcpSessionUpdateNotification) => void;
+	onRequestPermission?: (
+		params: AcpRequestPermissionParams,
+	) => Promise<AcpRequestPermissionResult>;
+	onElicitationCreate?: (
+		params: AcpElicitationCreateParams,
+	) => Promise<AcpElicitationCreateResult>;
+}
+
+interface PendingRpc {
+	method: string;
+	resolve: (value: unknown) => void;
+	reject: (reason: unknown) => void;
+	timer?: ReturnType<typeof setTimeout>;
+	cleanupAbort?: () => void;
+}
+
+/**
+ * 判断该进程配置是否需要生成纯 YAML Frontmatter 的轻量挂载 Agent 文件。
+ * Markdown 正文严格保持为空，绝不覆写或注入任何系统提示词。
+ */
+function resolveManagedAgentMaterialization(
+	profile: AcpProcessProfile,
+): { effectiveAgentName?: string; managedAgentDir?: string } {
+	if (
+		profile.userAgentName &&
+		!profile.disableBuiltinTools &&
+		!profile.excludeDefaultComponents &&
+		profile.mountedPluginPaths.length === 0
+	) {
+		return { effectiveAgentName: profile.userAgentName };
+	}
+
+	const needsManagedAgent =
+		profile.disableBuiltinTools ||
+		profile.excludeDefaultComponents ||
+		!profile.inheritCustomizations ||
+		!profile.inheritMcp ||
+		profile.mountedPluginPaths.length > 0;
+
+	if (!needsManagedAgent) {
+		return { effectiveAgentName: profile.userAgentName };
+	}
+
+	const specHash = crypto
+		.createHash("sha256")
+		.update(
+			JSON.stringify({
+				disableBuiltinTools: profile.disableBuiltinTools,
+				excludeDefaultComponents: profile.excludeDefaultComponents,
+				inheritCustomizations: profile.inheritCustomizations,
+				inheritMcp: profile.inheritMcp,
+				mountedPluginPaths: profile.mountedPluginPaths,
+			}),
+		)
+		.digest("hex")
+		.slice(0, 10);
+
+	const agentName =
+		profile.disableBuiltinTools &&
+		profile.excludeDefaultComponents &&
+		!profile.inheritCustomizations &&
+		!profile.inheritMcp &&
+		profile.mountedPluginPaths.length === 0
+			? BRIDGE_AGENT_NAME
+			: `${BRIDGE_AGENT_NAME}-${specHash}`;
+
+	const agentDir = path.join(profile.geminiDir, "config", "agents", agentName);
+	const agentFile = path.join(agentDir, "agent.md");
+
+	const yamlLines: string[] = [
+		"---",
+		`name: ${agentName}`,
+		"description: Configuration and customization mount profile for Pi Antigravity Bridge.",
+		"mainAgent: true",
+		"subagent: false",
+	];
+
+	if (profile.disableBuiltinTools) {
+		yamlLines.push("tools: []");
+	}
+	if (profile.excludeDefaultComponents) {
+		yamlLines.push("excludeDefaultComponents: true");
+	}
+	if (!profile.inheritCustomizations) {
+		yamlLines.push("inheritCustomizations: false");
+	}
+	if (!profile.inheritMcp) {
+		yamlLines.push("inheritMcp: false");
+	}
+	if (profile.mountedPluginPaths.length > 0) {
+		yamlLines.push("plugins:");
+		for (const pluginPath of profile.mountedPluginPaths) {
+			yamlLines.push(`  - ${JSON.stringify(pluginPath)}`);
+		}
+	}
+	yamlLines.push("---", "");
+
+	const desired = yamlLines.join("\n");
+	try {
+		if (!fs.existsSync(agentFile) || fs.readFileSync(agentFile, "utf8") !== desired) {
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.writeFileSync(agentFile, desired, "utf8");
+		}
+	} catch {
+		// 目录只读时忽略写入异常
+	}
+
+	return {
+		effectiveAgentName: agentName,
+		managedAgentDir: agentName === BRIDGE_AGENT_NAME ? undefined : agentDir,
+	};
+}
+
+function appendNoProxyLoopback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const result: NodeJS.ProcessEnv = { ...env };
+	const existing = env.NO_PROXY || env.no_proxy || "";
+	const entries = existing
+		.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+	for (const host of ["127.0.0.1", "localhost", "::1"]) {
+		if (!entries.includes(host)) {
+			entries.push(host);
+		}
+	}
+	const joined = entries.join(",");
+	result.NO_PROXY = joined;
+	result.no_proxy = joined;
+	return result;
+}
+
+/** 封装单个已握手 `agy acp` 子进程连接 */
+export class AcpClientConnection {
+	readonly binary: ResolvedBinary;
+	readonly profile: AcpProcessProfile;
+	private readonly proc: ChildProcessWithoutNullStreams;
+	private readonly managedAgentDir?: string;
+	private readonly pending = new Map<JsonRpcId, PendingRpc>();
+	private readonly activeSessions = new Set<string>();
+	private readonly stderrTail: string[] = [];
+	private nextRpcId = 1;
+	private closed = false;
+	private initPromise?: Promise<AcpInitializeResult>;
+	private initResult?: AcpInitializeResult;
+	private handlers: AcpServerHandlers;
+
+	constructor(
+		binary: ResolvedBinary,
+		profile: AcpProcessProfile,
+		handlers: AcpServerHandlers = {},
+		env: NodeJS.ProcessEnv = process.env,
+	) {
+		this.binary = binary;
+		this.profile = profile;
+		this.handlers = handlers;
+
+		const { effectiveAgentName, managedAgentDir } =
+			resolveManagedAgentMaterialization(profile);
+		this.managedAgentDir = managedAgentDir;
+
+		const args: string[] = ["acp", "--disable-telemetry"];
+		if (profile.processPerSession) {
+			args.push("--process-per-session");
+		}
+		if (effectiveAgentName) {
+			args.push("--agent", effectiveAgentName);
+		}
+		if (!profile.includeDefaultCustomizations) {
+			args.push("--include-default-customizations=false");
+		}
+		if (profile.sandbox) {
+			args.push("--sandbox");
+		}
+		if (profile.geminiDir) {
+			args.push("--gemini-dir", profile.geminiDir);
+		}
+		if (profile.appDataDirName && profile.appDataDirName !== "antigravity-cli") {
+			args.push("--app-data-dir", profile.appDataDirName);
+		}
+
+		const spawnCmd =
+			binary.isWindowsWrapperScript && binary.binPath.includes(" ")
+				? `"${binary.binPath}"`
+				: binary.binPath;
+
+		this.proc = spawn(spawnCmd, args, {
+			env: appendNoProxyLoopback(env),
+			stdio: ["pipe", "pipe", "pipe"],
+			shell: binary.isWindowsWrapperScript,
+			windowsHide: true,
+		});
+
+		const stdoutDecoder = new StringDecoder("utf8");
+		const parser = new NdjsonLineParser((msg) => this.handleIncomingMessage(msg));
+
+		this.proc.stdout.on("data", (chunk: Buffer) => {
+			parser.push(stdoutDecoder.write(chunk));
+		});
+		this.proc.stdout.on("end", () => {
+			const rem = stdoutDecoder.end();
+			if (rem) parser.push(rem);
+			parser.flush();
+		});
+
+		const stderrDecoder = new StringDecoder("utf8");
+		this.proc.stderr.on("data", (chunk: Buffer) => {
+			const text = stderrDecoder.write(chunk);
+			for (const line of text.split(/\r?\n/)) {
+				const trimmed = line.trim();
+				if (trimmed.length > 0) {
+					this.stderrTail.push(trimmed);
+					if (this.stderrTail.length > 20) {
+						this.stderrTail.shift();
+					}
+				}
+			}
+		});
+
+		this.proc.on("error", (err) => {
+			this.failAllPending(err);
+		});
+		this.proc.on("close", (code, signal) => {
+			this.closed = true;
+			const tail = this.stderrTail.length > 0 ? `: ${this.stderrTail.slice(-3).join(" | ")}` : "";
+			this.failAllPending(
+				new Error(`Antigravity ACP 进程已退出 (code=${code ?? "null"}, signal=${signal ?? "null"})${tail}`),
+			);
+		});
+	}
+
+	get isAlive(): boolean {
+		return !this.closed && this.proc.exitCode === null && !this.proc.killed;
+	}
+
+	get capabilities(): AcpInitializeResult["agentCapabilities"] | undefined {
+		return this.initResult?.agentCapabilities;
+	}
+
+	get initializeInfo(): AcpInitializeResult | undefined {
+		return this.initResult;
+	}
+
+	setHandlers(handlers: AcpServerHandlers): void {
+		this.handlers = handlers;
+	}
+
+	trackSession(sessionId: string): void {
+		this.activeSessions.add(sessionId);
+	}
+
+	untrackSession(sessionId: string): void {
+		this.activeSessions.delete(sessionId);
+	}
+
+	async ensureInitialized(signal?: AbortSignal): Promise<AcpInitializeResult> {
+		if (this.initResult) {
+			return this.initResult;
+		}
+		if (!this.initPromise) {
+			this.initPromise = this.request<AcpInitializeResult>(
+				"initialize",
+				{
+					protocolVersion: 1,
+					clientCapabilities: {
+						elicitation: { form: {}, url: {} },
+					},
+					clientInfo: {
+						name: CLIENT_INFO_NAME,
+						version: CLIENT_INFO_VERSION,
+					},
+				},
+				{ timeoutMs: 20_000, signal },
+			).then((res) => {
+				this.initResult = res;
+				return res;
+			});
+		}
+		return this.initPromise;
+	}
+
+	request<TResult = unknown>(
+		method: string,
+		params?: unknown,
+		options: { timeoutMs?: number; signal?: AbortSignal } = {},
+	): Promise<TResult> {
+		if (!this.isAlive) {
+			return Promise.reject(new Error("Antigravity ACP 子进程未处于运行状态"));
+		}
+		if (options.signal?.aborted) {
+			return Promise.reject(options.signal.reason ?? new Error("请求已取消"));
+		}
+
+		const id = this.nextRpcId++;
+		return new Promise<TResult>((resolve, reject) => {
+			const entry: PendingRpc = {
+				method,
+				resolve: (v) => resolve(v as TResult),
+				reject,
+			};
+
+			if (options.timeoutMs && options.timeoutMs > 0) {
+				entry.timer = setTimeout(() => {
+					this.pending.delete(id);
+					entry.cleanupAbort?.();
+					reject(new Error(`ACP 请求 ${method} 超时 (${options.timeoutMs}ms)`));
+				}, options.timeoutMs);
+			}
+
+			if (options.signal) {
+				const onAbort = () => {
+					if (!this.pending.has(id)) return;
+					this.pending.delete(id);
+					if (entry.timer) clearTimeout(entry.timer);
+					reject(options.signal?.reason ?? new Error(`ACP 请求 ${method} 已中止`));
+				};
+				options.signal.addEventListener("abort", onAbort, { once: true });
+				entry.cleanupAbort = () => options.signal?.removeEventListener("abort", onAbort);
+			}
+
+			this.pending.set(id, entry);
+			this.writeJson({
+				jsonrpc: "2.0",
+				id,
+				method,
+				params,
+			});
+		});
+	}
+
+	notify(method: string, params?: unknown): void {
+		if (!this.isAlive) return;
+		this.writeJson({
+			jsonrpc: "2.0",
+			method,
+			params,
+		});
+	}
+
+	async closeSessionSafe(sessionId: string): Promise<void> {
+		this.activeSessions.delete(sessionId);
+		if (!this.isAlive) return;
+		try {
+			await this.request("session/close", { sessionId }, { timeoutMs: 3_000 });
+		} catch {
+			// 会话已关闭或进程退出时静默忽略
+		}
+	}
+
+	/** 优雅关闭连接、清理临时挂载 Agent 描述并在超时后回收跨平台子进程树 */
+	async dispose(): Promise<void> {
+		if (this.closed) {
+			this.cleanupManagedAgentDir();
+			return;
+		}
+		const sessions = Array.from(this.activeSessions);
+		this.activeSessions.clear();
+
+		for (const sessionId of sessions) {
+			await this.closeSessionSafe(sessionId);
+		}
+
+		if (this.isAlive) {
+			await new Promise<void>((resolve) => {
+				let settled = false;
+				const finish = () => {
+					if (settled) return;
+					settled = true;
+					resolve();
+				};
+
+				this.proc.once("close", finish);
+				try {
+					this.proc.stdin.end();
+				} catch {
+					// 忽略管道关闭异常
+				}
+
+				setTimeout(() => {
+					if (!settled) {
+						this.forceKillProcessTree();
+						finish();
+					}
+				}, 1_500);
+			});
+		}
+
+		this.closed = true;
+		this.cleanupManagedAgentDir();
+	}
+
+	private cleanupManagedAgentDir(): void {
+		if (!this.managedAgentDir) return;
+		try {
+			fs.rmSync(this.managedAgentDir, { recursive: true, force: true });
+		} catch {
+			// 忽略清理异常
+		}
+	}
+
+	private forceKillProcessTree(): void {
+		const pid = this.proc.pid;
+		if (!pid) return;
+
+		if (process.platform === "win32") {
+			try {
+				spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+					windowsHide: true,
+					stdio: "ignore",
+					timeout: 3_000,
+				});
+			} catch {
+				try {
+					this.proc.kill();
+				} catch {
+					// 忽略已退出进程
+				}
+			}
+			return;
+		}
+
+		try {
+			this.proc.kill("SIGTERM");
+			setTimeout(() => {
+				try {
+					if (this.proc.exitCode === null) {
+						this.proc.kill("SIGKILL");
+					}
+				} catch {
+					// 忽略
+				}
+			}, 500).unref();
+		} catch {
+			// 忽略
+		}
+	}
+
+	private writeJson(payload: unknown): void {
+		try {
+			this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+		} catch (error) {
+			this.failAllPending(error);
+		}
+	}
+
+	private handleIncomingMessage(msg: JsonRpcMessage): void {
+		if ("id" in msg && ("result" in msg || "error" in msg) && !("method" in msg)) {
+			if (msg.id === null) return;
+			const entry = this.pending.get(msg.id);
+			if (!entry) return;
+			this.pending.delete(msg.id);
+			if (entry.timer) clearTimeout(entry.timer);
+			entry.cleanupAbort?.();
+			if ("error" in msg) {
+				entry.reject(new AcpRpcError(msg.error));
+			} else {
+				entry.resolve(msg.result);
+			}
+			return;
+		}
+
+		if ("id" in msg && "method" in msg) {
+			void this.handleServerRequest(msg as JsonRpcRequest);
+			return;
+		}
+
+		if ("method" in msg && !("id" in msg)) {
+			if (msg.method === "session/update" && msg.params) {
+				this.handlers.onSessionUpdate?.(msg.params as AcpSessionUpdateNotification);
+			}
+		}
+	}
+
+	private async handleServerRequest(req: JsonRpcRequest): Promise<void> {
+		try {
+			if (req.method === "session/request_permission") {
+				if (!this.handlers.onRequestPermission) {
+					this.writeJson({
+						jsonrpc: "2.0",
+						id: req.id,
+						result: { outcome: { outcome: "cancelled" } } satisfies AcpRequestPermissionResult,
+					});
+					return;
+				}
+				const result = await this.handlers.onRequestPermission(
+					req.params as AcpRequestPermissionParams,
+				);
+				this.writeJson({ jsonrpc: "2.0", id: req.id, result });
+				return;
+			}
+
+			if (req.method === "elicitation/create") {
+				if (!this.handlers.onElicitationCreate) {
+					this.writeJson({
+						jsonrpc: "2.0",
+						id: req.id,
+						error: { code: -32601, message: "Elicitation handler unavailable" },
+					});
+					return;
+				}
+				const result = await this.handlers.onElicitationCreate(
+					req.params as AcpElicitationCreateParams,
+				);
+				this.writeJson({ jsonrpc: "2.0", id: req.id, result });
+				return;
+			}
+
+			this.writeJson({
+				jsonrpc: "2.0",
+				id: req.id,
+				error: { code: -32601, message: `Unsupported client method: ${req.method}` },
+			});
+		} catch (error) {
+			this.writeJson({
+				jsonrpc: "2.0",
+				id: req.id,
+				error: {
+					code: -32603,
+					message: error instanceof Error ? error.message : String(error),
+				},
+			});
+		}
+	}
+
+	private failAllPending(error: unknown): void {
+		for (const [, entry] of this.pending) {
+			if (entry.timer) clearTimeout(entry.timer);
+			entry.cleanupAbort?.();
+			entry.reject(error);
+		}
+		this.pending.clear();
+	}
+}
+
+function buildProfileKey(profile: AcpProcessProfile): string {
+	return JSON.stringify([
+		profile.userAgentName ?? "",
+		profile.disableBuiltinTools,
+		profile.excludeDefaultComponents,
+		profile.inheritCustomizations,
+		profile.inheritMcp,
+		profile.mountedPluginPaths,
+		profile.includeDefaultCustomizations,
+		profile.processPerSession,
+		profile.sandbox,
+		profile.geminiDir,
+		profile.appDataDirName,
+	]);
+}
+
+/** 根据桥接配置与原生挂载清单构造目标 ACP 子进程 Profile */
+export function resolveProcessProfileForConfig(
+	config: BridgeConfig,
+	mountedPluginPaths: readonly string[] = [],
+): AcpProcessProfile {
+	const flags = resolveEffectiveFlags(config);
+	const isPiTools = flags.toolMode === "pi-tools";
+
+	return {
+		userAgentName: isPiTools ? undefined : config.agyCustomAgent,
+		disableBuiltinTools: isPiTools,
+		excludeDefaultComponents: isPiTools,
+		inheritCustomizations: flags.agyInheritCustomizations,
+		inheritMcp: flags.agyInheritMcp,
+		mountedPluginPaths: [...mountedPluginPaths],
+		includeDefaultCustomizations: flags.agyInheritCustomizations,
+		processPerSession: config.processPerSession,
+		sandbox: config.sandbox,
+		geminiDir: config.geminiDir,
+		appDataDirName: config.appDataDirName,
+	};
+}
+
+/** 管理不同 Profile 的常驻 `agy acp` 进程池与统一释放 */
+export class AcpProcessManager {
+	private readonly pool = new Map<string, AcpClientConnection>();
+	private sharedHandlers: AcpServerHandlers = {};
+
+	setHandlers(handlers: AcpServerHandlers): void {
+		this.sharedHandlers = handlers;
+		for (const conn of this.pool.values()) {
+			conn.setHandlers(handlers);
+		}
+	}
+
+	resolveBinary(config: BridgeConfig): ResolvedBinary {
+		const binary = resolveAgyBinary({
+			configuredBin: config.agyBin,
+			geminiDir: config.geminiDir,
+		});
+		if (!binary) {
+			throw new Error(
+				"未找到 Antigravity CLI (agy) 可执行文件。请确认已安装 agy 并加入 PATH，或设置环境变量 PI_AGY_BIN。",
+			);
+		}
+		return binary;
+	}
+
+	async acquire(
+		config: BridgeConfig,
+		profileOverride?: Partial<AcpProcessProfile>,
+		signal?: AbortSignal,
+	): Promise<AcpClientConnection> {
+		const baseProfile = resolveProcessProfileForConfig(config);
+		const profile: AcpProcessProfile = { ...baseProfile, ...profileOverride };
+		const key = buildProfileKey(profile);
+
+		const existing = this.pool.get(key);
+		if (existing?.isAlive) {
+			await existing.ensureInitialized(signal);
+			return existing;
+		}
+
+		const binary = this.resolveBinary(config);
+		const conn = new AcpClientConnection(binary, profile, this.sharedHandlers);
+		this.pool.set(key, conn);
+
+		try {
+			await conn.ensureInitialized(signal);
+			return conn;
+		} catch (error) {
+			this.pool.delete(key);
+			await conn.dispose();
+			throw error;
+		}
+	}
+
+	async disposeAll(): Promise<void> {
+		const connections = Array.from(this.pool.values());
+		this.pool.clear();
+		await Promise.allSettled(connections.map((conn) => conn.dispose()));
+	}
+}
