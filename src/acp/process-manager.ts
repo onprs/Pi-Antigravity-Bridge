@@ -511,6 +511,14 @@ export class AcpClientConnection {
 		}
 
 		this.closed = true;
+		try {
+			this.proc.stdin.destroy();
+			this.proc.stdout.destroy();
+			this.proc.stderr.destroy();
+			this.proc.unref();
+		} catch {
+			// 忽略流释放异常
+		}
 		// 保留确定性哈希目录 pi-bridge-<hash>，避免并发运行的多个 Pi 进程误删彼此正在使用的配置目录
 		void this.managedAgentDir;
 	}

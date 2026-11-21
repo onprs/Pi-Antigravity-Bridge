@@ -520,6 +520,17 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			onHoldTimeout: async () => {},
 		});
 
+		const waitUntil = async (predicate: () => boolean, timeoutMs = 5_000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs;
+			while (!predicate()) {
+				if (Date.now() > deadline) {
+					throw new Error(`waitUntil timed out after ${timeoutMs}ms`);
+				}
+				await new Promise((r) => setTimeout(r, 15));
+			}
+		};
+
+		let child: ReturnType<typeof spawn> | undefined;
 		try {
 			const port = await bridge.ensureListening();
 			bridge.recordAcpToolAnnouncement("sess-stdio", "mcp_pi_tools_slow_tool");
@@ -527,11 +538,11 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			const envObj: NodeJS.ProcessEnv = { ...process.env };
 			for (const pair of spec.env) envObj[pair.name] = pair.value;
 
-			const child = spawn(spec.command, spec.args, { env: envObj, stdio: ["pipe", "pipe", "pipe"] });
+			child = spawn(spec.command, spec.args, { env: envObj, stdio: ["pipe", "pipe", "pipe"] });
 			const lines: Array<{ id: number }> = [];
-			child.stdout.setEncoding("utf8");
+			child.stdout!.setEncoding("utf8");
 			let outBuf = "";
-			child.stdout.on("data", (chunk: string) => {
+			child.stdout!.on("data", (chunk: string) => {
 				outBuf += chunk;
 				let nl = outBuf.indexOf("\n");
 				while (nl !== -1) {
@@ -542,24 +553,29 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 				}
 			});
 
-			// 先发挂起的 tools/call (id=1)，紧接着并发发送 ping (id=2)
-			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow_tool", arguments: {} } })}\n`);
-			await new Promise((r) => setTimeout(r, 40));
-			assert.equal(parked.length, 1);
+			// 先发挂起的 tools/call (id=1)，等待服务端确认已进入 Park-and-Yield 挂起态
+			child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "slow_tool", arguments: {} } })}\n`);
+			await waitUntil(() => parked.length === 1);
 
-			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping", params: {} })}\n`);
-			await new Promise((r) => setTimeout(r, 40));
-			// id=2 (ping) 必须在 id=1 仍处于挂起态时先行返回
-			assert.equal(lines.length, 1);
+			// 紧接着并发发送 ping (id=2)，必须在 id=1 仍处于挂起态时先行返回
+			child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping", params: {} })}\n`);
+			await waitUntil(() => lines.length === 1);
 			assert.equal(lines[0].id, 2);
 
 			parked[0].settle({ content: [{ type: "text", text: "done" }] });
-			await new Promise((r) => setTimeout(r, 40));
-			assert.equal(lines.length, 2);
+			await waitUntil(() => lines.length === 2);
 			assert.equal(lines[1].id, 1);
-			child.stdin.end();
-			child.kill();
 		} finally {
+			if (child) {
+				try {
+					child.stdin?.destroy();
+					child.stdout?.destroy();
+					child.stderr?.destroy();
+					child.kill("SIGKILL");
+				} catch {
+					// 忽略子进程销毁异常
+				}
+			}
 			await bridge.dispose();
 		}
 	});
