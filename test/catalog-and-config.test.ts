@@ -185,8 +185,10 @@ describe("跨平台可执行文件定位", () => {
 			assert.equal(foundCmd.binPath, cmdPath);
 			assert.equal(foundCmd.isWindowsWrapperScript, true);
 
-			// 验证 Windows .cmd 包装脚本含空格路径参数通过 cmd.exe /d /s /c + windowsVerbatimArguments 安全引用
+			// 验证 Windows .cmd 包装脚本含空格及特殊字符参数通过 cmd.exe /d /s /c + windowsVerbatimArguments 安全引用
 			assert.equal(quoteWindowsCmdArg("C:\\Users\\John Doe\\.gemini"), '"C:\\Users\\John Doe\\.gemini"');
+			assert.equal(quoteWindowsCmdArg("--flag=a;b,c"), '"--flag=a;b,c"');
+			assert.equal(quoteWindowsCmdArg("%USERPROFILE%\\agy"), '"%%USERPROFILE%%\\agy"');
 			const cmdSpec = buildAgySpawnSpec(
 				{
 					binPath: "C:\\Users\\John Doe\\AppData\\Local\\Programs\\Antigravity\\bin\\agy.cmd",
@@ -322,15 +324,21 @@ rl.on("line", (line) => {
 			assert.ok(afterOrphan.closedIds.includes("probe-sess-1"));
 			assert.equal(fs.existsSync(path.join(convDir, "probe-sess-1.db")), false);
 
-			// 3. 4 个并发模型探测共享单一 Singleflight，仅触发 1 次新的 session/new
+			// 3. 4 个并发模型探测共享单一 Singleflight，仅触发 1 次新的 session/new，且通过 env 隔离写入目录绝不污染用户全局缓存
+			const isolatedAgentDir = path.join(tmpRoot, "isolated-pi-agent");
+			const isolatedEnv: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: isolatedAgentDir };
 			const [s1, s2, s3, s4] = await Promise.all([
-				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
-				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
-				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
-				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true, env: isolatedEnv }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true, env: isolatedEnv }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true, env: isolatedEnv }),
+				probeLiveAntigravityCatalog(pm, cfg, tmpRoot, { force: true, env: isolatedEnv }),
 			]);
 			assert.equal(s1.models.length, s2.models.length);
 			assert.equal(s3.models.length, s4.models.length);
+			assert.equal(
+				fs.existsSync(path.join(isolatedAgentDir, "cache", "antigravity-models.json")),
+				true,
+			);
 			const finalState = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
 				initCount: number;
 				newCount: number;
@@ -340,6 +348,13 @@ rl.on("line", (line) => {
 			assert.equal(finalState.newCount, 2); // 1 次孤儿测试 + 1 次合并探测
 			assert.ok(finalState.closedIds.includes("probe-sess-2"));
 			assert.equal(fs.existsSync(path.join(convDir, "probe-sess-2.db")), false);
+
+			// 4. 在 initialize 尚未完成时调用 disposeAll() 必须回收正在初始化的进程，绝不残留孤儿连接
+			const pmInitDispose = new AcpProcessManager();
+			const slowInit = pmInitDispose.acquire(cfg, undefined);
+			await new Promise((r) => setTimeout(r, 15));
+			await pmInitDispose.disposeAll();
+			await assert.rejects(slowInit);
 		} finally {
 			await pm.disposeAll();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

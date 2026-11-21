@@ -14,7 +14,7 @@ import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
 import { validateToolArguments } from "../src/mcp/schema-validator.ts";
 import { buildInlineStdioShimCommand } from "../src/mcp/stdio-shim.ts";
 import { prepareCustomizationMount } from "../src/session/customization-mounter.ts";
-import { classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
+import { AgyTurnMirrorBroker, classifyAgyToolCall } from "../src/tools/agy-mirror-tools.ts";
 import { ToolActivationController } from "../src/ui/commands.ts";
 
 describe("MCP 工具参数 JSON Schema 预校验", () => {
@@ -47,6 +47,43 @@ describe("MCP 工具参数 JSON Schema 预校验", () => {
 		assert.ok(bad.formattedError?.includes("$.line"));
 		assert.ok(bad.formattedError?.includes("$.mode"));
 		assert.ok(bad.formattedError?.includes("$.extra"));
+
+		// 支持 $defs / $ref 与 allOf 组合结构且不因顶层 additionalProperties: false 误拒合法分支字段
+		const refAndAllOfSchema = {
+			type: "object",
+			$defs: {
+				EditRange: {
+					type: "object",
+					properties: {
+						start: { type: "integer", minimum: 1 },
+						end: { type: "integer", minimum: 1 },
+					},
+					required: ["start"],
+				},
+			},
+			allOf: [
+				{
+					type: "object",
+					properties: {
+						range: { $ref: "#/$defs/EditRange" },
+					},
+					required: ["range"],
+				},
+			],
+			properties: {
+				path: { type: "string" },
+			},
+			required: ["path"],
+			additionalProperties: false,
+		};
+		assert.equal(
+			validateToolArguments("ref_tool", { path: "a.ts", range: { start: 1, end: 5 } }, refAndAllOfSchema)
+				.valid,
+			true,
+		);
+		const badRef = validateToolArguments("ref_tool", { path: "a.ts", range: { start: 0 } }, refAndAllOfSchema);
+		assert.equal(badRef.valid, false);
+		assert.ok(badRef.formattedError?.includes("$.range.start"));
 	});
 });
 
@@ -536,6 +573,62 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			bridgePiMcp: true,
 		});
 		assert.ok(activeTools.includes("mcp__deferred__secret_query"));
+
+		// 验证未开启 codemode 的用户进入 agy-tools + bridgePiMcp 时绝不被强行启用 codemode，且退出后不泄漏临时注入的 tool_search
+		let noCodemodeActive = ["read", "bash", "mcp__github__search"];
+		const fakePiNoCodemode = {
+			getActiveTools: () => [...noCodemodeActive],
+			getAllTools: () => [
+				{ name: "read" },
+				{ name: "bash" },
+				{ name: "codemode" },
+				{ name: "tool_search" },
+				{ name: "mcp__github__search" },
+			],
+			setActiveTools: (next: string[]) => {
+				noCodemodeActive = [...next];
+			},
+		} as unknown as ExtensionAPI;
+		const ctrlNoCode = new ToolActivationController(fakePiNoCodemode);
+		ctrlNoCode.syncForContext(fakeCtx, {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "agy-tools",
+			bridgePiMcp: true,
+			piMcpBridgeStrategy: "via-host",
+		});
+		assert.ok(!noCodemodeActive.includes("codemode"));
+		assert.ok(noCodemodeActive.includes("tool_search"));
+		// 切回 pi-tools 时完整恢复原工具列表且不泄漏 codemode / 临时补入的 tool_search
+		ctrlNoCode.syncForContext(fakeCtx, {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+		});
+		assert.deepEqual(noCodemodeActive.sort(), ["bash", "mcp__github__search", "read"]);
+
+		// 验证镜像工具收到纯 diff 的 tool_call_update 时保留先前流式文本输出不清空
+		const diffBroker = new AgyTurnMirrorBroker();
+		diffBroker.registerOrUpdateCall("sess-diff", {
+			toolCallId: "tc-diff-1",
+			kind: "edit",
+			title: "Edit a.ts",
+			status: "in_progress",
+			content: [{ type: "content", content: { type: "text", text: "Applying patch..." } }],
+		});
+		diffBroker.registerOrUpdateCall("sess-diff", {
+			toolCallId: "tc-diff-1",
+			status: "completed",
+			content: [{ type: "diff", path: "a.ts", oldText: "old", newText: "new" }],
+		});
+		const diffRes = await diffBroker.executeMirrorCall(
+			"tc-diff-1",
+			undefined,
+			undefined,
+			fakeCtx,
+		);
+		assert.ok(
+			diffRes.content.some((c) => c.type === "text" && c.text.includes("Applying patch...")),
+		);
+		assert.equal(diffRes.details?.diffs?.length, 1);
 
 		// 验证通用字段 name / Description 不会把普通原生工具误判为 agy_subagent
 		const bashWithDesc = classifyAgyToolCall({

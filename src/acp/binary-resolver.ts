@@ -149,12 +149,13 @@ export interface AgySpawnSpec {
 }
 
 /**
- * 为 Windows `cmd.exe /d /s /c` 安全引用单个命令行参数（处理含空格路径与双引号，且无需设置 `shell: true`，彻底规避 Node 22+ DEP0190）。
+ * 为 Windows `cmd.exe /d /s /c` 安全引用单个命令行参数（处理含空格、管道、环境变量符号 `%` 及分隔符参数，无需设置 `shell: true`，规避 Node 22+ DEP0190）。
  */
 export function quoteWindowsCmdArg(arg: string): string {
 	if (arg.length === 0) return '""';
-	if (!/[\s"&|<>^()]/.test(arg)) return arg;
-	return `"${arg.replace(/"/g, '""')}"`;
+	const escapedPercents = arg.replace(/%/g, "%%");
+	if (!/[\s"&|<>^()!;,=%]/.test(escapedPercents)) return escapedPercents;
+	return `"${escapedPercents.replace(/"/g, '""')}"`;
 }
 
 /**

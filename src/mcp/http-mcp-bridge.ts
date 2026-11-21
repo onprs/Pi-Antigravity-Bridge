@@ -34,6 +34,10 @@ export interface SessionMcpBinding {
 	onParkedCall: (call: ParkedToolCall) => void;
 	/** 达到 mcpHoldLimitMs 仍未收到宿主工具执行结果时触发，先对 AGY 执行预取消 */
 	onHoldTimeout: (call: ParkedToolCall) => Promise<void>;
+	/** 当工具调用在未知工具、参数预校验或门控阶段提前被拒绝时回调，用于平衡前置宣告计数 */
+	onRejectedCall?: (toolName: string) => void;
+	/** 当上游 HTTP 客户端在工具结果结算前主动断连时回调，用于及时清理失效挂起句柄 */
+	onClientDisconnect?: (callId: string) => void;
 }
 
 interface AnnouncedToolEntry {
@@ -202,11 +206,12 @@ export class LocalHttpMcpBridge {
 		}
 	}
 
-	updateBindingTools(token: string, tools: Tool[]): void {
+	/** 更新会话绑定的工具表，并返回是否已通过活跃 SSE 连接向客户端实时推送 `tools/list_changed` */
+	updateBindingTools(token: string, tools: Tool[]): boolean {
 		const binding = this.bindingsByToken.get(token);
-		if (!binding) return;
+		if (!binding) return false;
 		binding.tools = tools;
-		this.broadcastToolsListChanged(token);
+		return this.broadcastToolsListChanged(token);
 	}
 
 	unregisterSessionBinding(token: string): void {
@@ -313,25 +318,34 @@ export class LocalHttpMcpBridge {
 			const srv = this.server;
 			this.server = undefined;
 			this.port = 0;
+			srv.closeIdleConnections?.();
+			srv.closeAllConnections?.();
 			await new Promise<void>((resolve) => srv.close(() => resolve()));
 		}
 	}
 
-	private broadcastToolsListChanged(token: string): void {
+	private broadcastToolsListChanged(token: string): boolean {
 		const clients = this.sseClientsByToken.get(token);
-		if (!clients || clients.size === 0) return;
+		if (!clients || clients.size === 0) return false;
 		const payload = JSON.stringify({
 			jsonrpc: "2.0",
 			method: "notifications/tools/list_changed",
 			params: {},
 		});
-		for (const res of clients) {
+		let delivered = false;
+		for (const res of Array.from(clients)) {
+			if (res.writableEnded || res.destroyed) {
+				clients.delete(res);
+				continue;
+			}
 			try {
 				res.write(`event: message\ndata: ${payload}\n\n`);
+				delivered = true;
 			} catch {
-				// 忽略已断开的 SSE 连接
+				clients.delete(res);
 			}
 		}
+		return delivered;
 	}
 
 	private pruneExpiredAnnouncements(now: number): void {
@@ -584,6 +598,7 @@ export class LocalHttpMcpBridge {
 
 		const toolDef = binding.tools.find((t) => t.name === toolName);
 		if (!toolDef) {
+			binding.onRejectedCall?.(toolName);
 			res.writeHead(200);
 			res.end(
 				JSON.stringify({
@@ -607,6 +622,7 @@ export class LocalHttpMcpBridge {
 		const normalizedArgs = normalizeHostToolArguments(toolName, rawArgs, toolDef);
 		const validation = validateToolArguments(toolName, normalizedArgs, toolDef.parameters);
 		if (!validation.valid) {
+			binding.onRejectedCall?.(toolName);
 			res.writeHead(200);
 			res.end(
 				JSON.stringify({
@@ -624,6 +640,7 @@ export class LocalHttpMcpBridge {
 		// 2. ACP 公告门控校验，防止已取消旧轮次迟到调用串扰
 		const allowed = await this.waitForAnnouncementPairing(toolName, rootConvId, 450);
 		if (!allowed) {
+			binding.onRejectedCall?.(toolName);
 			res.writeHead(200);
 			res.end(
 				JSON.stringify({
@@ -716,7 +733,9 @@ export class LocalHttpMcpBridge {
 
 		res.on("close", () => {
 			if (!settled) {
+				settled = true;
 				clearTimeout(holdTimer);
+				binding.onClientDisconnect?.(callId);
 			}
 		});
 

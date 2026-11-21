@@ -24,6 +24,7 @@ import {
 import {
 	buildFreshReplayPromptBlocks,
 	computeTranscriptDigest,
+	extractAuxiliaryTaskInstructions,
 	isAuxiliarySingleTurnRequest,
 } from "../src/session/reconcile.ts";
 import {
@@ -158,6 +159,7 @@ describe("流式行尾缓冲、429 软错误拦截与 Usage 转换", () => {
 describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 	it("识别辅助摘要请求并在 FreshReplay 中保留历史多模态图片块", () => {
 		const auxCtx = normalizeContext({
+			systemPrompt: "You are a context summarization assistant. Do not continue the conversation.",
 			messages: [
 				{
 					role: "user",
@@ -168,6 +170,20 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			tools: [],
 		});
 		assert.equal(isAuxiliarySingleTurnRequest(auxCtx, undefined, false), true);
+		assert.ok(extractAuxiliaryTaskInstructions(auxCtx)?.includes("summarization assistant"));
+
+		// 用户以 --no-tools 首轮正常提问“总结 README”绝不能误判为一次性辅助请求
+		const normalNoToolsCtx = normalizeContext({
+			messages: [
+				{
+					role: "user",
+					content: "Please summarize this README file and list its features.",
+					timestamp: 1,
+				},
+			],
+			tools: [],
+		});
+		assert.equal(isAuxiliarySingleTurnRequest(normalNoToolsCtx, undefined, false), false);
 
 		const u1: UserMessage = {
 			role: "user",

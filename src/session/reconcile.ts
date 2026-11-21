@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import {
+	getCurrentSystemPrompt,
 	getCurrentTools,
 	type AssistantMessage,
 	type ImageContent,
@@ -85,12 +86,15 @@ export function computeTranscriptDigest(
 	return hash.digest("hex");
 }
 
-const SUMMARY_HINT_PATTERN =
-	/(?:summarize|summary|compaction|checkpoint|context\s+summary|<conversation>)/i;
+const SUMMARY_USER_HINT_PATTERN =
+	/(?:<conversation>|summarize\s+(?:the|this)\s+(?:conversation|session|branch)|for\s+compaction|compaction\s+summary|context\s+summary|structured\s+checkpoint|update\s+the\s+previous\s+summary|create\s+a\s+(?:structured\s+)?checkpoint)/i;
+
+const SUMMARY_SYSTEM_HINT_PATTERN =
+	/(?:context\s+summarization\s+assistant|do\s+not\s+continue\s+the\s+conversation|summarize\s+the\s+conversation)/i;
 
 /**
  * 判定当前请求是否为后台单轮无工具辅助请求（例如 `/compact` 生成摘要、`/tree` 分支总结或缓存预热）。
- * 辅助请求将分配独立临时 ACP Session，避免污染主会话状态。
+ * 辅助请求将分配独立临时 ACP Session，避免污染主会话状态；同时避免误伤用户在 `--no-tools` 下首轮普通的总结类提问。
  */
 export function isAuxiliarySingleTurnRequest(
 	context: TranscriptContext,
@@ -108,6 +112,10 @@ export function isAuxiliarySingleTurnRequest(
 	const visible = extractVisibleMessages(context.messages);
 
 	if (tools.length === 0 && visible.length <= 2) {
+		const sysText = getCurrentSystemPrompt(context.messages);
+		if (sysText && SUMMARY_SYSTEM_HINT_PATTERN.test(sysText)) {
+			return true;
+		}
 		const last = visible[visible.length - 1];
 		if (last?.role === "user") {
 			const text =
@@ -117,7 +125,7 @@ export function isAuxiliarySingleTurnRequest(
 							.filter((c): c is TextContent => c.type === "text")
 							.map((c) => c.text)
 							.join("\n");
-			if (SUMMARY_HINT_PATTERN.test(text)) {
+			if (SUMMARY_USER_HINT_PATTERN.test(text)) {
 				return true;
 			}
 		}
@@ -127,6 +135,19 @@ export function isAuxiliarySingleTurnRequest(
 	}
 
 	return false;
+}
+
+/**
+ * 为后台无状态辅助请求（如 `/compact`、`/tree` 分支摘要）提取宿主传入的任务说明文本，
+ * 通过用户消息块传递给临时会话，确保摘要约束与输出格式生效且不修改任何官方系统提示词。
+ */
+export function extractAuxiliaryTaskInstructions(context: TranscriptContext): string | undefined {
+	const raw = getCurrentSystemPrompt(context.messages)?.trim();
+	if (!raw) return undefined;
+	if (raw.length > 8_000) {
+		return raw.slice(0, 8_000);
+	}
+	return raw;
 }
 
 /** 将单条或多条新增的 `UserMessage` 转换为 ACP `PromptBlock[]` */
@@ -210,6 +231,8 @@ export function buildDetachedToolResultBlocks(
 
 /** 历史检查点重放文本最大 UTF-8 字节预算（严防超出后端单次 Prompt 上限导致尾部最新用户提问被硬截断） */
 export const MAX_FRESH_REPLAY_HISTORY_BYTES = 120_000;
+/** 历史检查点重放最多保留的近期历史图片数（更早图片转为占位文本，防单行 JSON-RPC 体积失控） */
+const MAX_FRESH_REPLAY_HISTORY_IMAGES = 6;
 const MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES = 4_000;
 const MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES = 16_000;
 
@@ -350,6 +373,7 @@ export function buildFreshReplayPromptBlocks(
 	if (historySlice.length > 0) {
 		const selectedReversed: AcpPromptBlock[][] = [];
 		let usedHistoryBytes = 0;
+		let usedHistoryImages = 0;
 		let omittedCount = 0;
 
 		for (let i = historySlice.length - 1; i >= 0; i--) {
@@ -364,7 +388,18 @@ export function buildFreshReplayPromptBlocks(
 				omittedCount = i + 1;
 				break;
 			}
-			selectedReversed.push(serialized.blocks);
+			const cappedBlocks: AcpPromptBlock[] = serialized.blocks.map((block) => {
+				if (block.type !== "image") return block;
+				if (usedHistoryImages < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
+					usedHistoryImages++;
+					return block;
+				}
+				return {
+					type: "text",
+					text: `[earlier ${block.mimeType} image omitted in replay]`,
+				};
+			});
+			selectedReversed.push(cappedBlocks);
 			usedHistoryBytes += serialized.textBytes;
 		}
 

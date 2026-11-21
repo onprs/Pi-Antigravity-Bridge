@@ -263,11 +263,29 @@ export class AgyTurnMirrorBroker {
 			if (payload.kind) state.kind = payload.kind;
 			if (payload.status) state.status = payload.status;
 			if (payload.locations?.[0]?.path) state.path = payload.locations[0].path;
+			if (typeof payload.locations?.[0]?.line === "number") state.line = payload.locations[0].line;
+			if (typeof classified.arguments.path === "string" && !state.path) {
+				state.path = classified.arguments.path;
+			}
+			if (typeof classified.arguments.line === "number" && state.line === undefined) {
+				state.line = classified.arguments.line;
+			}
+			if (typeof classified.arguments.command === "string") {
+				state.command = classified.arguments.command;
+			}
+			if (typeof classified.arguments.query === "string") {
+				state.query = classified.arguments.query;
+			}
+			if (typeof classified.arguments.agentRole === "string") {
+				state.agentRole = classified.arguments.agentRole;
+			}
 		}
 
 		if (payload.content && payload.content.length > 0) {
 			const merged = mergeContentItems(payload.content);
-			state.contentBlocks = merged.blocks;
+			if (merged.blocks.length > 0) {
+				state.contentBlocks = merged.blocks;
+			}
 			if (merged.diffs.length > 0) {
 				state.diffs = merged.diffs;
 			}

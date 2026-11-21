@@ -39,6 +39,7 @@ import { updateAntigravityStatusBar } from "./ui/status-bar.ts";
 
 const SENTINEL_API_KEY = "agy-managed";
 const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+const MODEL_CACHE_STALE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * 读取 Pi 的 `trust.json` 判断指定工作目录在 `resources_discover` 早期阶段是否已被授予项目信任。
@@ -266,8 +267,13 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 		coordinator.setActiveContext(ctx);
 		toolActivation.syncForContext(ctx, currentConfig);
 
-		// 若首次加载尚无本地缓存快照，复用内置 Singleflight 静默探测一次模型目录
-		if (!cachedCatalog) {
+		// 若首次加载尚无本地缓存快照或缓存已超过 6 小时，复用内置 Singleflight 后台静默探测一次最新模型目录
+		const diskCache = readCachedCatalog();
+		const isCacheStale =
+			!diskCache ||
+			typeof diskCache.updatedAt !== "number" ||
+			Date.now() - diskCache.updatedAt > MODEL_CACHE_STALE_MS;
+		if (isCacheStale) {
 			void refreshAndReRegisterModels(ctx).catch(() => {});
 		}
 	});

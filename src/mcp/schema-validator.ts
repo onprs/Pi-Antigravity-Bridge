@@ -45,12 +45,83 @@ function deepEqualPrimitiveOrJson(a: unknown, b: unknown): boolean {
 	}
 }
 
+function resolveLocalSchemaRef(
+	ref: string,
+	rootSchema: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	if (!ref.startsWith("#/")) return undefined;
+	const parts = ref
+		.slice(2)
+		.split("/")
+		.map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+	let current: unknown = rootSchema;
+	for (const part of parts) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) {
+			return undefined;
+		}
+		current = (current as Record<string, unknown>)[part];
+	}
+	if (current && typeof current === "object" && !Array.isArray(current)) {
+		return current as Record<string, unknown>;
+	}
+	return undefined;
+}
+
+function collectDeclaredPropertyKeys(
+	schema: Record<string, unknown>,
+	rootSchema: Record<string, unknown>,
+	depth = 0,
+): Set<string> {
+	const keys = new Set<string>();
+	if (depth > 8) return keys;
+
+	if (typeof schema.$ref === "string") {
+		const target = resolveLocalSchemaRef(schema.$ref, rootSchema);
+		if (target) {
+			for (const k of collectDeclaredPropertyKeys(target, rootSchema, depth + 1)) {
+				keys.add(k);
+			}
+		}
+	}
+	if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+		for (const k of Object.keys(schema.properties as Record<string, unknown>)) {
+			keys.add(k);
+		}
+	}
+	for (const compositeKey of ["allOf", "anyOf", "oneOf"] as const) {
+		const branches = schema[compositeKey];
+		if (Array.isArray(branches)) {
+			for (const branch of branches) {
+				if (branch && typeof branch === "object" && !Array.isArray(branch)) {
+					for (const k of collectDeclaredPropertyKeys(
+						branch as Record<string, unknown>,
+						rootSchema,
+						depth + 1,
+					)) {
+						keys.add(k);
+					}
+				}
+			}
+		}
+	}
+	return keys;
+}
+
 function validateNode(
 	value: unknown,
 	schema: Record<string, unknown>,
 	currentPath: string,
 	issues: ValidationIssue[],
+	rootSchema: Record<string, unknown>,
+	refDepth = 0,
 ): void {
+	if (typeof schema.$ref === "string" && refDepth < 8) {
+		const resolved = resolveLocalSchemaRef(schema.$ref, rootSchema);
+		if (resolved) {
+			validateNode(value, resolved, currentPath, issues, rootSchema, refDepth + 1);
+		}
+	}
+
 	if ("const" in schema && !deepEqualPrimitiveOrJson(value, schema.const)) {
 		issues.push({
 			path: currentPath,
@@ -70,11 +141,33 @@ function validateNode(
 		}
 	}
 
+	if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
+		for (const branch of schema.allOf) {
+			if (branch && typeof branch === "object" && !Array.isArray(branch)) {
+				validateNode(
+					value,
+					branch as Record<string, unknown>,
+					currentPath,
+					issues,
+					rootSchema,
+					refDepth + 1,
+				);
+			}
+		}
+	}
+
 	if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
 		const branchValid = schema.anyOf.some((branch) => {
 			if (!branch || typeof branch !== "object") return true;
 			const subIssues: ValidationIssue[] = [];
-			validateNode(value, branch as Record<string, unknown>, currentPath, subIssues);
+			validateNode(
+				value,
+				branch as Record<string, unknown>,
+				currentPath,
+				subIssues,
+				rootSchema,
+				refDepth + 1,
+			);
 			return subIssues.length === 0;
 		});
 		if (!branchValid) {
@@ -90,7 +183,14 @@ function validateNode(
 		const okCount = schema.oneOf.filter((branch) => {
 			if (!branch || typeof branch !== "object") return true;
 			const subIssues: ValidationIssue[] = [];
-			validateNode(value, branch as Record<string, unknown>, currentPath, subIssues);
+			validateNode(
+				value,
+				branch as Record<string, unknown>,
+				currentPath,
+				subIssues,
+				rootSchema,
+				refDepth + 1,
+			);
 			return subIssues.length === 0;
 		}).length;
 		if (okCount === 0) {
@@ -158,7 +258,7 @@ function validateNode(
 		if (schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)) {
 			const itemSchema = schema.items as Record<string, unknown>;
 			value.forEach((item, index) => {
-				validateNode(item, itemSchema, `${currentPath}[${index}]`, issues);
+				validateNode(item, itemSchema, `${currentPath}[${index}]`, issues, rootSchema, refDepth);
 			});
 		}
 	}
@@ -169,6 +269,11 @@ function validateNode(
 			schema.properties && typeof schema.properties === "object"
 				? (schema.properties as Record<string, unknown>)
 				: undefined;
+		const hasComposite =
+			Array.isArray(schema.allOf) || Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf);
+		const compositeKeys = hasComposite
+			? collectDeclaredPropertyKeys(schema, rootSchema)
+			: undefined;
 
 		if (Array.isArray(schema.required)) {
 			for (const reqKey of schema.required) {
@@ -181,18 +286,20 @@ function validateNode(
 			}
 		}
 
-		if (properties) {
+		if (properties || schema.additionalProperties === false) {
 			for (const [key, propVal] of Object.entries(record)) {
 				if (propVal === undefined) continue;
-				const propSchema = properties[key];
+				const propSchema = properties?.[key];
 				if (propSchema && typeof propSchema === "object") {
 					validateNode(
 						propVal,
 						propSchema as Record<string, unknown>,
 						currentPath === "$" ? `$.${key}` : `${currentPath}.${key}`,
 						issues,
+						rootSchema,
+						refDepth,
 					);
-				} else if (schema.additionalProperties === false) {
+				} else if (schema.additionalProperties === false && !compositeKeys?.has(key)) {
 					issues.push({
 						path: currentPath === "$" ? `$.${key}` : `${currentPath}.${key}`,
 						message: `包含未声明的多余字段 "${key}"`,
@@ -218,7 +325,8 @@ export function validateToolArguments(
 
 	const normalizedArgs = args === undefined ? {} : args;
 	const issues: ValidationIssue[] = [];
-	validateNode(normalizedArgs, schema as Record<string, unknown>, "$", issues);
+	const root = schema as Record<string, unknown>;
+	validateNode(normalizedArgs, root, "$", issues, root, 0);
 
 	if (issues.length === 0) {
 		return { valid: true, issues: [] };

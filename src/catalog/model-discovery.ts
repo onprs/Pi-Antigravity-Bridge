@@ -317,9 +317,14 @@ export function writeCachedCatalog(
 }
 
 const CATALOG_FRESH_TTL_MS = 15_000;
-let inFlightCatalogProbe: Promise<DiscoveredCatalogSnapshot> | undefined;
-let lastLiveProbeSnapshot: DiscoveredCatalogSnapshot | undefined;
-let lastLiveProbeAt = 0;
+const liveProbeStateByCachePath = new Map<
+	string,
+	{
+		inFlight?: Promise<DiscoveredCatalogSnapshot>;
+		lastSnapshot?: DiscoveredCatalogSnapshot;
+		lastAt: number;
+	}
+>();
 
 function raceCatalogProbeWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
@@ -380,6 +385,8 @@ export function removeEmptyProbeSessionFiles(config: BridgeConfig, sessionId: st
 export interface ProbeCatalogOptions {
 	signal?: AbortSignal;
 	force?: boolean;
+	/** 可选环境变量覆盖（主要用于隔离模型缓存写入目录，避免测试覆写用户全局缓存） */
+	env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -401,16 +408,25 @@ export async function probeLiveAntigravityCatalog(
 		throw opts.signal.reason ?? new Error("模型探测已取消");
 	}
 
+	const cacheKey = resolveModelCachePath(opts.env);
+	let state = liveProbeStateByCachePath.get(cacheKey);
 	if (
 		!opts.force &&
-		lastLiveProbeSnapshot &&
-		Date.now() - lastLiveProbeAt < CATALOG_FRESH_TTL_MS
+		state?.lastSnapshot &&
+		Date.now() - state.lastAt < CATALOG_FRESH_TTL_MS
 	) {
-		return lastLiveProbeSnapshot;
+		return state.lastSnapshot;
 	}
 
-	if (!inFlightCatalogProbe) {
-		inFlightCatalogProbe = (async () => {
+	if (!state) {
+		state = { lastAt: 0 };
+		liveProbeStateByCachePath.set(cacheKey, state);
+	}
+
+	let inFlight = state.inFlight;
+	if (!inFlight) {
+		const targetState = state;
+		inFlight = (async () => {
 			const conn = await processManager.acquire(config, undefined);
 			const sessionRes = await conn.request<AcpSessionNewResult>(
 				"session/new",
@@ -433,9 +449,9 @@ export async function probeLiveAntigravityCatalog(
 					models: models.length > 0 ? models : getSeedModels(),
 					modelEfforts,
 				};
-				writeCachedCatalog(snapshot);
-				lastLiveProbeSnapshot = snapshot;
-				lastLiveProbeAt = Date.now();
+				writeCachedCatalog(snapshot, opts.env);
+				targetState.lastSnapshot = snapshot;
+				targetState.lastAt = Date.now();
 				return snapshot;
 			} finally {
 				if (sessionRes.sessionId) {
@@ -444,11 +460,12 @@ export async function probeLiveAntigravityCatalog(
 				}
 			}
 		})().finally(() => {
-			inFlightCatalogProbe = undefined;
+			targetState.inFlight = undefined;
 		});
+		targetState.inFlight = inFlight;
 	}
 
-	return raceCatalogProbeWithSignal(inFlightCatalogProbe, opts.signal);
+	return raceCatalogProbeWithSignal(inFlight, opts.signal);
 }
 
 export interface ResolvedModelSelection {

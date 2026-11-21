@@ -4,6 +4,8 @@ import type {
 	ImageContent,
 	TextContent,
 	ThinkingContent,
+	ToolCall,
+	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import type {
@@ -37,6 +39,7 @@ import { AGY_SESSION_ANCHOR_CUSTOM_TYPE, type AgySessionAnchor } from "../sessio
 import { computeTranscriptDigest } from "../session/reconcile.ts";
 import type { TurnCoordinator } from "../session/turn-coordinator.ts";
 import { createZeroUsage } from "../stream/event-mapper.ts";
+import { classifyAgyToolCall } from "../tools/agy-mirror-tools.ts";
 import { AGY_MIRROR_TOOL_NAMES } from "../tools/agy-renderers.ts";
 import { updateAntigravityStatusBar } from "./status-bar.ts";
 
@@ -58,6 +61,7 @@ const OVERLAPPING_PI_BASE_TOOLS = new Set<string>([
 export class ToolActivationController {
 	private readonly pi: ExtensionAPI;
 	private savedUserActiveTools?: string[];
+	private readonly temporarilyInjectedTools = new Set<string>();
 	private lastAppliedMode?: ToolMode;
 
 	constructor(pi: ExtensionAPI) {
@@ -89,7 +93,7 @@ export class ToolActivationController {
 		} else if (this.savedUserActiveTools && hasAnyMirror && nonMirrorCurrent.length > 0) {
 			const merged = new Set(this.savedUserActiveTools);
 			for (const name of nonMirrorCurrent) {
-				if (!OVERLAPPING_PI_BASE_TOOLS.has(name)) {
+				if (!OVERLAPPING_PI_BASE_TOOLS.has(name) && !this.temporarilyInjectedTools.has(name)) {
 					merged.add(name);
 				}
 			}
@@ -98,22 +102,34 @@ export class ToolActivationController {
 
 		// 将首次基线与当前运行态中已动态激活（如 tool_search 解锁）的非镜像工具合并，绝不回滚动态工具
 		const activePool = hasAnyMirror
-			? Array.from(new Set([...(this.savedUserActiveTools ?? []), ...nonMirrorCurrent]))
+			? Array.from(
+					new Set([
+						...(this.savedUserActiveTools ?? []),
+						...nonMirrorCurrent.filter((name) => !this.temporarilyInjectedTools.has(name)),
+					]),
+				)
 			: (this.savedUserActiveTools ?? nonMirrorCurrent);
 
 		const flags = resolveEffectiveFlags(config);
 
 		if (config.toolMode === "agy-tools") {
 			if (flags.bridgePiMcp && config.piMcpBridgeStrategy === "via-host") {
-				// 仅保留用户激活集（含 direct 暴露与 tool_search 已加载项）中的 MCP 工具，并补回可能因切换模式临时移除的 codemode/tool_search 入口
-				let registeredEntryTools: string[] = [];
+				// 仅保留用户激活集中的 MCP 工具与已启用的 codemode；仅按需补入已注册的 tool_search 入口（绝不强行启用用户关闭的 codemode）
+				let registeredToolSearch: string[] = [];
 				try {
-					registeredEntryTools = this.pi
+					registeredToolSearch = this.pi
 						.getAllTools()
 						.map((t) => t.name)
-						.filter((name) => name === "codemode" || name === "tool_search");
+						.filter((name) => name === "tool_search");
 				} catch {
 					// 忽略未初始化运行态
+				}
+				const activeSet = new Set(activePool);
+				this.temporarilyInjectedTools.clear();
+				for (const name of registeredToolSearch) {
+					if (!activeSet.has(name)) {
+						this.temporarilyInjectedTools.add(name);
+					}
 				}
 				const mcpBridgedTools = Array.from(
 					new Set([
@@ -121,18 +137,23 @@ export class ToolActivationController {
 							(name) =>
 								isPiMcpRelatedTool(name) || name === "codemode" || name === "tool_search",
 						),
-						...registeredEntryTools,
+						...registeredToolSearch,
 					]),
 				);
 				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES, ...mcpBridgedTools]);
 			} else {
+				this.temporarilyInjectedTools.clear();
 				this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES]);
 			}
 		} else {
-			// hybrid：激活镜像工具 + 当前活跃的非重叠扩展/动态工具（保留 tool_search 动态增量）
+			// hybrid：激活镜像工具 + 当前活跃的非重叠扩展/动态工具（保留 tool_search 动态增量，排除临时注入项）
+			const userNonMirrorCurrent = nonMirrorCurrent.filter(
+				(name) => !this.temporarilyInjectedTools.has(name),
+			);
 			const sourceForHybrid =
-				this.lastAppliedMode === "hybrid" && hasAnyMirror ? nonMirrorCurrent : activePool;
+				this.lastAppliedMode === "hybrid" && hasAnyMirror ? userNonMirrorCurrent : activePool;
 			const extraTools = sourceForHybrid.filter((name) => !OVERLAPPING_PI_BASE_TOOLS.has(name));
+			this.temporarilyInjectedTools.clear();
 			this.pi.setActiveTools([...AGY_MIRROR_TOOL_NAMES, ...extraTools]);
 		}
 
@@ -149,7 +170,10 @@ export class ToolActivationController {
 
 		const mirrorSet = new Set<string>(AGY_MIRROR_TOOL_NAMES);
 		const hasAnyMirror = current.some((t) => mirrorSet.has(t));
-		const nonMirrorCurrent = current.filter((t) => !mirrorSet.has(t));
+		const nonMirrorCurrent = current.filter(
+			(t) => !mirrorSet.has(t) && !this.temporarilyInjectedTools.has(t),
+		);
+		this.temporarilyInjectedTools.clear();
 
 		if (this.savedUserActiveTools) {
 			const dynamicAdditions = nonMirrorCurrent.filter((t) => !OVERLAPPING_PI_BASE_TOOLS.has(t));
@@ -612,10 +636,15 @@ async function handleSessionsImportSubcommand(
 	const idx = labels.indexOf(pickedLabel);
 	const target = topSessions[idx >= 0 ? idx : 0];
 
-	// 通过 session/load 收集回放事件流并组装为标准 Pi 消息序列
-	const replayedMessages: Array<UserMessage | AssistantMessage> = [];
+	// 通过 session/load 收集回放事件流并组装为标准 Pi 消息序列（保留文本、思考与历史工具记录）
+	const replayedMessages: Array<UserMessage | AssistantMessage | ToolResultMessage> = [];
 	let currentUserParts: Array<TextContent | ImageContent> = [];
-	let currentAssistantBlocks: Array<ThinkingContent | TextContent> = [];
+	let currentAssistantBlocks: Array<ThinkingContent | TextContent | ToolCall> = [];
+	const replayedToolResults = new Map<
+		string,
+		{ toolName: string; content: Array<TextContent | ImageContent>; isError: boolean }
+	>();
+	let pendingToolCallIds: string[] = [];
 
 	const flushUser = () => {
 		if (currentUserParts.length === 0) return;
@@ -627,25 +656,42 @@ async function handleSessionsImportSubcommand(
 		currentUserParts = [];
 	};
 
-	const flushAssistant = () => {
+	const flushAssistant = (stopReason: "stop" | "toolUse" = "stop") => {
 		if (currentAssistantBlocks.length === 0) return;
 		replayedMessages.push({
 			role: "assistant",
 			content: currentAssistantBlocks,
 			api: ANTIGRAVITY_API_ID,
 			provider: ANTIGRAVITY_PROVIDER_ID,
-			model: ctx.model?.id ?? "gemini-4-neon",
+			model:
+				ctx.model?.provider === ANTIGRAVITY_PROVIDER_ID ? ctx.model.id : "gemini-4-neon",
 			responseId: target.sessionId,
 			usage: createZeroUsage(),
-			stopReason: "stop",
+			stopReason,
 			timestamp: Date.now(),
 		});
 		currentAssistantBlocks = [];
+
+		for (const callId of pendingToolCallIds) {
+			const tr = replayedToolResults.get(callId);
+			replayedMessages.push({
+				role: "toolResult",
+				toolCallId: callId,
+				toolName: tr?.toolName ?? "agy_tool",
+				content:
+					tr && tr.content.length > 0
+						? tr.content
+						: [{ type: "text", text: "(completed)" }],
+				isError: tr?.isError ?? false,
+				timestamp: Date.now(),
+			});
+		}
+		pendingToolCallIds = [];
 	};
 
 	const unsubscribe = coordinator.registerAuxiliaryUpdateListener(target.sessionId, (update) => {
 		if (update.sessionUpdate === "user_message_chunk") {
-			flushAssistant();
+			flushAssistant(pendingToolCallIds.length > 0 ? "toolUse" : "stop");
 			if (update.content.type === "text") {
 				const prev = currentUserParts[currentUserParts.length - 1];
 				if (prev?.type === "text") {
@@ -665,6 +711,9 @@ async function handleSessionsImportSubcommand(
 
 		if (update.sessionUpdate === "agent_thought_chunk" && update.content.type === "text") {
 			flushUser();
+			if (pendingToolCallIds.length > 0) {
+				flushAssistant("toolUse");
+			}
 			const prev = currentAssistantBlocks[currentAssistantBlocks.length - 1];
 			if (prev?.type === "thinking") {
 				prev.thinking += update.content.text;
@@ -676,11 +725,64 @@ async function handleSessionsImportSubcommand(
 
 		if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
 			flushUser();
+			if (pendingToolCallIds.length > 0) {
+				flushAssistant("toolUse");
+			}
 			const prev = currentAssistantBlocks[currentAssistantBlocks.length - 1];
 			if (prev?.type === "text") {
 				prev.text += update.content.text;
 			} else {
 				currentAssistantBlocks.push({ type: "text", text: update.content.text });
+			}
+			return;
+		}
+
+		if (update.sessionUpdate === "tool_call") {
+			flushUser();
+			const classified = classifyAgyToolCall(update);
+			currentAssistantBlocks.push({
+				type: "toolCall",
+				id: update.toolCallId,
+				name: classified.mirrorToolName,
+				arguments: classified.arguments,
+			});
+			pendingToolCallIds.push(update.toolCallId);
+			replayedToolResults.set(update.toolCallId, {
+				toolName: classified.mirrorToolName,
+				content: [],
+				isError: update.status === "failed",
+			});
+			return;
+		}
+
+		if (update.sessionUpdate === "tool_call_update") {
+			const entry = replayedToolResults.get(update.toolCallId);
+			if (!entry) return;
+			if (update.status === "failed") {
+				entry.isError = true;
+			}
+			if (update.content && update.content.length > 0) {
+				const blocks: Array<TextContent | ImageContent> = [];
+				for (const item of update.content) {
+					if (item.type === "content") {
+						if (item.content.type === "text") {
+							blocks.push({ type: "text", text: item.content.text });
+						} else if (item.content.type === "image") {
+							blocks.push({
+								type: "image",
+								data: item.content.data,
+								mimeType: item.content.mimeType,
+							});
+						}
+					} else if (item.type === "diff") {
+						blocks.push({ type: "text", text: `Updated ${item.path}` });
+					}
+				}
+				if (blocks.length > 0) {
+					entry.content = blocks;
+				}
+			} else if (typeof update.rawOutput === "string" && update.rawOutput.trim().length > 0) {
+				entry.content = [{ type: "text", text: update.rawOutput }];
 			}
 		}
 	});
@@ -696,7 +798,7 @@ async function handleSessionsImportSubcommand(
 			{ timeoutMs: 25_000 },
 		);
 		flushUser();
-		flushAssistant();
+		flushAssistant(pendingToolCallIds.length > 0 ? "toolUse" : "stop");
 	} finally {
 		unsubscribe();
 		await conn.closeSessionSafe(target.sessionId);
@@ -725,8 +827,12 @@ async function handleSessionsImportSubcommand(
 			sessionManager.appendCustomEntry(AGY_SESSION_ANCHOR_CUSTOM_TYPE, importedAnchor);
 		},
 		withSession: async (replacedCtx) => {
+			const modelHint =
+				replacedCtx.model?.provider !== ANTIGRAVITY_PROVIDER_ID
+					? " 当前模型非 Antigravity，请先使用 `/model` 切换至 `antigravity` 分组模型以无缝续接该会话。"
+					: "";
 			replacedCtx.ui.notify(
-				`已导入会话 "${target.title || target.sessionId.slice(0, 8)}"（共 ${replayedMessages.length} 条消息）。`,
+				`已导入会话 "${target.title || target.sessionId.slice(0, 8)}"（共 ${replayedMessages.length} 条消息）。${modelHint}`,
 				"info",
 			);
 		},

@@ -34,6 +34,9 @@ const sessions = new Map();
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\\n");
 }
+function mcpHttpUrl(sess) {
+  return sess.mcpHttp.url;
+}
 
 let nextServerReqId = 9000;
 const serverPending = new Map();
@@ -124,6 +127,37 @@ rl.on("line", async (line) => {
     return;
   }
 
+  if (msg.method === "session/resume") {
+    const resumeSid = msg.params?.sessionId || "resumed-session";
+    const mcpHttp = (msg.params?.mcpServers || []).find((s) => s.type === "http");
+    const prevSess = sessions.get(resumeSid) || {};
+    const sessObj = { ...prevSess, mcpHttp, resumeCount: (prevSess.resumeCount || 0) + 1 };
+    if (mcpHttp) {
+      const authHeader = mcpHttp.headers?.[0]?.value || "";
+      const listRes = await fetch(mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 200 + sessObj.resumeCount, method: "tools/list", params: {} })
+      }).then((r) => r.json());
+      sessObj.knownTools = (listRes.result?.tools || []).map((t) => t.name);
+    }
+    sessions.set(resumeSid, sessObj);
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: resumeSid,
+        models: { availableModels: [{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" }] },
+        configOptions: [
+          { id: "model", name: "Model", type: "select", currentValue: "gemini-4-neon", options: [{ value: "gemini-4-neon", name: "Gemini 4 Neon" }] },
+          { id: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [{ value: "high", name: "High" }] },
+          { id: "mode", name: "Mode", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }] }
+        ]
+      }
+    });
+    return;
+  }
+
   if (msg.method === "session/set_config_option" || msg.method === "session/close") {
     send({ jsonrpc: "2.0", id: msg.id, result: {} });
     return;
@@ -152,6 +186,87 @@ rl.on("line", async (line) => {
         params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Hanging..." } } }
       });
       // 模拟极端死锁：即使收到 session/cancel 也不回包
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_TOOL_SEARCH_UNLOCK" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_ts_1", name: "mcp_pi_tools_tool_search", title: "Run mcp_pi_tools_tool_search" } }
+      });
+      await fetch(mcpHttpUrl(sess), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 501, method: "tools/call", params: { name: "tool_search", arguments: { query: "secret" } } })
+      }).then((r) => r.json());
+      await new Promise((r) => setTimeout(r, 80));
+      if (sess.inFlightPromptId !== myPromptId) return;
+      sess.inFlightPromptId = undefined;
+      sess.cancelablePromptId = undefined;
+      send({ jsonrpc: "2.0", id: myPromptId, result: { stopReason: "end_turn" } });
+      return;
+    }
+
+    if (lastBlockText.includes("The newly activated tools are now loaded") && sess) {
+      sess.inFlightPromptId = undefined;
+      const names = (sess.knownTools || []).join(",");
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "LOADED_TOOLS=" + names + ";RESUMES=" + (sess.resumeCount || 0) } } }
+      });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      return;
+    }
+
+    if (lastBlockText === "HYBRID_NATIVE_PI_TOOLS_FILE" && sess) {
+      sess.inFlightPromptId = msg.id;
+      // 模拟 hybrid 模式下原生 read_file 读取文件名含 pi_tools 的文件（name="read_file", title 含 pi_tools）
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "native_read_pi_tools_1",
+            name: "read_file",
+            title: "File src/pi_tools_helper.ts",
+            kind: "read",
+            status: "in_progress",
+            locations: [{ path: "src/pi_tools_helper.ts" }]
+          }
+        }
+      });
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "native_read_pi_tools_1",
+              name: "read_file",
+              title: "File src/pi_tools_helper.ts",
+              status: "completed",
+              content: [{ type: "content", content: { type: "text", text: "export const ok = true;" } }]
+            }
+          }
+        });
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Native read OK" } } }
+        });
+        sess.inFlightPromptId = undefined;
+        send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      }, 25);
       return;
     }
 
@@ -924,6 +1039,8 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.map((c) => c.text)
 				.join("");
 			assert.equal(text2, "Echo -> FOLLOWUP_MSG:取消后立刻重发");
+			// 中断后立即重发必须复用原热缓存会话，绝不重建丢缓存
+			assert.equal(msg2.responseId, abortedMsg.responseId);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -1170,6 +1287,214 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				)
 				.result();
 			assert.equal(sqlS3.stopReason, "stop");
+			// 即使末步 SQLite WAL 未落盘新 step_type=15，也不能将末步归零导致缓存命中率消失
+			const finalPromptTokens = sqlS3.usage.input + sqlS3.usage.cacheRead + sqlS3.usage.cacheWrite;
+			assert.ok(finalPromptTokens > 0, "末步提示词不应归零导致状态栏缓存命中率消失");
+			assert.ok(sqlS3.usage.output > 0, "末步输出 Token 不应归零");
+			assert.ok(
+				sqlS1.usage.reasoning === undefined || sqlS1.usage.output >= sqlS1.usage.reasoning,
+				"切片后必须严格维持 output >= reasoning",
+			);
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("轮次中修改 AGENTS.md 不触发死锁强杀、无 SSE 下动态工具经 session/resume 原地重载、hybrid 原生工具含 pi_tools 路径不误判", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-resilience-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const agentsMdPath = path.join(tmpRoot, "AGENTS.md");
+		fs.writeFileSync(agentsMdPath, "# Rule v1\nInitial workspace rule.\n");
+
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+				{
+					name: "tool_search",
+					description: "Search deferred tools",
+					parameters: {
+						type: "object",
+						properties: { query: { type: "string" } },
+						required: ["query"],
+					},
+				},
+			];
+
+			const sysWithRule = {
+				role: "system" as const,
+				content: "",
+				sections: {
+					project_context: `<project_context><project_instructions path="${agentsMdPath}"># Rule v1</project_instructions></project_context>`,
+				},
+				tools,
+				timestamp: 1,
+			};
+
+			// 场景 1：工具执行期间磁盘上的 AGENTS.md 被修改导致 mountDigest 变化，活跃轮次仍须无缝完成绝不死锁强杀
+			const uEdit = { role: "user" as const, content: "Read package.json", timestamp: 2 };
+			const ctxEdit1 = normalizeContext({ tools, messages: [uEdit] });
+			if (ctxEdit1.messages[0]?.role === "system") {
+				ctxEdit1.messages[0].sections = sysWithRule.sections;
+			}
+			const step1 = await coord
+				.streamSimple(TEST_MODEL, ctxEdit1, { sessionId: "pi-sess-agents" })
+				.result();
+			assert.equal(step1.stopReason, "toolUse");
+			const tc1 = step1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+
+			// 模拟工具执行期间磁盘 AGENTS.md 发生变化
+			fs.writeFileSync(agentsMdPath, "# Rule v2\nUpdated mid-turn!\n");
+
+			const tr1 = {
+				role: "toolResult" as const,
+				toolCallId: tc1.id,
+				toolName: "read",
+				content: [{ type: "text" as const, text: '{"name":"updated"}' }],
+				isError: false,
+				timestamp: 3,
+			};
+			const ctxEdit2 = normalizeContext({ tools, messages: [uEdit, step1, tr1] });
+			if (ctxEdit2.messages[0]?.role === "system") {
+				ctxEdit2.messages[0].sections = sysWithRule.sections;
+			}
+			const step2 = await coord
+				.streamSimple(TEST_MODEL, ctxEdit2, { sessionId: "pi-sess-agents" })
+				.result();
+			assert.equal(step2.stopReason, "stop");
+			assert.equal(step2.responseId, step1.responseId);
+			const text2 = step2.content
+				.filter((c) => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(text2.includes('{"name":"updated"}'));
+
+			// 场景 2：默认 processPerSession: true（无 SSE 客户端）下，tool_search 解锁新工具后原地 close + session/resume 重拉 tools/list
+			const convDir = path.join(cfg.geminiDir, "antigravity-cli", "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+			const unlockStart = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [{ role: "user", content: "TRIGGER_TOOL_SEARCH_UNLOCK", timestamp: 10 }],
+					}),
+					{ sessionId: "pi-sess-unlock" },
+				)
+				.result();
+			assert.equal(unlockStart.stopReason, "toolUse");
+			const tsCall = unlockStart.content.find((c): c is ToolCall => c.type === "toolCall")!;
+			const unlockAgyId = unlockStart.responseId!;
+			// 创建本地占位 .db 模拟真实 agy 会话库以触发 session/resume 原地刷新路径
+			const unlockDb = new DatabaseSync(path.join(convDir, `${unlockAgyId}.db`));
+			unlockDb.exec("CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL, status integer NOT NULL, step_payload blob, metadata blob);");
+			unlockDb.prepare("INSERT INTO steps VALUES (1, 132, 3, X'01', X'01')").run();
+			unlockDb.close();
+
+			const unlockedTools = [
+				...tools,
+				{
+					name: "mcp__github__search_code",
+					description: "Unlocked tool",
+					parameters: { type: "object", properties: {} },
+				},
+			];
+			const unlockDone = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: unlockedTools,
+						messages: [
+							{ role: "user", content: "TRIGGER_TOOL_SEARCH_UNLOCK", timestamp: 10 },
+							unlockStart,
+							{
+								role: "toolResult",
+								toolCallId: tsCall.id,
+								toolName: "tool_search",
+								content: [{ type: "text", text: "Activated mcp__github__search_code" }],
+								isError: false,
+								timestamp: 11,
+							},
+						],
+					}),
+					{ sessionId: "pi-sess-unlock" },
+				)
+				.result();
+			assert.equal(unlockDone.stopReason, "stop");
+			assert.equal(unlockDone.responseId, unlockAgyId);
+			const unlockText = unlockDone.content
+				.filter((c) => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(unlockText.includes("mcp__github__search_code"), `应重拉包含新解锁工具，实际：${unlockText}`);
+			assert.ok(unlockText.includes("RESUMES=1"), `应通过原地 session/resume 重拉 tools/list，实际：${unlockText}`);
+
+			// 场景 3：hybrid 模式下原生 read_file 读取文件名含 pi_tools 的文件，不得被误判为宿主 MCP 宣告并吞掉
+			const hybridCfg: BridgeConfig = {
+				...cfg,
+				toolMode: "hybrid",
+				bridgePiMcp: true,
+			};
+			const hybridPm = new AcpProcessManager();
+			const hybridBroker = new AgyTurnMirrorBroker();
+			const hybridMirrorTools = createAgyMirrorToolDefinitions(hybridBroker);
+			const hybridCoord = new TurnCoordinator(createStubPiApi(), hybridPm, hybridBroker, hybridCfg);
+			try {
+				const hybridTools = [
+					{
+						name: "custom_ext",
+						description: "Custom extension tool",
+						parameters: { type: "object", properties: {} },
+					},
+				];
+				const hStep1 = await hybridCoord
+					.streamSimple(
+						TEST_MODEL,
+						normalizeContext({
+							tools: hybridTools,
+							messages: [{ role: "user", content: "HYBRID_NATIVE_PI_TOOLS_FILE", timestamp: 20 }],
+						}),
+						{ sessionId: "pi-sess-hybrid-name" },
+					)
+					.result();
+				assert.equal(hStep1.stopReason, "toolUse");
+				const mirrorTc = hStep1.content.find((c): c is ToolCall => c.type === "toolCall")!;
+				assert.equal(mirrorTc.name, "agy_read");
+				assert.equal(mirrorTc.arguments.path, "src/pi_tools_helper.ts");
+
+				const readMirrorTool = hybridMirrorTools.find((t) => t.name === "agy_read")!;
+				const mirrorRes = await readMirrorTool.execute(
+					mirrorTc.id,
+					mirrorTc.arguments,
+					undefined,
+					undefined,
+					{ hasUI: false } as never,
+				);
+				assert.ok(
+					mirrorRes.content.some((c) => c.type === "text" && c.text.includes("export const ok = true;")),
+				);
+			} finally {
+				await hybridCoord.dispose();
+			}
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

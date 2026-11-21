@@ -23,7 +23,7 @@ import {
 
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.6";
+export const CLIENT_INFO_VERSION = "0.1.7";
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -81,9 +81,57 @@ interface PendingRpc {
 	cleanupAbort?: () => void;
 }
 
+/** 读取用户在 `<geminiDir>/config/agents/` 中显式配置的自定义 Agent 文件（若存在），以便在附加挂载插件时完整保留其定义 */
+function readUserCustomAgentFile(
+	geminiDir: string,
+	userAgentName: string,
+): { frontmatterLines: string[]; body: string } | undefined {
+	const candidates = [
+		path.join(geminiDir, "config", "agents", userAgentName, "agent.md"),
+		path.join(geminiDir, "config", "agents", `${userAgentName}.md`),
+	];
+	for (const candidate of candidates) {
+		try {
+			if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) continue;
+			const raw = fs.readFileSync(candidate, "utf8");
+			const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
+			if (fmMatch) {
+				const lines = fmMatch[1].split(/\r?\n/);
+				return { frontmatterLines: lines, body: fmMatch[2] };
+			}
+			return { frontmatterLines: [], body: raw };
+		} catch {
+			// 读取失败则继续检查下一候选路径
+		}
+	}
+	return undefined;
+}
+
+/** 从已有 YAML frontmatter 行中剔除指定顶层键（含多行列表值）以便安全合并挂载覆盖项 */
+function stripYamlTopLevelKeys(lines: readonly string[], keysToRemove: ReadonlySet<string>): string[] {
+	const kept: string[] = [];
+	let skippingBlock = false;
+	for (const line of lines) {
+		const isTopLevel = line.length > 0 && !/^\s/.test(line) && !line.startsWith("#");
+		if (isTopLevel) {
+			const colonIdx = line.indexOf(":");
+			const key = colonIdx !== -1 ? line.slice(0, colonIdx).trim() : "";
+			if (keysToRemove.has(key)) {
+				skippingBlock = true;
+				continue;
+			}
+			skippingBlock = false;
+		}
+		if (!skippingBlock) {
+			kept.push(line);
+		}
+	}
+	return kept;
+}
+
 /**
  * 判断该进程配置是否需要生成纯 YAML Frontmatter 的轻量挂载 Agent 文件。
- * Markdown 正文严格保持为空，绝不覆写或注入任何系统提示词。
+ * Markdown 正文严格保持为空（仅在合并用户显式指定的 `agyCustomAgent` 时原样保留用户自定义文件内容），绝不覆写或注入任何系统提示词。
  */
 function resolveManagedAgentMaterialization(
 	profile: AcpProcessProfile,
@@ -92,6 +140,8 @@ function resolveManagedAgentMaterialization(
 		profile.userAgentName &&
 		!profile.disableBuiltinTools &&
 		!profile.excludeDefaultComponents &&
+		profile.inheritCustomizations &&
+		profile.inheritMcp &&
 		profile.mountedPluginPaths.length === 0
 	) {
 		return { effectiveAgentName: profile.userAgentName };
@@ -108,10 +158,23 @@ function resolveManagedAgentMaterialization(
 		return { effectiveAgentName: profile.userAgentName };
 	}
 
+	const userCustomAgent =
+		profile.userAgentName && !profile.disableBuiltinTools
+			? readUserCustomAgentFile(profile.geminiDir, profile.userAgentName)
+			: undefined;
+
 	const specHash = crypto
 		.createHash("sha256")
 		.update(
 			JSON.stringify({
+				userAgentName: profile.userAgentName ?? "",
+				userAgentBodyHash: userCustomAgent
+					? crypto
+							.createHash("sha256")
+							.update(userCustomAgent.frontmatterLines.join("\n") + "\n---\n" + userCustomAgent.body)
+							.digest("hex")
+							.slice(0, 12)
+					: "",
 				disableBuiltinTools: profile.disableBuiltinTools,
 				excludeDefaultComponents: profile.excludeDefaultComponents,
 				inheritCustomizations: profile.inheritCustomizations,
@@ -123,6 +186,7 @@ function resolveManagedAgentMaterialization(
 		.slice(0, 10);
 
 	const agentName =
+		!profile.userAgentName &&
 		profile.disableBuiltinTools &&
 		profile.excludeDefaultComponents &&
 		!profile.inheritCustomizations &&
@@ -134,35 +198,64 @@ function resolveManagedAgentMaterialization(
 	const agentDir = path.join(profile.geminiDir, "config", "agents", agentName);
 	const agentFile = path.join(agentDir, "agent.md");
 
-	const yamlLines: string[] = [
-		"---",
-		`name: ${agentName}`,
-		"description: Configuration and customization mount profile for Pi Antigravity Bridge.",
-		"mainAgent: true",
-		"subagent: false",
-	];
+	let desired: string;
+	if (userCustomAgent) {
+		const keysToReplace = new Set<string>(["name"]);
+		if (!profile.inheritCustomizations) keysToReplace.add("inheritCustomizations");
+		if (!profile.inheritMcp) keysToReplace.add("inheritMcp");
+		if (profile.mountedPluginPaths.length > 0) keysToReplace.add("plugins");
 
-	if (profile.disableBuiltinTools) {
-		yamlLines.push("tools: []");
-	}
-	if (profile.excludeDefaultComponents) {
-		yamlLines.push("excludeDefaultComponents: true");
-	}
-	if (!profile.inheritCustomizations) {
-		yamlLines.push("inheritCustomizations: false");
-	}
-	if (!profile.inheritMcp) {
-		yamlLines.push("inheritMcp: false");
-	}
-	if (profile.mountedPluginPaths.length > 0) {
-		yamlLines.push("plugins:");
-		for (const pluginPath of profile.mountedPluginPaths) {
-			yamlLines.push(`  - ${JSON.stringify(pluginPath)}`);
+		const mergedLines = [
+			"---",
+			`name: ${agentName}`,
+			...stripYamlTopLevelKeys(userCustomAgent.frontmatterLines, keysToReplace),
+		];
+		if (!profile.inheritCustomizations) {
+			mergedLines.push("inheritCustomizations: false");
 		}
-	}
-	yamlLines.push("---", "");
+		if (!profile.inheritMcp) {
+			mergedLines.push("inheritMcp: false");
+		}
+		if (profile.mountedPluginPaths.length > 0) {
+			mergedLines.push("plugins:");
+			for (const pluginPath of profile.mountedPluginPaths) {
+				mergedLines.push(`  - ${JSON.stringify(pluginPath)}`);
+			}
+		}
+		mergedLines.push("---");
+		desired = userCustomAgent.body
+			? `${mergedLines.join("\n")}\n${userCustomAgent.body}`
+			: `${mergedLines.join("\n")}\n`;
+	} else {
+		const yamlLines: string[] = [
+			"---",
+			`name: ${agentName}`,
+			"description: Configuration and customization mount profile for Pi Antigravity Bridge.",
+			"mainAgent: true",
+			"subagent: false",
+		];
 
-	let desired = yamlLines.join("\n");
+		if (profile.disableBuiltinTools) {
+			yamlLines.push("tools: []");
+		}
+		if (profile.excludeDefaultComponents) {
+			yamlLines.push("excludeDefaultComponents: true");
+		}
+		if (!profile.inheritCustomizations) {
+			yamlLines.push("inheritCustomizations: false");
+		}
+		if (!profile.inheritMcp) {
+			yamlLines.push("inheritMcp: false");
+		}
+		if (profile.mountedPluginPaths.length > 0) {
+			yamlLines.push("plugins:");
+			for (const pluginPath of profile.mountedPluginPaths) {
+				yamlLines.push(`  - ${JSON.stringify(pluginPath)}`);
+			}
+		}
+		yamlLines.push("---", "");
+		desired = yamlLines.join("\n");
+	}
 	if (agentName === BRIDGE_AGENT_NAME) {
 		try {
 			const bundledAssetPath = path.resolve(
@@ -549,9 +642,14 @@ export class AcpClientConnection {
 		if (this.isAlive) {
 			await new Promise<void>((resolve) => {
 				let settled = false;
+				let killTimer: ReturnType<typeof setTimeout> | undefined;
 				const finish = () => {
 					if (settled) return;
 					settled = true;
+					if (killTimer) {
+						clearTimeout(killTimer);
+						killTimer = undefined;
+					}
 					resolve();
 				};
 
@@ -562,12 +660,13 @@ export class AcpClientConnection {
 					// 忽略管道关闭异常
 				}
 
-				setTimeout(() => {
+				killTimer = setTimeout(() => {
 					if (!settled) {
 						this.forceKillProcessTree();
 						finish();
 					}
 				}, 1_500);
+				killTimer.unref();
 			});
 		}
 
@@ -790,11 +889,16 @@ export function resolveProcessProfileForConfig(
 export class AcpProcessManager {
 	private readonly pool = new Map<string, AcpClientConnection>();
 	private readonly initializing = new Map<string, Promise<AcpClientConnection>>();
+	private readonly initializingConns = new Set<AcpClientConnection>();
 	private sharedHandlers: AcpServerHandlers = {};
+	private disposeEpoch = 0;
 
 	setHandlers(handlers: AcpServerHandlers): void {
 		this.sharedHandlers = handlers;
 		for (const conn of this.pool.values()) {
+			conn.setHandlers(handlers);
+		}
+		for (const conn of this.initializingConns) {
 			conn.setHandlers(handlers);
 		}
 	}
@@ -833,18 +937,27 @@ export class AcpProcessManager {
 
 		let initTask = this.initializing.get(key);
 		if (!initTask) {
+			const epochAtStart = this.disposeEpoch;
 			initTask = (async () => {
 				const binary = this.resolveBinary(config);
 				const conn = new AcpClientConnection(binary, profile, this.sharedHandlers);
+				this.initializingConns.add(conn);
 				try {
 					await conn.ensureInitialized();
+					if (this.disposeEpoch !== epochAtStart) {
+						await conn.dispose();
+						throw new Error("Antigravity ACP 进程池已关闭");
+					}
 					this.pool.set(key, conn);
 					return conn;
 				} catch (error) {
 					await conn.dispose();
 					throw error;
 				} finally {
-					this.initializing.delete(key);
+					this.initializingConns.delete(conn);
+					if (this.initializing.get(key) === initTask) {
+						this.initializing.delete(key);
+					}
 				}
 			})();
 			this.initializing.set(key, initTask);
@@ -860,12 +973,19 @@ export class AcpProcessManager {
 				this.pool.delete(key);
 			}
 		}
+		this.initializingConns.delete(target);
 		await target.dispose();
 	}
 
 	async disposeAll(): Promise<void> {
-		const connections = Array.from(this.pool.values());
+		this.disposeEpoch++;
+		const connections = new Set<AcpClientConnection>([
+			...this.pool.values(),
+			...this.initializingConns.values(),
+		]);
 		this.pool.clear();
-		await Promise.allSettled(connections.map((conn) => conn.dispose()));
+		this.initializing.clear();
+		this.initializingConns.clear();
+		await Promise.allSettled(Array.from(connections, (conn) => conn.dispose()));
 	}
 }

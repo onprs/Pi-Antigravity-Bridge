@@ -322,6 +322,8 @@ export type AcpSessionUpdatePayload =
 	| {
 			sessionUpdate: "tool_call";
 			toolCallId: string;
+			name?: string;
+			args?: unknown;
 			title?: string;
 			kind?: AcpToolKind;
 			status?: AcpToolStatus;
@@ -333,6 +335,8 @@ export type AcpSessionUpdatePayload =
 	| {
 			sessionUpdate: "tool_call_update";
 			toolCallId: string;
+			name?: string;
+			args?: unknown;
 			title?: string;
 			kind?: AcpToolKind;
 			status?: AcpToolStatus;

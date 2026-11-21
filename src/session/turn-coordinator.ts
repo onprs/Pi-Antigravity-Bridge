@@ -61,8 +61,10 @@ import {
 	captureSqliteCheckpoint,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
+	hasLocalConversationDb,
 	readCurrentMaxSqliteStepIdx,
 	readSqliteGenerationUsagesSince,
+	readSqliteGenerationUsagesSinceWithRetry,
 	waitForSqliteToolStepsSettled,
 } from "./checkpoint-sync.ts";
 import { prepareCustomizationMount } from "./customization-mounter.ts";
@@ -71,6 +73,7 @@ import {
 	buildFreshReplayPromptBlocks,
 	computeTranscriptDigest,
 	convertUserMessagesToPromptBlocks,
+	extractAuxiliaryTaskInstructions,
 	extractVisibleMessages,
 	isAuxiliarySingleTurnRequest,
 } from "./reconcile.ts";
@@ -165,6 +168,10 @@ interface ManagedSessionLedger {
 	piSessionKey: string;
 	agySessionId: string;
 	conn: AcpClientConnection;
+	cwd: string;
+	isProjectTrusted: boolean;
+	additionalDirectories: string[];
+	useHttpMcp: boolean;
 	mcpToken?: string;
 	hostMcpTools: Tool[];
 	toolsDigest: string;
@@ -187,6 +194,8 @@ interface ManagedSessionLedger {
 	lastConsumedStepIdx: number;
 	/** 单次模型生成内含多个顺序工具调用时的整数守恒分摊池（消除后续子步 0 提示词造成的缓存命中率闪烁） */
 	pendingGenSlicePool?: PendingGenSlicePool;
+	/** 是否正处于工具边界 steer/reload 切入收口窗口，期间拒绝新冲入的同批后续 MCP 调用 */
+	steeringCutInPending?: boolean;
 	tier?: AcpTierInfo;
 	backendCompactedRecently?: boolean;
 	parkedCalls: Map<string, ParkedToolCall>;
@@ -622,18 +631,21 @@ export class TurnCoordinator {
 			update.sessionUpdate === "agent_thought_chunk" ||
 			update.sessionUpdate === "agent_message_chunk"
 		) {
-			// 在推入队列的同时立即结算挂起的镜像工具，消除队列尚未被下一轮消费时的死锁窗口
+			// 在推入队列的同时立即结算仍未显式上报 completed 的挂起镜像工具，消除队列尚未被下一轮消费时的死锁窗口
 			this.mirrorBroker.completePendingCallsImplicitly(sessionId);
 			ledger.activePump?.queue.push({ kind: "acp_update", update });
 			return;
 		}
 
-		// 处理工具调用事件路由：区分宿主 MCP 工具前置宣告与 AGY 原生工具调用
+		// 处理工具调用事件路由：优先依据真实 `update.name` 精准区分宿主 MCP 工具前置宣告与 AGY 原生工具调用
 		if (update.sessionUpdate === "tool_call") {
-			const isHostMcpAnnouncement = this.isHostMcpToolEvent(ledger, update.title);
+			const isHostMcpAnnouncement = this.isHostMcpToolEvent(ledger, update.title, update.name);
 			if (isHostMcpAnnouncement) {
 				ledger.hostMcpAnnouncementIds.add(update.toolCallId);
-				this.httpMcpBridge.recordAcpToolAnnouncement(sessionId, update.title || "");
+				this.httpMcpBridge.recordAcpToolAnnouncement(
+					sessionId,
+					update.name || update.title || "",
+				);
 				if (ledger.activePump && !ledger.activePump.finished) {
 					ledger.activePump.pendingAnnouncedMcpCount++;
 				}
@@ -648,7 +660,7 @@ export class TurnCoordinator {
 		if (update.sessionUpdate === "tool_call_update") {
 			const isHostMcp =
 				ledger.hostMcpAnnouncementIds.has(update.toolCallId) ||
-				this.isHostMcpToolEvent(ledger, update.title);
+				this.isHostMcpToolEvent(ledger, update.title, update.name);
 			if (!isHostMcp) {
 				this.mirrorBroker.registerOrUpdateCall(sessionId, update);
 			}
@@ -661,6 +673,7 @@ export class TurnCoordinator {
 	private isHostMcpToolEvent(
 		ledger: ManagedSessionLedger,
 		rawTitle: string | undefined,
+		rawName?: string,
 	): boolean {
 		if (ledger.toolMode === "pi-tools") {
 			return true;
@@ -668,11 +681,22 @@ export class TurnCoordinator {
 		if (ledger.hostMcpTools.length === 0) {
 			return false;
 		}
+		if (rawName && rawName.trim().length > 0) {
+			const lowerName = rawName.trim().toLowerCase();
+			if (lowerName.startsWith("mcp_pi_tools_")) {
+				return true;
+			}
+			if (ledger.hostMcpTools.some((t) => lowerName === t.name.toLowerCase())) {
+				return true;
+			}
+			// 若服务端已提供明确的非宿主原生工具名（如 read_file），不再按 title 子串模糊匹配，防止读写含 pi_tools 路径时误吞
+			return false;
+		}
 		if (!rawTitle) {
 			return false;
 		}
 		const lower = rawTitle.toLowerCase();
-		if (lower.includes("pi_tools")) {
+		if (lower.includes("mcp_pi_tools_")) {
 			return true;
 		}
 		return ledger.hostMcpTools.some((t) => lower === t.name.toLowerCase());
@@ -701,16 +725,15 @@ export class TurnCoordinator {
 		const declaredTools = getCurrentTools(context.messages);
 		const hostMcpTools = filterToolsForHostMcpBridge(declaredTools, this.currentConfig);
 		const toolsDigest = computeToolsFingerprint(hostMcpTools);
-		const mountInfo = prepareCustomizationMount(context.messages, this.currentConfig, cwd);
 		const visibleMessages = extractVisibleMessages(context.messages);
 
-		// 2. 检查是否正在续接当前活跃会话的工具返回或分片流
+		// 2. 优先检查活跃轮次续接（2a / 2b）：不因中途编辑 AGENTS.md / SKILL.md 改变 mountDigest 而跳过挂起结算导致死锁，
+		// 将规则挂载变更延后至下一新轮次生效。
 		const existing = this.ledgers.get(piSessionKey);
 		if (
 			existing &&
 			existing.conn.isAlive &&
-			existing.toolMode === this.currentConfig.toolMode &&
-			existing.mountDigest === mountInfo.mountDigest
+			existing.toolMode === this.currentConfig.toolMode
 		) {
 			// 2a. 模式 B / Hybrid：结算挂起中的 Parked MCP 工具调用
 			if (existing.parkedCalls.size > 0 || existing.detachedCallIds.size > 0) {
@@ -740,6 +763,7 @@ export class TurnCoordinator {
 							return;
 						}
 						await this.discardWedgedLedger(existing);
+						// 驱逐后直接跳至第 3 步重建，绝不穿透落入 2c 对已销毁 ledger 执行操作
 					} else {
 						existing.lastConsumedStepIdx = Math.max(
 							existing.lastConsumedStepIdx,
@@ -769,27 +793,62 @@ export class TurnCoordinator {
 					return;
 				}
 			}
+		}
 
-			// 2c. 连续正常追问：先确认上一轮在途请求已完全收敛；若底层卡死则自动驱逐重建，否则直接复用会话与缓存
-			const idleOk = await this.waitForInFlightPrompt(existing, 2_500, options?.signal);
+		// 进入新用户轮次（2c）或重建路径（3）时才计算最新规则与技能挂载指纹
+		const mountInfo = prepareCustomizationMount(context.messages, this.currentConfig, cwd);
+
+		// 2c. 连续正常追问：先确认上一轮在途请求已完全收敛；若底层卡死则自动驱逐重建，否则直接复用会话与缓存
+		const idleCandidate = this.ledgers.get(piSessionKey);
+		if (
+			idleCandidate &&
+			idleCandidate.conn.isAlive &&
+			idleCandidate.toolMode === this.currentConfig.toolMode &&
+			idleCandidate.mountDigest === mountInfo.mountDigest
+		) {
+			const idleOk = await this.waitForInFlightPrompt(idleCandidate, 2_500, options?.signal);
 			if (!idleOk) {
 				if (options?.signal?.aborted) {
 					writer.fail("aborted", "Request aborted by user");
 					return;
 				}
-				await this.discardWedgedLedger(existing);
+				await this.discardWedgedLedger(idleCandidate);
 			} else {
-				const continuationPrompts = this.tryExtractIncrementalUserPrompts(existing, visibleMessages);
-				if (continuationPrompts && existing.toolsDigest === toolsDigest) {
-					await this.executePromptOnLedger(
-						existing,
-						continuationPrompts,
-						visibleMessages,
-						writer,
-						model,
-						options,
+				const continuationPrompts = this.tryExtractIncrementalUserPrompts(
+					idleCandidate,
+					visibleMessages,
+				);
+				if (continuationPrompts) {
+					if (idleCandidate.toolsDigest === toolsDigest) {
+						await this.executePromptOnLedger(
+							idleCandidate,
+							continuationPrompts,
+							visibleMessages,
+							writer,
+							model,
+							options,
+						);
+						return;
+					}
+
+					// 跨轮次仅动态工具集合变化：优先通过活跃 SSE 或原地 session/resume 重拉 tools/list，零历史丢失
+					const syncedTools = await this.syncLedgerToolsBetweenTurns(
+						idleCandidate,
+						hostMcpTools,
+						toolsDigest,
+						options?.signal,
 					);
-					return;
+					if (syncedTools) {
+						await this.executePromptOnLedger(
+							idleCandidate,
+							continuationPrompts,
+							visibleMessages,
+							writer,
+							model,
+							options,
+						);
+						return;
+					}
 				}
 			}
 		}
@@ -841,11 +900,153 @@ export class TurnCoordinator {
 			return undefined;
 		}
 		const delta = visibleMessages.slice(ledger.syncedMessageCount);
-		if (!delta.every((m): m is UserMessage => m.role === "user")) {
+		if (delta.every((m): m is UserMessage => m.role === "user")) {
+			const blocks = convertUserMessagesToPromptBlocks(delta);
+			return blocks.length > 0 ? blocks : undefined;
+		}
+
+		// 若增量片段中仅包含因按 Esc 中断或报错失败的未完结轮次（无任何已执行工具结果），
+		// 跳过失败片段仅提取末尾新增用户消息，在同一热缓存会话上无损续接，避免误拆长会话退化为截断重放。
+		if (delta.some((m) => m.role === "toolResult")) {
 			return undefined;
 		}
-		const blocks = convertUserMessagesToPromptBlocks(delta);
+		let lastFailedAssistantIdx = -1;
+		for (let i = 0; i < delta.length; i++) {
+			const m = delta[i];
+			if (m.role === "assistant") {
+				if (m.stopReason !== "aborted" && m.stopReason !== "error") {
+					return undefined;
+				}
+				lastFailedAssistantIdx = i;
+			}
+		}
+		if (lastFailedAssistantIdx === -1 || lastFailedAssistantIdx >= delta.length - 1) {
+			return undefined;
+		}
+		const trailingUsers = delta.slice(lastFailedAssistantIdx + 1);
+		if (!trailingUsers.every((m): m is UserMessage => m.role === "user")) {
+			return undefined;
+		}
+		const blocks = convertUserMessagesToPromptBlocks(trailingUsers);
 		return blocks.length > 0 ? blocks : undefined;
+	}
+
+	/** 构造当前会话所需的 ACP `mcpServers` 列表（供初次建连与原地 `session/resume` 工具热重载复用） */
+	private async buildSessionMcpServersSpec(params: {
+		mcpToken?: string;
+		useHttpMcp: boolean;
+		cwd: string;
+		isProjectTrusted: boolean;
+	}): Promise<AcpMcpServerSpec[]> {
+		const mcpServers: AcpMcpServerSpec[] = [];
+		if (params.mcpToken) {
+			mcpServers.push(
+				await this.httpMcpBridge.buildAcpMcpServerSpec(params.mcpToken, params.useHttpMcp),
+			);
+		}
+		const effectiveFlags = resolveEffectiveFlags(this.currentConfig);
+		if (
+			effectiveFlags.toolMode !== "pi-tools" &&
+			effectiveFlags.bridgePiMcp &&
+			this.currentConfig.piMcpBridgeStrategy === "direct-config"
+		) {
+			mcpServers.push(
+				...loadDirectPiMcpServerSpecs({
+					cwd: params.cwd,
+					isProjectTrusted: params.isProjectTrusted,
+					processPerSession: params.useHttpMcp,
+				}),
+			);
+		}
+		return mcpServers;
+	}
+
+	/**
+	 * 通过 `session/close` + `session/resume`（同 `agySessionId`）原地重拉 `tools/list`，
+	 * 在默认 `processPerSession: true`（无 SSE 通道）下让新解锁工具立即可见且 100% 保留会话历史与热缓存。
+	 */
+	private async reloadLedgerSessionForTools(
+		ledger: ManagedSessionLedger,
+		hostMcpTools: Tool[],
+		toolsDigest: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		if (
+			!ledger.conn.isAlive ||
+			!ledger.conn.capabilities?.sessionCapabilities?.resume ||
+			!hasLocalConversationDb(this.currentConfig, ledger.agySessionId)
+		) {
+			return false;
+		}
+
+		if (ledger.mcpToken) {
+			this.httpMcpBridge.updateBindingTools(ledger.mcpToken, hostMcpTools);
+		} else if (hostMcpTools.length > 0) {
+			// 原会话无 MCP 通道（例如 agy-tools 原本零 MCP 工具，后新增 MCP 工具）时由上层重建
+			return false;
+		}
+
+		const mcpServers = await this.buildSessionMcpServersSpec({
+			mcpToken: ledger.mcpToken,
+			useHttpMcp: ledger.useHttpMcp,
+			cwd: ledger.cwd,
+			isProjectTrusted: ledger.isProjectTrusted,
+		});
+		const addDirs =
+			ledger.additionalDirectories.length > 0 ? ledger.additionalDirectories : undefined;
+
+		try {
+			await ledger.conn.closeSessionSafe(ledger.agySessionId);
+			const resumed = await ledger.conn.request<AcpSessionResumeResult>(
+				"session/resume",
+				{
+					sessionId: ledger.agySessionId,
+					cwd: ledger.cwd,
+					mcpServers,
+					additionalDirectories: addDirs,
+				},
+				{ timeoutMs: 20_000, signal },
+			);
+			ledger.conn.trackSession(resumed.sessionId);
+			if (resumed.configOptions) {
+				ledger.configOptions = resumed.configOptions;
+			}
+			if (resumed.models?.availableModels) {
+				ledger.availableModels = resumed.models.availableModels;
+			}
+			ledger.appliedModelValue = undefined;
+			ledger.appliedThoughtLevel = undefined;
+			ledger.appliedExecMode = undefined;
+			ledger.hostMcpTools = hostMcpTools;
+			ledger.toolsDigest = toolsDigest;
+			ledger.lastConsumedStepIdx = Math.max(
+				ledger.lastConsumedStepIdx,
+				await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	private async syncLedgerToolsBetweenTurns(
+		ledger: ManagedSessionLedger,
+		hostMcpTools: Tool[],
+		toolsDigest: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		if (ledger.mcpToken) {
+			const deliveredViaSse = this.httpMcpBridge.updateBindingTools(
+				ledger.mcpToken,
+				hostMcpTools,
+			);
+			if (deliveredViaSse) {
+				ledger.hostMcpTools = hostMcpTools;
+				ledger.toolsDigest = toolsDigest;
+				return true;
+			}
+		}
+		return this.reloadLedgerSessionForTools(ledger, hostMcpTools, toolsDigest, signal);
 	}
 
 	private collectRecentToolResultsAndSteeringUsers(
@@ -876,11 +1077,17 @@ export class TurnCoordinator {
 		toolsDigest: string,
 		options?: SimpleStreamOptions,
 	): Promise<void> {
-		// 更新动态工具表（例如上一轮刚执行了 tool_search 激活了新工具）
+		// 更新动态工具表（例如上一轮刚执行了 tool_search 激活了新工具）；
+		// 仅在存在活跃 SSE 客户端即时送达变更时更新 ledger.toolsDigest；否则在无 SSE 通道下通过原地 session/resume 重拉 tools/list。
+		let needsMidTurnToolsReload = false;
 		if (ledger.mcpToken && ledger.toolsDigest !== toolsDigest) {
-			ledger.hostMcpTools = hostMcpTools;
-			ledger.toolsDigest = toolsDigest;
-			this.httpMcpBridge.updateBindingTools(ledger.mcpToken, hostMcpTools);
+			const deliveredViaSse = this.httpMcpBridge.updateBindingTools(ledger.mcpToken, hostMcpTools);
+			if (deliveredViaSse) {
+				ledger.hostMcpTools = hostMcpTools;
+				ledger.toolsDigest = toolsDigest;
+			} else {
+				needsMidTurnToolsReload = true;
+			}
 		}
 
 		// 从末尾收集本轮产生的 ToolResultMessage 与可能夹带的 Steering UserMessage
@@ -1016,6 +1223,19 @@ export class TurnCoordinator {
 			([callId]) => pump.emittedMcpCallIds.has(callId) || recentToolResults.has(callId),
 		);
 
+		// 若即将执行工具边界切入（用户 steer 或无 SSE 下的动态工具重载），先开启切入保护标志，
+		// 防止 settle 后毫秒级冲入的同批第 2 个 MCP 工具被挂起拖慢收口。
+		const willCutInForSteer = trailingUsers.length > 0;
+		const willCutInForToolsReload =
+			!willCutInForSteer &&
+			needsMidTurnToolsReload &&
+			Boolean(ledger.conn.capabilities?.sessionCapabilities?.resume) &&
+			hasLocalConversationDb(this.currentConfig, ledger.agySessionId);
+
+		if (willCutInForSteer || willCutInForToolsReload) {
+			ledger.steeringCutInPending = true;
+		}
+
 		for (const [callId, parked] of entriesToSettle) {
 			const tr = recentToolResults.get(callId);
 			ledger.parkedCalls.delete(callId);
@@ -1029,8 +1249,17 @@ export class TurnCoordinator {
 
 		// 若用户在工具执行期间按 Enter 发送了转向消息（steer）：
 		// 先等待刚结算的工具输出落盘至本地会话库，随即在当前工具边界收口后台自动循环，立即在同一热缓存会话上以真实用户身份发送转向消息！
-		if (trailingUsers.length > 0) {
-			await waitForSqliteToolStepsSettled(this.currentConfig, ledger.agySessionId, 160);
+		if (willCutInForSteer) {
+			try {
+				await waitForSqliteToolStepsSettled(
+					this.currentConfig,
+					ledger.agySessionId,
+					160,
+					options?.signal,
+				);
+			} finally {
+				ledger.steeringCutInPending = false;
+			}
 			this.abortLedgerTurnNonBlocking(ledger, true);
 			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 			if (!idleOk) {
@@ -1070,14 +1299,90 @@ export class TurnCoordinator {
 				return;
 			}
 
-			ledger.lastConsumedStepIdx = Math.max(
-				ledger.lastConsumedStepIdx,
-				await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
-			);
+			if (needsMidTurnToolsReload) {
+				await this.reloadLedgerSessionForTools(ledger, hostMcpTools, toolsDigest, options?.signal);
+			} else {
+				ledger.lastConsumedStepIdx = Math.max(
+					ledger.lastConsumedStepIdx,
+					await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
+				);
+			}
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
 			await this.executePromptOnLedger(
 				ledger,
 				convertUserMessagesToPromptBlocks(trailingUsers),
+				visibleMessages,
+				writer,
+				model,
+				options,
+			);
+			return;
+		}
+
+		// 默认 processPerSession: true（无 SSE 订阅）下工具集动态变化（如 tool_search 解锁新工具）：
+		// 在当前工具落盘后通过原地 close + session/resume 重拉 tools/list，使模型当轮立即可见并调用新解锁工具！
+		if (willCutInForToolsReload) {
+			try {
+				await waitForSqliteToolStepsSettled(
+					this.currentConfig,
+					ledger.agySessionId,
+					160,
+					options?.signal,
+				);
+			} finally {
+				ledger.steeringCutInPending = false;
+			}
+			this.abortLedgerTurnNonBlocking(ledger, true);
+			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+			if (idleOk) {
+				const reloaded = await this.reloadLedgerSessionForTools(
+					ledger,
+					hostMcpTools,
+					toolsDigest,
+					options?.signal,
+				);
+				if (reloaded) {
+					this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+					await this.executePromptOnLedger(
+						ledger,
+						[
+							{
+								type: "text",
+								text: "The newly activated tools are now loaded and available. Please continue.",
+							},
+						],
+						visibleMessages,
+						writer,
+						model,
+						options,
+					);
+					return;
+				}
+			} else if (options?.signal?.aborted) {
+				writer.fail("aborted", "Request aborted by user");
+				return;
+			}
+			// 若原地重载未能收敛，直接重建会话避免悬空
+			await this.discardWedgedLedger(ledger);
+			const cwd = this.activeContext?.cwd ?? process.cwd();
+			const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
+			const mountInfo = prepareCustomizationMount(fullContextMessages, this.currentConfig, cwd);
+			const restored = await this.bootstrapOrRestoreLedger({
+				piSessionKey: ledger.piSessionKey,
+				cwd,
+				isProjectTrusted,
+				visibleMessages,
+				hostMcpTools,
+				toolsDigest,
+				mountedPluginPaths: mountInfo.mountedPluginPaths,
+				mountDigest: mountInfo.mountDigest,
+				additionalDirectories: mountInfo.additionalDirectories,
+				workspaceContextBlock: mountInfo.workspaceContextBlock,
+				signal: options?.signal,
+			});
+			await this.executePromptOnLedger(
+				restored.ledger,
+				restored.initialPromptBlocks,
 				visibleMessages,
 				writer,
 				model,
@@ -1136,7 +1441,17 @@ export class TurnCoordinator {
 				tools: params.hostMcpTools,
 				onParkedCall: (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
-					if (!fullLedger.activePump || fullLedger.activePump.finished) {
+					if (
+						fullLedger.steeringCutInPending ||
+						!fullLedger.activePump ||
+						fullLedger.activePump.finished
+					) {
+						if (fullLedger.activePump) {
+							fullLedger.activePump.pendingAnnouncedMcpCount = Math.max(
+								0,
+								fullLedger.activePump.pendingAnnouncedMcpCount - 1,
+							);
+						}
 						call.settle({
 							isError: true,
 							content: [{ type: "text", text: "Turn cancelled." }],
@@ -1150,6 +1465,20 @@ export class TurnCoordinator {
 					);
 					fullLedger.activePump.queue.push({ kind: "mcp_parked", call });
 				},
+				onRejectedCall: () => {
+					const fullLedger = ledgerDraft as ManagedSessionLedger;
+					if (fullLedger.activePump) {
+						fullLedger.activePump.pendingAnnouncedMcpCount = Math.max(
+							0,
+							fullLedger.activePump.pendingAnnouncedMcpCount - 1,
+						);
+					}
+				},
+				onClientDisconnect: (callId) => {
+					const fullLedger = ledgerDraft as ManagedSessionLedger;
+					fullLedger.parkedCalls.delete(callId);
+					fullLedger.activePump?.emittedMcpCallIds.delete(callId);
+				},
 				onHoldTimeout: async (call) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
 					fullLedger.detachedCallIds.add(call.callId);
@@ -1162,24 +1491,16 @@ export class TurnCoordinator {
 					}
 				},
 			});
-			mcpServers.push(await this.httpMcpBridge.buildAcpMcpServerSpec(mcpToken, useHttpMcp));
 		}
 
-		// 在模式 A / Hybrid 且配置为 direct-config 时，追加 Pi mcp.json 配置项
-		const effectiveFlags = resolveEffectiveFlags(this.currentConfig);
-		if (
-			effectiveFlags.toolMode !== "pi-tools" &&
-			effectiveFlags.bridgePiMcp &&
-			this.currentConfig.piMcpBridgeStrategy === "direct-config"
-		) {
-			mcpServers.push(
-				...loadDirectPiMcpServerSpecs({
-					cwd: params.cwd,
-					isProjectTrusted: params.isProjectTrusted,
-					processPerSession: useHttpMcp,
-				}),
-			);
-		}
+		mcpServers.push(
+			...(await this.buildSessionMcpServersSpec({
+				mcpToken,
+				useHttpMcp,
+				cwd: params.cwd,
+				isProjectTrusted: params.isProjectTrusted,
+			})),
+		);
 
 		// 拆分前序历史与末尾待发送的新增用户消息，尝试沿会话分支查找锚点恢复
 		let tailStartIdx = params.visibleMessages.length;
@@ -1309,6 +1630,10 @@ export class TurnCoordinator {
 			piSessionKey: params.piSessionKey,
 			agySessionId: sessionInfo.sessionId,
 			conn,
+			cwd: params.cwd,
+			isProjectTrusted: params.isProjectTrusted,
+			additionalDirectories: [...params.additionalDirectories],
+			useHttpMcp,
 			mcpToken,
 			hostMcpTools: params.hostMcpTools,
 			toolsDigest: params.toolsDigest,
@@ -1879,8 +2204,14 @@ export class TurnCoordinator {
 			if (genPromptSum > 0 && genCacheRead > 0) {
 				ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, genCacheRead / genPromptSum));
 			}
-			const genWindowTotal = genPromptSum + genOutput;
-			const effectiveWindow = liveWindowUsed > 0 ? liveWindowUsed : genWindowTotal;
+			// 多条 SQLite 生成并入单步时，上下文窗口基数取最新一条生成的窗口值，杜绝无 usage_update 时窗口翻倍误触发压缩
+			const lastGen = gensToAccount[gensToAccount.length - 1];
+			const latestGenWindowTotal =
+				lastGen.inputTokens +
+				lastGen.cacheReadTokens +
+				lastGen.cacheWriteTokens +
+				lastGen.outputTokens;
+			const effectiveWindow = liveWindowUsed > 0 ? liveWindowUsed : latestGenWindowTotal;
 			pump.accountedOutputTokens += genOutput;
 			ledger.cachedPrefixTokens = Math.max(ledger.cachedPrefixTokens, effectiveWindow);
 
@@ -1894,7 +2225,7 @@ export class TurnCoordinator {
 				1,
 				writer.message.content.filter((b) => b.type === "toolCall").length,
 			);
-			const plannedTools = gensToAccount[gensToAccount.length - 1].plannedToolCalls ?? 1;
+			const plannedTools = lastGen.plannedToolCalls ?? 1;
 			const remainingSlices = Math.max(0, plannedTools - emittedToolCount);
 
 			if (remainingSlices > 0 && totalPrompt >= (remainingSlices + 1) * 20) {
@@ -1908,7 +2239,9 @@ export class TurnCoordinator {
 				const resCr = Math.min(totalCr, remainingSlices * perCr);
 				const resCw = Math.min(totalCw, remainingSlices * perCw);
 				const resIn = Math.min(totalIn, remainingSlices * perIn);
-				const resOut = totalOut > remainingSlices ? remainingSlices : 0;
+				// 严格保证第 1 步 output >= reasoning，仅在扣除思考 Token 仍有余量时才向后续切片预留 output
+				const minStepOut = Math.max(1, hasThought ? thoughtSum : 1);
+				const resOut = Math.min(remainingSlices, Math.max(0, totalOut - minStepOut));
 
 				ledger.pendingGenSlicePool = {
 					remainingSlices,
@@ -1925,18 +2258,19 @@ export class TurnCoordinator {
 					output: stepOut,
 					cacheRead: totalCr - resCr,
 					cacheWrite: totalCw - resCw,
-					reasoning: hasThought ? thoughtSum : undefined,
+					reasoning: hasThought ? Math.min(stepOut, thoughtSum) : undefined,
 					totalTokens: effectiveWindow,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};
 			}
 
+			const finalStepOut = Math.max(1, totalOut);
 			return {
 				input: totalIn,
-				output: Math.max(1, totalOut),
+				output: finalStepOut,
 				cacheRead: totalCr,
 				cacheWrite: totalCw,
-				reasoning: hasThought ? thoughtSum : undefined,
+				reasoning: hasThought ? Math.min(finalStepOut, thoughtSum) : undefined,
 				totalTokens: effectiveWindow,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			};
@@ -1973,12 +2307,8 @@ export class TurnCoordinator {
 				};
 			}
 
-			// 无本地库回退路径下的同次生成拆分步：若会话已有缓存命中记录，返回极小整数比例样本以维持 UI 缓存命中率显示不闪烁
-			if (
-				!pump.hasSqliteGenTelemetry &&
-				ledger.lastObservedCacheRatio !== undefined &&
-				ledger.lastObservedCacheRatio > 0
-			) {
+			// 切片池耗尽或无本地库回退路径下的同次生成拆分步：若会话已有缓存命中记录，返回极小整数比例样本维持 UI 缓存命中率不闪烁
+			if (ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0) {
 				const win = liveWindowUsed > 0 ? liveWindowUsed : ledger.cachedPrefixTokens;
 				const cr = Math.max(1, Math.min(100, Math.round(100 * ledger.lastObservedCacheRatio)));
 				return {
@@ -2065,7 +2395,7 @@ export class TurnCoordinator {
 				? Math.floor(ledger.usedTokens)
 				: undefined;
 
-		const dbGens = await readSqliteGenerationUsagesSince(
+		const dbGens = await readSqliteGenerationUsagesSinceWithRetry(
 			this.currentConfig,
 			ledger.agySessionId,
 			ledger.lastConsumedStepIdx,
@@ -2100,16 +2430,22 @@ export class TurnCoordinator {
 			if (promptSum > 0 && cacheRead > 0) {
 				ledger.lastObservedCacheRatio = Math.min(1, Math.max(0, cacheRead / promptSum));
 			}
-			const totalTokens = promptSum + output;
-			const effectiveWindow = liveWindowUsed ?? totalTokens;
+			const lastGen = gensToAccount[gensToAccount.length - 1];
+			const latestGenWindowTotal =
+				lastGen.inputTokens +
+				lastGen.cacheReadTokens +
+				lastGen.cacheWriteTokens +
+				lastGen.outputTokens;
+			const effectiveWindow = liveWindowUsed ?? latestGenWindowTotal;
 			ledger.cachedPrefixTokens = effectiveWindow;
 
+			const totalOut = output + carry.output;
 			return {
 				input: input + carry.input,
-				output: output + carry.output,
+				output: totalOut,
 				cacheRead: cacheRead + carry.cacheRead,
 				cacheWrite: cacheWrite + carry.cacheWrite,
-				reasoning: hasThought ? thoughtSum : undefined,
+				reasoning: hasThought ? Math.min(totalOut, thoughtSum) : undefined,
 				totalTokens: effectiveWindow,
 				cost: raw.cost,
 			};
@@ -2127,7 +2463,15 @@ export class TurnCoordinator {
 					cost: raw.cost,
 				};
 			}
-			return createZeroUsage();
+			// 若末步 SQLite WAL 延迟落盘或遇到锁冲突导致 dbGens 为空，回退至下方末步估算与缓存命中率对齐，
+			// 绝不直接返回全零 Usage 导致末步 output 与状态栏缓存命中率消失。
+			if (
+				writer.estimatedOutputTokens === 0 &&
+				raw.output === 0 &&
+				!(ledger.lastObservedCacheRatio !== undefined && ledger.lastObservedCacheRatio > 0)
+			) {
+				return createZeroUsage();
+			}
 		}
 
 		const cacheRatio = ledger.lastObservedCacheRatio ?? 0;
@@ -2301,23 +2645,41 @@ export class TurnCoordinator {
 
 			try {
 				const visible = extractVisibleMessages(context.messages);
-				const promptBlocks = buildFreshReplayPromptBlocks(visible);
-				writer.ensureStarted();
-				const promptRes = await conn.request<AcpPromptResponse>(
-					"session/prompt",
-					{
-						sessionId: tempSessionId,
-						prompt: promptBlocks,
-					},
-					{ signal: options?.signal },
-				);
-				if (detectedQuotaErr) {
-					writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);
-					return;
-				}
-				const { quotaError } = writer.finishTurn(promptRes.stopReason, promptRes.usage);
-				if (quotaError) {
-					writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
+				const basePromptBlocks = buildFreshReplayPromptBlocks(visible);
+				const auxInstructions = extractAuxiliaryTaskInstructions(context);
+				const promptBlocks: AcpPromptBlock[] = auxInstructions
+					? [
+							{
+								type: "text",
+								text: `<task_instructions>\n${auxInstructions}\n</task_instructions>`,
+							},
+							...basePromptBlocks,
+						]
+					: basePromptBlocks;
+				const onAuxAbort = () => {
+					conn.notify("session/cancel", { sessionId: tempSessionId });
+				};
+				options?.signal?.addEventListener("abort", onAuxAbort, { once: true });
+				try {
+					writer.ensureStarted();
+					const promptRes = await conn.request<AcpPromptResponse>(
+						"session/prompt",
+						{
+							sessionId: tempSessionId,
+							prompt: promptBlocks,
+						},
+						{ signal: options?.signal },
+					);
+					if (detectedQuotaErr) {
+						writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);
+						return;
+					}
+					const { quotaError } = writer.finishTurn(promptRes.stopReason, promptRes.usage);
+					if (quotaError) {
+						writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
+					}
+				} finally {
+					options?.signal?.removeEventListener("abort", onAuxAbort);
 				}
 			} finally {
 				unsubscribe();

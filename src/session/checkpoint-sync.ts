@@ -137,6 +137,24 @@ async function loadNodeSqlite(): Promise<NodeSqliteModule | undefined> {
 	}
 }
 
+/** 打开 SQLite 连接并设置 `busy_timeout`，缓解 Windows WAL 并发读写下的瞬时 `SQLITE_BUSY` 锁冲突 */
+function openSqliteWithTimeout(
+	sqlite: NodeSqliteModule,
+	dbPath: string,
+	readOnly: boolean,
+	busyTimeoutMs = 1_500,
+): import("node:sqlite").DatabaseSync {
+	const db = readOnly
+		? new sqlite.DatabaseSync(dbPath, { readOnly: true })
+		: new sqlite.DatabaseSync(dbPath);
+	try {
+		db.exec(`PRAGMA busy_timeout = ${Math.max(100, Math.floor(busyTimeoutMs))}`);
+	} catch {
+		// 忽略只读连接或特殊环境下 PRAGMA 不可用异常
+	}
+	return db;
+}
+
 const REQUIRED_TABLES = [
 	"trajectory_meta",
 	"steps",
@@ -367,7 +385,7 @@ export async function readCurrentMaxSqliteStepIdx(
 
 	let db: import("node:sqlite").DatabaseSync | undefined;
 	try {
-		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+		db = openSqliteWithTimeout(sqlite, dbPath, true);
 		const row = db
 			.prepare("SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps")
 			.get() as { maxIdx: number } | undefined;
@@ -400,7 +418,7 @@ export async function readSqliteGenerationUsagesSince(
 
 	let db: import("node:sqlite").DatabaseSync | undefined;
 	try {
-		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+		db = openSqliteWithTimeout(sqlite, dbPath, true);
 		const rows = db
 			.prepare(
 				"SELECT idx, metadata, step_payload FROM steps WHERE step_type = 15 AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
@@ -439,6 +457,45 @@ export async function readSqliteGenerationUsagesSince(
 }
 
 /**
+ * 在末步 `prompt_done` 到达时带短退避重试读取最新 SQLite `PLANNER_RESPONSE` 统计，
+ * 兜底应对 `agy` WAL 异步落盘略晚于 JSON-RPC 回包的边界竞态。
+ */
+export async function readSqliteGenerationUsagesSinceWithRetry(
+	config: BridgeConfig,
+	agySessionId: string,
+	afterStepIdx: number,
+	retryDelaysMs: readonly number[] = [25, 50],
+): Promise<SqliteGenerationUsage[]> {
+	const first = await readSqliteGenerationUsagesSince(config, agySessionId, afterStepIdx);
+	if (first.length > 0 || !hasLocalConversationDb(config, agySessionId)) {
+		return first;
+	}
+	for (const delay of retryDelaysMs) {
+		await new Promise((r) => setTimeout(r, delay));
+		const next = await readSqliteGenerationUsagesSince(config, agySessionId, afterStepIdx);
+		if (next.length > 0) {
+			return next;
+		}
+	}
+	return [];
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			resolve();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
  * 在工具边界切入用户转向消息（`steer`）前，等待刚结算的 loopback HTTP 工具结果落盘为非进行中状态（`status != 1`），
  * 确保随后的 `session/cancel` 不会误冲掉已完成工具的持久化输出。
  */
@@ -446,27 +503,30 @@ export async function waitForSqliteToolStepsSettled(
 	config: BridgeConfig,
 	agySessionId: string,
 	maxWaitMs = 160,
+	signal?: AbortSignal,
 ): Promise<void> {
+	if (signal?.aborted) return;
 	const dbPath = agySessionId
 		? path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`)
 		: "";
 	if (!dbPath || !fs.existsSync(dbPath)) {
-		await new Promise((r) => setTimeout(r, 25));
+		await sleepWithAbort(25, signal);
 		return;
 	}
 	const sqlite = await loadNodeSqlite();
 	if (!sqlite) {
-		await new Promise((r) => setTimeout(r, 25));
+		await sleepWithAbort(25, signal);
 		return;
 	}
 
-	await new Promise((r) => setTimeout(r, 20));
+	await sleepWithAbort(20, signal);
+	if (signal?.aborted) return;
 	const deadline = Date.now() + Math.max(20, maxWaitMs - 20);
-	while (Date.now() < deadline) {
+	while (Date.now() < deadline && !signal?.aborted) {
 		let hasRunningTool = false;
 		let db: import("node:sqlite").DatabaseSync | undefined;
 		try {
-			db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+			db = openSqliteWithTimeout(sqlite, dbPath, true, 200);
 			const busy = db
 				.prepare(
 					"SELECT 1 AS busy FROM steps WHERE step_type != 15 AND step_type != 14 AND status = 1 LIMIT 1",
@@ -485,7 +545,7 @@ export async function waitForSqliteToolStepsSettled(
 		if (!hasRunningTool) {
 			return;
 		}
-		await new Promise((r) => setTimeout(r, 15));
+		await sleepWithAbort(15, signal);
 	}
 }
 
@@ -510,7 +570,7 @@ export async function captureSqliteCheckpoint(
 
 	let db: import("node:sqlite").DatabaseSync | undefined;
 	try {
-		db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+		db = openSqliteWithTimeout(sqlite, dbPath, true);
 		if (!verifyRequiredTables(db)) {
 			return undefined;
 		}
@@ -575,7 +635,7 @@ export async function forkSqliteConversationAtCheckpoint(
 
 	let srcDb: import("node:sqlite").DatabaseSync | undefined;
 	try {
-		srcDb = new sqlite.DatabaseSync(sourceDbPath, { readOnly: true });
+		srcDb = openSqliteWithTimeout(sqlite, sourceDbPath, true);
 		if (!verifyRequiredTables(srcDb)) {
 			return undefined;
 		}
@@ -604,7 +664,7 @@ export async function forkSqliteConversationAtCheckpoint(
 
 	let dstDb: import("node:sqlite").DatabaseSync | undefined;
 	try {
-		dstDb = new sqlite.DatabaseSync(targetDbPath);
+		dstDb = openSqliteWithTimeout(sqlite, targetDbPath, false);
 		dstDb.exec("BEGIN IMMEDIATE");
 		dstDb.prepare("DELETE FROM steps WHERE idx >= ?").run(checkpoint.steps);
 		dstDb.prepare("DELETE FROM parent_references WHERE idx >= ?").run(checkpoint.steps);
