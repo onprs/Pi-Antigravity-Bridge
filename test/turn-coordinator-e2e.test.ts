@@ -23,9 +23,14 @@ import {
  * 生成一个纯 Node.js 标准库编写的跨平台模拟 `agy acp` 服务端脚本，
  * 真实走 stdio NDJSON 与本地 Streamable HTTP MCP 网络套接字进行端到端协议验证。
  */
-function writeMockAgyExecutable(dir: string): string {
+function writeMockAgyExecutable(
+	dir: string,
+	options?: { seedTemplateDbOnNew?: boolean },
+): string {
 	const scriptPath = path.join(dir, "mock-agy.mjs");
+	const seedTemplateDbOnNew = Boolean(options?.seedTemplateDbOnNew);
 	const scriptSource = `#!/usr/bin/env node
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -33,6 +38,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 const mockRootDir = path.dirname(fileURLToPath(import.meta.url));
+const seedTemplateDbOnNew = ${seedTemplateDbOnNew};
 const isModeA = !process.argv.some((arg) => arg.startsWith("pi-bridge"));
 const sessions = new Map();
 
@@ -84,9 +90,33 @@ rl.on("line", async (line) => {
   }
 
   if (msg.method === "session/new") {
-    const sessionId = "mock-session-" + (sessions.size + 1);
+    const sessionId = seedTemplateDbOnNew
+      ? crypto.randomUUID()
+      : "mock-session-" + (sessions.size + 1);
     const mcpHttp = (msg.params?.mcpServers || []).find((s) => s.type === "http");
     sessions.set(sessionId, { mcpHttp });
+
+    if (seedTemplateDbOnNew) {
+      const convDir = path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations");
+      fs.mkdirSync(convDir, { recursive: true });
+      const dbPath = path.join(convDir, sessionId + ".db");
+      const db = new DatabaseSync(dbPath);
+      db.exec(\`
+        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
+        CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, has_subtrajectory numeric NOT NULL DEFAULT false, metadata blob, error_details blob, permissions blob, task_details blob, render_info blob, step_payload blob, step_format integer NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS executor_metadata (idx integer PRIMARY KEY, data blob);
+        CREATE TABLE IF NOT EXISTS parent_references (idx integer PRIMARY KEY, data blob);
+        CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id text PRIMARY KEY DEFAULT "main", data blob);
+        CREATE TABLE IF NOT EXISTS battle_mode_infos (idx integer PRIMARY KEY, data blob);
+      \`);
+      db.prepare("INSERT OR REPLACE INTO trajectory_meta VALUES (?, ?, 4, 17)").run(sessionId, sessionId);
+      const agentTag = isModeA ? "default-agy-agent" : "pi-bridge";
+      const blob = Buffer.from("mock-meta:" + agentTag + ":" + sessionId, "utf8");
+      db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES ('main', ?)").run(blob);
+      db.close();
+    }
 
     if (mcpHttp) {
       const authHeader = mcpHttp.headers?.[0]?.value || "";
@@ -134,6 +164,25 @@ rl.on("line", async (line) => {
 
   if (msg.method === "session/resume") {
     const resumeSid = msg.params?.sessionId || "resumed-session";
+    if (seedTemplateDbOnNew && !isModeA) {
+      const dbPath = path.join(mockRootDir, ".gemini", "antigravity-cli", "conversations", resumeSid + ".db");
+      if (!fs.existsSync(dbPath)) {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Missing db for resume" } });
+        return;
+      }
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      const blobRow = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get();
+      db.close();
+      const blobStr = blobRow?.data ? Buffer.from(blobRow.data).toString("utf8") : "";
+      if (!blobStr.includes("pi-bridge") || !blobStr.includes(resumeSid)) {
+        send({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32603, message: "Resumed DB missing pi-bridge trajectory_metadata_blob" }
+        });
+        return;
+      }
+    }
     const mcpHttp = (msg.params?.mcpServers || []).find((s) => s.type === "http");
     const prevSess = sessions.get(resumeSid) || {};
     const sessObj = { ...prevSess, mcpHttp, resumeCount: (prevSess.resumeCount || 0) + 1 };
@@ -2001,9 +2050,9 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		}
 	});
 
-	it("超长历史与超长辅助压缩请求自动通过 SQLite 多步预注入零额外调用恢复，禁用 SQLite 时平滑降级至单步安全预算且保住末尾提问", async () => {
+	it("超长历史与超长辅助压缩请求自动通过官方模板克隆 SQLite 多步预注入零额外调用恢复（保留 pi-bridge 规格），禁用 SQLite 时平滑降级至单步安全预算且保住末尾提问", async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-preload-"));
-		const binPath = writeMockAgyExecutable(tmpRoot);
+		const binPath = writeMockAgyExecutable(tmpRoot, { seedTemplateDbOnNew: true });
 		const convDir = path.join(tmpRoot, ".gemini", "antigravity-cli", "conversations");
 		const cfg: BridgeConfig = {
 			...DEFAULT_BRIDGE_CONFIG,
@@ -2070,14 +2119,22 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 
 			const seededDbPath = path.join(convDir, `${seededId}.db`);
 			assert.ok(fs.existsSync(seededDbPath), "应已生成独立 UUID 的预注入 SQLite 会话库");
+			const dbsAfterSeed = fs.readdirSync(convDir).filter((f) => f.endsWith(".db"));
+			assert.deepEqual(dbsAfterSeed, [`${seededId}.db`], "官方空白模板库必须在克隆后立即删除，仅保留预注入会话库");
 			const db = new DatabaseSync(seededDbPath, { readOnly: true });
 			const stepCountRow = db.prepare("SELECT COUNT(*) AS n FROM steps").get() as { n: number };
 			const firstPayload = db.prepare("SELECT step_payload FROM steps WHERE idx = 0").get() as {
 				step_payload: Uint8Array;
 			};
+			const metaBlobRow = db
+				.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+				.get() as { data: Uint8Array };
 			db.close();
 			assert.ok(stepCountRow.n >= 4, `预注入库应包含多对交替步，实际 steps=${stepCountRow.n}`);
 			assert.ok(Buffer.from(firstPayload.step_payload).includes("HIST_USER_0:"));
+			const metaBlobStr = Buffer.from(metaBlobRow.data).toString("utf8");
+			assert.ok(metaBlobStr.includes("pi-bridge"), "预注入会话库必须完整保留 pi-bridge 规格以禁用内置工具");
+			assert.ok(metaBlobStr.includes(seededId), "预注入会话库元数据中的 UUID 必须更新为新会话 UUID");
 
 			const sentPromptText = capturedPayloads[0].prompt
 				.filter((b) => b.type === "text")
@@ -2127,8 +2184,15 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.join("\n");
 			assert.ok(fallbackText.includes("FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777"), "降级模式必须 100% 保住末尾提问");
 			assert.ok(Buffer.byteLength(fallbackText, "utf8") <= 110_000, "降级模式单步字节数不得超过安全红线");
-			const newFallbackDbs = fs.readdirSync(convDir).filter((f) => !beforeFallbackDbs.has(f));
-			assert.equal(newFallbackDbs.length, 0, "禁用 enableSqliteFork 时不得创建预注入 .db");
+			const fallbackDbPath = path.join(convDir, `${resFallback.responseId!}.db`);
+			if (fs.existsSync(fallbackDbPath)) {
+				const fbDb = new DatabaseSync(fallbackDbPath, { readOnly: true });
+				const fbSteps = fbDb.prepare("SELECT COUNT(*) AS n FROM steps").get() as { n: number };
+				fbDb.close();
+				assert.equal(fbSteps.n, 0, "禁用 enableSqliteFork 时不得向会话库写入预注入步骤");
+			}
+			const newFallbackDbs = fs.readdirSync(convDir).filter((f) => !beforeFallbackDbs.has(f) && f.endsWith(".db"));
+			assert.equal(newFallbackDbs.length, 1, "禁用 enableSqliteFork 时仅应由单次 session/new 生成一个普通会话库");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

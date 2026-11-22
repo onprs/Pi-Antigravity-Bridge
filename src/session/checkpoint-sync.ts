@@ -666,9 +666,14 @@ export async function forkSqliteConversationAtCheckpoint(
 		}
 	}
 
+	let origTrajectoryId: string | undefined;
 	let dstDb: import("node:sqlite").DatabaseSync | undefined;
 	try {
 		dstDb = openSqliteWithTimeout(sqlite, targetDbPath, false);
+		const origMeta = dstDb
+			.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1")
+			.get() as { trajectory_id?: string } | undefined;
+		origTrajectoryId = origMeta?.trajectory_id;
 		dstDb.exec("BEGIN IMMEDIATE");
 		dstDb.prepare("DELETE FROM steps WHERE idx >= ?").run(checkpoint.steps);
 		dstDb.prepare("DELETE FROM parent_references WHERE idx >= ?").run(checkpoint.steps);
@@ -683,6 +688,7 @@ export async function forkSqliteConversationAtCheckpoint(
 		dstDb
 			.prepare("UPDATE trajectory_meta SET trajectory_id = ?, cascade_id = ?")
 			.run(forkedSessionId, forkedSessionId);
+		rewriteMetadataBlobUuids(dstDb, [sourceSessionId, origTrajectoryId], forkedSessionId);
 		dstDb.exec("COMMIT");
 		return forkedSessionId;
 	} catch {
@@ -762,11 +768,262 @@ export function encodePlannerResponseStepPayload(text: string): Buffer {
 }
 
 /**
- * 新建一个独立 UUID 的 AGY 本地 SQLite 会话数据库，并将超长历史的多个安全分片以
- * `(USER_INPUT, PLANNER_RESPONSE)` 交替步预注入 `steps` 表，供随后通过 `session/resume`
- * 零额外 LLM 调用直接恢复，规避 `agy` 单条 `USER_INPUT` 64,000 token 截断上限。
+ * 校验已有本地会话库是否携带有效的 `trajectory_metadata_blob`（以及 `pi-tools` 模式下必需的 `pi-bridge` 标识）。
+ * 用于在恢复或分叉历史锚点前自动识别并隔离旧版无元数据裸库，避免 `session/resume` 回退启用 Antigravity 原生内置工具。
+ */
+export async function hasValidAgentMetadataBlob(
+	config: BridgeConfig,
+	agySessionId: string,
+	requiredAgentSubstring?: string,
+): Promise<boolean> {
+	if (!agySessionId) return true;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	if (!fs.existsSync(dbPath)) {
+		return true;
+	}
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return true;
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = openSqliteWithTimeout(sqlite, dbPath, true, 500);
+		const hasBlobTable = db
+			.prepare(
+				"SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'trajectory_metadata_blob'",
+			)
+			.get();
+		if (!hasBlobTable) {
+			return true;
+		}
+		const rows = db
+			.prepare("SELECT data FROM trajectory_metadata_blob WHERE data IS NOT NULL AND length(data) > 0")
+			.all() as Array<{ data: Uint8Array }>;
+		if (rows.length === 0) {
+			return false;
+		}
+		if (requiredAgentSubstring) {
+			return rows.some((row) =>
+				Buffer.from(row.data).toString("utf8").includes(requiredAgentSubstring),
+			);
+		}
+		return true;
+	} catch {
+		return true;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+/**
+ * 在克隆出的 `.db` 的 `trajectory_metadata_blob` 中将旧 UUID 等长替换为新 UUID。
+ * 仅对长度完全相等的 ASCII UUID 执行原位字节替换，不破坏 Protobuf 长度前缀编码。
+ */
+function rewriteMetadataBlobUuids(
+	db: import("node:sqlite").DatabaseSync,
+	oldIds: readonly (string | undefined)[],
+	newId: string,
+): void {
+	const hasBlobTable = db
+		.prepare(
+			"SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'trajectory_metadata_blob'",
+		)
+		.get();
+	if (!hasBlobTable) return;
+
+	const targets = Array.from(
+		new Set(
+			oldIds.filter(
+				(id): id is string =>
+					typeof id === "string" && id.length === newId.length && id !== newId,
+			),
+		),
+	);
+	if (targets.length === 0) return;
+
+	const newBytes = Buffer.from(newId, "ascii");
+	const rows = db
+		.prepare("SELECT id, data FROM trajectory_metadata_blob WHERE data IS NOT NULL")
+		.all() as Array<{ id: string; data: Uint8Array }>;
+	const updateStmt = db.prepare("UPDATE trajectory_metadata_blob SET data = ? WHERE id = ?");
+
+	for (const row of rows) {
+		const buf = Buffer.from(row.data);
+		let changed = false;
+		for (const oldId of targets) {
+			const oldBytes = Buffer.from(oldId, "ascii");
+			let offset = 0;
+			while ((offset = buf.indexOf(oldBytes, offset)) !== -1) {
+				newBytes.copy(buf, offset);
+				offset += newBytes.length;
+				changed = true;
+			}
+		}
+		if (changed) {
+			updateStmt.run(buf, row.id);
+		}
+	}
+}
+
+/**
+ * 基于刚刚由官方 `agy session/new` 创建的空白模板会话数据库，通过只读 `VACUUM INTO` 克隆出全新 UUID 的
+ * 会话库并写入多步预注入 `(USER_INPUT, PLANNER_RESPONSE)` 历史分片。
  *
- * 严格仅新建独立 UUID 文件，永不改动任何已有会话库；任何异常均立即清理临时文件并返回 `undefined`。
+ * 与从零建表不同，该方法完整保留 `agy` 原生写入 `trajectory_metadata_blob` 的 `CustomAgentSpec`
+ * （如 `pi-tools` 模式下的 `pi-bridge` 禁用内置工具与默认组件规格、挂载插件、工作区 URI 与权限策略），
+ * 防止 `session/resume` 找不到 Agent 元数据时回退启用 Antigravity 原生内置工具与工作流。
+ */
+export async function cloneTemplateSqliteConversationWithPreload(
+	config: BridgeConfig,
+	templateSessionId: string,
+	turns: readonly PreloadedSqliteTurn[],
+	options?: { signal?: AbortSignal },
+): Promise<string | undefined> {
+	if (!config.enableSqliteFork || !templateSessionId || turns.length === 0) {
+		return undefined;
+	}
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return undefined;
+
+	const convDir = resolveAgyConversationsDir(config);
+	const templateDbPath = path.join(convDir, `${templateSessionId}.db`);
+
+	// 等待刚刚关闭的模板会话完成 SQLite/WAL 落盘（最长 240ms，响应取消信号）
+	const deadline = Date.now() + 240;
+	let templateReady = false;
+	while (!options?.signal?.aborted) {
+		if (fs.existsSync(templateDbPath)) {
+			let probeDb: import("node:sqlite").DatabaseSync | undefined;
+			try {
+				probeDb = openSqliteWithTimeout(sqlite, templateDbPath, true, 300);
+				if (verifyRequiredTables(probeDb)) {
+					const hasBlobTable = probeDb
+						.prepare(
+							"SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'trajectory_metadata_blob'",
+						)
+						.get();
+					if (hasBlobTable) {
+						const blobRow = probeDb
+							.prepare(
+								"SELECT count(*) AS c FROM trajectory_metadata_blob WHERE data IS NOT NULL AND length(data) > 0",
+							)
+							.get() as { c?: number } | undefined;
+						if (Number(blobRow?.c ?? 0) > 0) {
+							templateReady = true;
+							break;
+						}
+					}
+				}
+			} catch {
+				// 模板仍在 WAL 刷盘中，短等后重试
+			} finally {
+				try {
+					probeDb?.close();
+				} catch {
+					// 忽略
+				}
+			}
+		}
+		if (Date.now() >= deadline) {
+			break;
+		}
+		await sleepWithAbort(20, options?.signal);
+	}
+
+	if (!templateReady || options?.signal?.aborted) {
+		return undefined;
+	}
+
+	const clonedSessionId = crypto.randomUUID();
+	const targetDbPath = path.join(convDir, `${clonedSessionId}.db`);
+	const escapedTarget = targetDbPath.replace(/'/g, "''");
+
+	let srcDb: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		srcDb = openSqliteWithTimeout(sqlite, templateDbPath, true);
+		srcDb.exec(`VACUUM INTO '${escapedTarget}'`);
+	} catch {
+		cleanupDbFilesSafe(targetDbPath);
+		return undefined;
+	} finally {
+		try {
+			srcDb?.close();
+		} catch {
+			// 忽略
+		}
+	}
+
+	let dstDb: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		dstDb = openSqliteWithTimeout(sqlite, targetDbPath, false);
+		const origMeta = dstDb
+			.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1")
+			.get() as { trajectory_id?: string } | undefined;
+
+		dstDb.exec("BEGIN IMMEDIATE");
+		dstDb.prepare("DELETE FROM steps").run();
+		dstDb.prepare("DELETE FROM parent_references").run();
+		const hasBattleTable = dstDb
+			.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'battle_mode_infos'")
+			.get();
+		if (hasBattleTable) {
+			dstDb.prepare("DELETE FROM battle_mode_infos").run();
+		}
+		dstDb.prepare("DELETE FROM gen_metadata").run();
+		dstDb.prepare("DELETE FROM executor_metadata").run();
+		dstDb
+			.prepare("UPDATE trajectory_meta SET trajectory_id = ?, cascade_id = ?")
+			.run(clonedSessionId, clonedSessionId);
+		rewriteMetadataBlobUuids(
+			dstDb,
+			[templateSessionId, origMeta?.trajectory_id],
+			clonedSessionId,
+		);
+
+		const insertStep = dstDb.prepare(
+			"INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload, step_format) VALUES (?, ?, ?, 0, ?, 0)",
+		);
+		let idx = 0;
+		for (const turn of turns) {
+			insertStep.run(
+				idx++,
+				CORTEX_STEP_TYPE_USER_INPUT,
+				CORTEX_STEP_STATUS_DONE,
+				encodeUserInputStepPayload(turn.userText),
+			);
+			insertStep.run(
+				idx++,
+				CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+				CORTEX_STEP_STATUS_DONE,
+				encodePlannerResponseStepPayload(turn.assistantAckText),
+			);
+		}
+		dstDb.exec("COMMIT");
+		return clonedSessionId;
+	} catch {
+		try {
+			dstDb?.exec("ROLLBACK");
+		} catch {
+			// 忽略
+		}
+		cleanupDbFilesSafe(targetDbPath);
+		return undefined;
+	} finally {
+		try {
+			dstDb?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+/**
+ * 新建一个独立 UUID 的 AGY 本地 SQLite 会话数据库，并将超长历史的多个安全分片以
+ * `(USER_INPUT, PLANNER_RESPONSE)` 交替步预注入 `steps` 表（底层最小建库实现；生产路径请优先使用
+ * `cloneTemplateSqliteConversationWithPreload` 以保留 `agy` 原生 `trajectory_metadata_blob` Agent 规格）。
  */
 export async function createPreloadedSqliteConversation(
 	config: BridgeConfig,

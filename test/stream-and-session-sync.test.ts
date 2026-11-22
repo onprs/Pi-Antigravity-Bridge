@@ -16,9 +16,11 @@ import {
 	AGY_SESSION_ANCHOR_CUSTOM_TYPE,
 	appendPreloadedTurnsToSqliteConversation,
 	captureSqliteCheckpoint,
+	cloneTemplateSqliteConversationWithPreload,
 	createPreloadedSqliteConversation,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
+	hasValidAgentMetadataBlob,
 	parseStepMetadataGenerationUsage,
 	parseStepPayloadPlannedToolCount,
 	readCurrentMaxSqliteStepIdx,
@@ -819,6 +821,106 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 					[5, 15],
 				],
 			);
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("cloneTemplateSqliteConversationWithPreload 完整保留模板 trajectory_metadata_blob 中的 pi-bridge 规格并同步替换 UUID，模板缺失元数据时拒绝生成裸库", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-template-preload-"));
+		try {
+			const cfg: BridgeConfig = {
+				...DEFAULT_BRIDGE_CONFIG,
+				geminiDir: path.join(tmpRoot, ".gemini"),
+				enableSqliteFork: true,
+			};
+			const convDir = path.join(cfg.geminiDir, "antigravity-cli", "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+
+			// 1. 构造含 trajectory_metadata_blob（带 pi-bridge 与模板 UUID）的官方模板会话库
+			const templateId = "11111111-2222-4333-8444-555555555555";
+			const origTrajId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+			const templateDbPath = path.join(convDir, `${templateId}.db`);
+			const tmplDb = new DatabaseSync(templateDbPath);
+			tmplDb.exec(`
+				PRAGMA user_version = 1;
+				CREATE TABLE trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
+				CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, has_subtrajectory numeric NOT NULL DEFAULT false, metadata blob, error_details blob, permissions blob, task_details blob, render_info blob, step_payload blob, step_format integer NOT NULL DEFAULT 0);
+				CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
+				CREATE TABLE executor_metadata (idx integer PRIMARY KEY, data blob);
+				CREATE TABLE parent_references (idx integer PRIMARY KEY, data blob);
+				CREATE TABLE trajectory_metadata_blob (id text PRIMARY KEY DEFAULT "main", data blob);
+				CREATE TABLE battle_mode_infos (idx integer PRIMARY KEY, data blob);
+			`);
+			tmplDb
+				.prepare("INSERT INTO trajectory_meta VALUES (?, ?, 4, 17)")
+				.run(origTrajId, templateId);
+			const fakeBlob = Buffer.from(
+				`header\x00pi-bridge\x00Tool execution bridge agent for Pi\x00${templateId}\x00${origTrajId}\x00footer`,
+				"utf8",
+			);
+			tmplDb.prepare("INSERT INTO trajectory_metadata_blob VALUES ('main', ?)").run(fakeBlob);
+			tmplDb.close();
+
+			const clonedId = await cloneTemplateSqliteConversationWithPreload(cfg, templateId, [
+				{ userText: "CLONED_HISTORY_1", assistantAckText: "Ack 1" },
+				{ userText: "CLONED_HISTORY_2", assistantAckText: "Ack 2" },
+			]);
+			assert.ok(clonedId && clonedId !== templateId);
+
+			const clonedDb = new DatabaseSync(path.join(convDir, `${clonedId}.db`), { readOnly: true });
+			const meta = clonedDb.prepare("SELECT * FROM trajectory_meta").get() as {
+				trajectory_id: string;
+				cascade_id: string;
+			};
+			assert.equal(meta.trajectory_id, clonedId);
+			assert.equal(meta.cascade_id, clonedId);
+
+			const blobRow = clonedDb
+				.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+				.get() as { data: Uint8Array };
+			const blobText = Buffer.from(blobRow.data).toString("utf8");
+			assert.equal(blobRow.data.length, fakeBlob.length, "UUID 替换必须保持原位等长以防破坏 Protobuf 编码");
+			assert.ok(blobText.includes("pi-bridge"), "克隆库必须完整保留 pi-bridge Agent 规格");
+			assert.ok(blobText.includes(clonedId), "克隆库元数据中的旧 UUID 应同步替换为新会话 UUID");
+			assert.ok(!blobText.includes(templateId), "克隆库元数据中不应残留模板 UUID");
+			assert.ok(!blobText.includes(origTrajId), "克隆库元数据中不应残留旧 trajectory_id");
+
+			const stepRows = clonedDb
+				.prepare("SELECT idx, step_type FROM steps ORDER BY idx ASC")
+				.all() as Array<{ idx: number; step_type: number }>;
+			clonedDb.close();
+			assert.deepEqual(
+				stepRows.map((r) => [r.idx, r.step_type]),
+				[
+					[0, 14],
+					[1, 15],
+					[2, 14],
+					[3, 15],
+				],
+			);
+
+			// 2. 模板库缺少 trajectory_metadata_blob 时，必须拒绝克隆返回 undefined，绝不生成失去 pi-bridge 约束的裸库
+			const bareId = "99999999-8888-4777-8666-555555555555";
+			const bareDb = new DatabaseSync(path.join(convDir, `${bareId}.db`));
+			bareDb.exec(`
+				CREATE TABLE trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
+				CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer, status integer, step_payload blob);
+				CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob);
+				CREATE TABLE executor_metadata (idx integer PRIMARY KEY, data blob);
+				CREATE TABLE parent_references (idx integer PRIMARY KEY, data blob);
+				CREATE TABLE trajectory_metadata_blob (id text PRIMARY KEY, data blob);
+			`);
+			bareDb.close();
+
+			const rejected = await cloneTemplateSqliteConversationWithPreload(cfg, bareId, [
+				{ userText: "SHOULD_REJECT", assistantAckText: "Ack" },
+			]);
+			assert.equal(rejected, undefined);
+
+			// 3. 历史恢复自愈校验：克隆库应通过 pi-bridge 校验，空元数据裸库应被识别为无效以便自动重建
+			assert.equal(await hasValidAgentMetadataBlob(cfg, clonedId, "pi-bridge"), true);
+			assert.equal(await hasValidAgentMetadataBlob(cfg, bareId, "pi-bridge"), false);
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}

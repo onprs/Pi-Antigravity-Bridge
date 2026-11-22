@@ -13,7 +13,7 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AcpClientConnection, AcpProcessManager } from "../acp/process-manager.ts";
+import { BRIDGE_AGENT_NAME, type AcpClientConnection, type AcpProcessManager } from "../acp/process-manager.ts";
 import type {
 	AcpAvailableModel,
 	AcpConfigOption,
@@ -60,10 +60,11 @@ import {
 	type AgySessionAnchor,
 	appendPreloadedTurnsToSqliteConversation,
 	captureSqliteCheckpoint,
-	createPreloadedSqliteConversation,
+	cloneTemplateSqliteConversationWithPreload,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
 	hasLocalConversationDb,
+	hasValidAgentMetadataBlob,
 	readCurrentMaxSqliteStepIdx,
 	readSqliteGenerationUsagesSince,
 	readSqliteGenerationUsagesSinceWithRetry,
@@ -81,6 +82,7 @@ import {
 	extractVisibleMessages,
 	inspectTrafficOptProjectionState,
 	isAuxiliarySingleTurnRequest,
+	type PreloadedSqliteTurn,
 	type TrafficOptProjectionState,
 } from "./reconcile.ts";
 
@@ -1043,9 +1045,80 @@ export class TurnCoordinator {
 	}
 
 	/**
-	 * 通过 `session/close` + `session/resume`（同 `agySessionId`）原地重拉 `tools/list`，
-	 * 在默认 `processPerSession: true`（无 SSE 通道）下让新解锁工具立即可见且 100% 保留会话历史与热缓存。
+	 * 通过「官方 `session/new` 建空模板 -> `session/close` -> `VACUUM INTO` 克隆新 UUID 并写入预注入步 -> `session/resume`」
+	 * 创建带有完整 `trajectory_metadata_blob`（包含 `pi-bridge` 等 Agent 规格、挂载插件与工作区配置）的多步预注入会话。
+	 * 任意环节失败时立即清理模板与临时副本并返回 `undefined`，由调用方安全降级至单步重放，绝不生成无 Agent 规格的裸库。
 	 */
+	private async createPreloadedSessionFromTemplate(params: {
+		conn: AcpClientConnection;
+		cwd: string;
+		mcpServers: AcpMcpServerSpec[];
+		additionalDirectories?: string[];
+		preloadedTurns: readonly PreloadedSqliteTurn[];
+		signal?: AbortSignal;
+	}): Promise<AcpSessionResumeResult | undefined> {
+		if (
+			params.preloadedTurns.length === 0 ||
+			!this.currentConfig.enableSqliteFork ||
+			!params.conn.capabilities?.sessionCapabilities?.resume
+		) {
+			return undefined;
+		}
+
+		let templateSessionId: string | undefined;
+		let clonedSessionId: string | undefined;
+		try {
+			const templateRes = await params.conn.request<AcpSessionNewResult>(
+				"session/new",
+				{
+					cwd: params.cwd,
+					mcpServers: [],
+					additionalDirectories: params.additionalDirectories,
+				},
+				{ timeoutMs: 20_000, signal: params.signal },
+			);
+			const createdTemplateId = templateRes.sessionId;
+			if (!createdTemplateId) {
+				return undefined;
+			}
+			templateSessionId = createdTemplateId;
+			await params.conn.closeSessionSafe(createdTemplateId);
+
+			clonedSessionId = await cloneTemplateSqliteConversationWithPreload(
+				this.currentConfig,
+				createdTemplateId,
+				params.preloadedTurns,
+				{ signal: params.signal },
+			);
+			if (!clonedSessionId) {
+				return undefined;
+			}
+
+			return await params.conn.request<AcpSessionResumeResult>(
+				"session/resume",
+				{
+					sessionId: clonedSessionId,
+					cwd: params.cwd,
+					mcpServers: params.mcpServers,
+					additionalDirectories: params.additionalDirectories,
+				},
+				{ timeoutMs: 25_000, signal: params.signal },
+			);
+		} catch (error) {
+			if (clonedSessionId) {
+				removeEmptyProbeSessionFiles(this.currentConfig, clonedSessionId);
+			}
+			if (params.signal?.aborted) {
+				throw error;
+			}
+			return undefined;
+		} finally {
+			if (templateSessionId) {
+				removeEmptyProbeSessionFiles(this.currentConfig, templateSessionId);
+			}
+		}
+	}
+
 	/**
 	 * 热会话中遇到单条追问超过单步 64k 安全预算时，严格遵循只读原库原则：
 	 * 通过 `VACUUM INTO` 克隆当前会话快照至新 UUID `.db`，追加前 N-1 个安全文本分片后切换 `session/resume`，
@@ -1749,7 +1822,7 @@ export class TurnCoordinator {
 
 		const priorProjection = inspectTrafficOptProjectionState(priorHistory);
 		const branchEntries = this.activeContext?.sessionManager?.getBranch?.() ?? [];
-		const anchorMatch =
+		let anchorMatch =
 			!params.skipAnchorRestore && priorHistory.length > 0 && pendingUserMessages.length > 0
 				? findBranchAnchorForHistory({
 						branchEntries,
@@ -1758,7 +1831,24 @@ export class TurnCoordinator {
 						mountDigest: params.mountDigest,
 						config: this.currentConfig,
 					})
-				: { kind: "none" as const };
+				: ({ kind: "none" } as const);
+
+		// 自愈校验：若历史锚点指向的本地库缺失 trajectory_metadata_blob 或 pi-bridge 规格（如旧版裸建库），
+		// 跳过直接恢复/分叉，改由路径 3 通过官方模板重建，防止回退启用 Antigravity 原生内置工具与工作流。
+		if (
+			anchorMatch.kind !== "none" &&
+			this.currentConfig.toolMode === "pi-tools" &&
+			!anchorMatch.anchor.importedRaw
+		) {
+			const metadataValid = await hasValidAgentMetadataBlob(
+				this.currentConfig,
+				anchorMatch.anchor.agySessionId,
+				BRIDGE_AGENT_NAME,
+			);
+			if (!metadataValid) {
+				anchorMatch = { kind: "none" };
+			}
+		}
 
 		const addDirs =
 			params.additionalDirectories.length > 0 ? params.additionalDirectories : undefined;
@@ -1918,7 +2008,7 @@ export class TurnCoordinator {
 			}
 		}
 
-		// 路径 3：新建会话并重放历史（超出单步 64k 安全线时优先通过本地新建 SQLite 多步预注入 + session/resume 零额外调用恢复，失败则平滑降级为单步安全重放）
+		// 路径 3：新建会话并重放历史（超出单步 64k 安全线时优先经官方 session/new 模板克隆 + 多步预注入 + session/resume 零额外调用恢复，失败则平滑降级为单步安全重放）
 		if (!sessionInfo || !initialPromptBlocks) {
 			const replayPlan = buildFreshReplayPlan({
 				visibleMessages: params.visibleMessages,
@@ -1926,32 +2016,25 @@ export class TurnCoordinator {
 				maxContextWindowTokens: params.modelContextWindow,
 			});
 
-			if (
-				replayPlan.preloadedTurns.length > 0 &&
-				this.currentConfig.enableSqliteFork &&
-				conn.capabilities?.sessionCapabilities?.resume
-			) {
-				const seededSessionId = await createPreloadedSqliteConversation(
-					this.currentConfig,
-					replayPlan.preloadedTurns,
-				);
-				if (seededSessionId) {
-					try {
-						sessionInfo = await conn.request<AcpSessionResumeResult>(
-							"session/resume",
-							{
-								sessionId: seededSessionId,
-								cwd: params.cwd,
-								mcpServers,
-								additionalDirectories: addDirs,
-							},
-							{ timeoutMs: 25_000, signal: params.signal },
-						);
+			if (replayPlan.preloadedTurns.length > 0) {
+				try {
+					const preloadedRes = await this.createPreloadedSessionFromTemplate({
+						conn,
+						cwd: params.cwd,
+						mcpServers,
+						additionalDirectories: addDirs,
+						preloadedTurns: replayPlan.preloadedTurns,
+						signal: params.signal,
+					});
+					if (preloadedRes) {
+						sessionInfo = preloadedRes;
 						initialPromptBlocks = replayPlan.finalPromptBlocks;
-					} catch {
-						sessionInfo = undefined;
-						removeEmptyProbeSessionFiles(this.currentConfig, seededSessionId);
 					}
+				} catch (error) {
+					if (mcpToken) {
+						this.httpMcpBridge.unregisterSessionBinding(mcpToken);
+					}
+					throw error;
 				}
 			}
 
@@ -2956,31 +3039,14 @@ export class TurnCoordinator {
 		let sessionRes: AcpSessionNewResult | undefined;
 		let promptBlocks: AcpPromptBlock[] = auxPlan.finalPromptBlocks;
 
-		if (
-			auxPlan.preloadedTurns.length > 0 &&
-			this.currentConfig.enableSqliteFork &&
-			conn.capabilities?.sessionCapabilities?.resume
-		) {
-			const seededId = await createPreloadedSqliteConversation(
-				this.currentConfig,
-				auxPlan.preloadedTurns,
-			);
-			if (seededId) {
-				try {
-					sessionRes = await conn.request<AcpSessionResumeResult>(
-						"session/resume",
-						{
-							sessionId: seededId,
-							cwd,
-							mcpServers: [],
-						},
-						{ timeoutMs: 25_000, signal: options?.signal },
-					);
-				} catch {
-					sessionRes = undefined;
-					removeEmptyProbeSessionFiles(this.currentConfig, seededId);
-				}
-			}
+		if (auxPlan.preloadedTurns.length > 0) {
+			sessionRes = await this.createPreloadedSessionFromTemplate({
+				conn,
+				cwd,
+				mcpServers: [],
+				preloadedTurns: auxPlan.preloadedTurns,
+				signal: options?.signal,
+			});
 		}
 
 		if (!sessionRes) {
