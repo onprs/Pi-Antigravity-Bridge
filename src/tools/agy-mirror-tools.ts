@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import type { ImageContent, JsonObject, TextContent } from "@earendil-works/pi-ai";
 import {
 	defineTool,
@@ -31,6 +32,7 @@ const MirrorToolParamsSchema = Type.Object(
 		kind: Type.Optional(Type.String()),
 		path: Type.Optional(Type.String()),
 		line: Type.Optional(Type.Number()),
+		limit: Type.Optional(Type.Number()),
 		command: Type.Optional(Type.String()),
 		query: Type.Optional(Type.String()),
 		agentRole: Type.Optional(Type.String()),
@@ -64,6 +66,40 @@ function pickFirstString(
 	return undefined;
 }
 
+function pickFirstPositiveInt(
+	obj: Record<string, unknown> | undefined,
+	keys: readonly string[],
+): number | undefined {
+	if (!obj) return undefined;
+	for (const k of keys) {
+		const v = obj[k];
+		if (typeof v === "number" && Number.isSafeInteger(v) && v >= 1) {
+			return v;
+		}
+		if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+			const parsed = Number.parseInt(v.trim(), 10);
+			if (Number.isSafeInteger(parsed) && parsed >= 1) {
+				return parsed;
+			}
+		}
+	}
+	return undefined;
+}
+
+function normalizeMirrorFilePath(rawPath: string | undefined): string | undefined {
+	if (!rawPath) return undefined;
+	const trimmed = rawPath.trim();
+	if (!trimmed) return undefined;
+	if (/^file:\/\//i.test(trimmed)) {
+		try {
+			return fileURLToPath(trimmed);
+		} catch {
+			return trimmed;
+		}
+	}
+	return trimmed;
+}
+
 /**
  * 将 AGY 原生 `tool_call` 事件智能归类为对应的 Pi 语义镜像工具与展示参数。
  */
@@ -79,11 +115,23 @@ export function classifyAgyToolCall(input: {
 	const lowerTitle = title.toLowerCase();
 	const kind = (input.kind ?? "").toLowerCase();
 
-	const locPath = input.locations?.[0]?.path;
-	const locLine = input.locations?.[0]?.line;
+	const locPath = normalizeMirrorFilePath(input.locations?.[0]?.path);
+	const locLine =
+		typeof input.locations?.[0]?.line === "number" &&
+		Number.isSafeInteger(input.locations[0].line) &&
+		input.locations[0].line >= 1
+			? input.locations[0].line
+			: pickFirstPositiveInt(rawObj, ["StartLine", "start_line", "startLine", "offset", "line"]);
+	const explicitLimit = pickFirstPositiveInt(rawObj, ["limit", "Limit", "num_lines", "NumLines"]);
+	const endLine = pickFirstPositiveInt(rawObj, ["EndLine", "end_line", "endLine"]);
+	const lineLimit =
+		explicitLimit ??
+		(endLine !== undefined && endLine >= (locLine ?? 1) ? endLine - (locLine ?? 1) + 1 : undefined);
 	const filePath =
 		locPath ||
-		pickFirstString(rawObj, ["Path", "path", "TargetFile", "AbsolutePath", "file_path", "uri"]);
+		normalizeMirrorFilePath(
+			pickFirstString(rawObj, ["Path", "path", "TargetFile", "AbsolutePath", "file_path", "uri"]),
+		);
 	const command = pickFirstString(rawObj, ["CommandLine", "command", "cmd"]);
 	const query = pickFirstString(rawObj, ["Query", "query", "Pattern", "pattern", "SearchPath"]);
 	// 仅匹配明确的子代理专属字段，避免普通工具的通用 name / Description 字段误触发 agy_subagent
@@ -131,6 +179,7 @@ export function classifyAgyToolCall(input: {
 	if (input.kind) args.kind = input.kind;
 	if (filePath) args.path = filePath;
 	if (typeof locLine === "number") args.line = locLine;
+	if (mirrorToolName === "agy_read" && typeof lineLimit === "number") args.limit = lineLimit;
 	if (command) args.command = command;
 	if (query) args.query = query;
 	if (agentRole) args.agentRole = agentRole;
@@ -148,6 +197,7 @@ interface TrackedMirrorCallState {
 	kind?: string;
 	path?: string;
 	line?: number;
+	limit?: number;
 	command?: string;
 	query?: string;
 	agentRole?: string;
@@ -183,7 +233,7 @@ function mergeContentItems(
 			}
 		} else if (item.type === "diff") {
 			diffs.push({
-				path: item.path,
+				path: normalizeMirrorFilePath(item.path) ?? item.path,
 				oldText: item.oldText ?? "",
 				newText: item.newText,
 			});
@@ -241,6 +291,8 @@ export class AgyTurnMirrorBroker {
 				kind: payload.kind,
 				path: typeof classified.arguments.path === "string" ? classified.arguments.path : undefined,
 				line: typeof classified.arguments.line === "number" ? classified.arguments.line : undefined,
+				limit:
+					typeof classified.arguments.limit === "number" ? classified.arguments.limit : undefined,
 				command:
 					typeof classified.arguments.command === "string"
 						? classified.arguments.command
@@ -262,13 +314,18 @@ export class AgyTurnMirrorBroker {
 			if (payload.title) state.title = payload.title;
 			if (payload.kind) state.kind = payload.kind;
 			if (payload.status) state.status = payload.status;
-			if (payload.locations?.[0]?.path) state.path = payload.locations[0].path;
+			if (payload.locations?.[0]?.path) {
+				state.path = normalizeMirrorFilePath(payload.locations[0].path);
+			}
 			if (typeof payload.locations?.[0]?.line === "number") state.line = payload.locations[0].line;
 			if (typeof classified.arguments.path === "string" && !state.path) {
 				state.path = classified.arguments.path;
 			}
 			if (typeof classified.arguments.line === "number" && state.line === undefined) {
 				state.line = classified.arguments.line;
+			}
+			if (typeof classified.arguments.limit === "number" && state.limit === undefined) {
+				state.limit = classified.arguments.limit;
 			}
 			if (typeof classified.arguments.command === "string") {
 				state.command = classified.arguments.command;
@@ -571,6 +628,7 @@ export class AgyTurnMirrorBroker {
 				title: state.title,
 				path: state.path,
 				line: state.line,
+				limit: state.limit,
 				command: state.command,
 				query: state.query,
 				agentRole: state.agentRole,

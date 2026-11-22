@@ -36,6 +36,7 @@ export interface AgyMirrorToolDetails {
 	title?: string;
 	path?: string;
 	line?: number;
+	limit?: number;
 	command?: string;
 	query?: string;
 	agentRole?: string;

@@ -159,8 +159,6 @@ interface ActiveTurnPump {
 	pendingAnnouncedMcpCount: number;
 	/** 已向 Pi 推理流发出的宿主 MCP `callId` 集合，防止误结算仍在队列中待消费的后续工具请求 */
 	readonly emittedMcpCallIds: Set<string>;
-	/** 运行中排队进入的转向用户消息，在工具结果结算或本轮 `prompt_done` 收口时安全串行投递 */
-	readonly pendingSteeringUsers: UserMessage[];
 }
 
 interface PendingGenSlicePool {
@@ -190,6 +188,10 @@ interface ManagedSessionLedger {
 	appliedModelValue?: string;
 	appliedThoughtLevel?: string;
 	appliedExecMode?: string;
+	/** 最近一次在此会话上执行请求的 Pi 模型 ID（防止切换模型后旧会话迟到 usage_update 污染新模型窗口） */
+	lastSelectedModelId?: string;
+	/** 本次随 SQLite 多步预注入一起写入、尚未在下一条 `session/prompt` 的 `onPayload` 中通告的分片列表 */
+	pendingPreloadedTurns?: readonly PreloadedSqliteTurn[];
 	syncedMessageCount: number;
 	syncedTranscriptDigest: string;
 	/** 当前 AGY 会话实际承载的 `pi-traffic-optimization` 归档投影指纹与计数 */
@@ -241,7 +243,7 @@ function shouldRebuildForProjectionSync(
 		if (typeof usedTokens === "number" && usedTokens >= 32_000) return true;
 		return false;
 	}
-	if (syncedCount > 0 && current.archivedCount === 0) {
+	if (syncedCount > 0 && current.archivedCount < syncedCount) {
 		return true;
 	}
 	return false;
@@ -409,6 +411,7 @@ export class TurnCoordinator {
 						projectedCount: ledger.syncedProjectedCount,
 					}
 				: {}),
+			...(typeof ledger.usedTokens === "number" ? { usedTokens: ledger.usedTokens } : {}),
 			dbCheckpoint,
 		};
 
@@ -634,8 +637,17 @@ export class TurnCoordinator {
 			if (typeof update.size === "number") {
 				ledger.windowSize = update.size;
 				const activeModel = this.activeContext?.model;
-				if (activeModel && activeModel.provider === ANTIGRAVITY_PROVIDER_ID) {
-					recordObservedContextWindow(activeModel.id, update.size);
+				const targetModelId =
+					ledger.lastSelectedModelId ??
+					(activeModel?.provider === ANTIGRAVITY_PROVIDER_ID ? activeModel.id : undefined);
+				if (targetModelId) {
+					recordObservedContextWindow(targetModelId, update.size);
+				}
+				if (
+					activeModel &&
+					activeModel.provider === ANTIGRAVITY_PROVIDER_ID &&
+					(!ledger.lastSelectedModelId || activeModel.id === ledger.lastSelectedModelId)
+				) {
 					activeModel.contextWindow = update.size;
 				}
 			}
@@ -1209,6 +1221,7 @@ export class TurnCoordinator {
 				this.currentConfig,
 				resumed.sessionId,
 			);
+			ledger.pendingPreloadedTurns = plan.preloadedTurns;
 			return plan.finalPromptBlocks;
 		} catch {
 			removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
@@ -1537,15 +1550,34 @@ export class TurnCoordinator {
 			ledger.steeringCutInPending = true;
 		}
 
+		const settledMcpIds: string[] = [];
 		for (const [callId, parked] of entriesToSettle) {
 			const tr = recentToolResults.get(callId);
 			ledger.parkedCalls.delete(callId);
 			pump.emittedMcpCallIds.delete(callId);
+			settledMcpIds.push(callId);
 
 			parked.settle({
 				content: tr ? [...tr.content] : [{ type: "text", text: "(tool call skipped)" }],
 				isError: tr ? tr.isError : true,
 			});
+		}
+
+		if (options?.onResponse && settledMcpIds.length > 0) {
+			const currentProjection = inspectTrafficOptProjectionState(visibleMessages);
+			await options.onResponse(
+				{
+					status: 200,
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-transport": "acp-mcp-result",
+						"x-acp-settled-mcp-ids": settledMcpIds.join(","),
+						"x-acp-projection-synced":
+							currentProjection.projectionDigest === ledger.syncedProjectionDigest ? "1" : "0",
+					},
+				},
+				model,
+			);
 		}
 
 		// 若用户在工具执行期间按 Enter 发送了转向消息（steer）：
@@ -1798,99 +1830,201 @@ export class TurnCoordinator {
 			});
 		}
 
-		mcpServers.push(
-			...(await this.buildSessionMcpServersSpec({
-				mcpToken,
-				useHttpMcp,
-				cwd: params.cwd,
-				isProjectTrusted: params.isProjectTrusted,
-			})),
-		);
-
-		// 拆分前序历史与末尾待发送的新增用户消息，尝试沿会话分支查找锚点恢复
-		let tailStartIdx = params.visibleMessages.length;
-		while (
-			tailStartIdx > 0 &&
-			params.visibleMessages[tailStartIdx - 1].role === "user"
-		) {
-			tailStartIdx--;
-		}
-		const priorHistory = params.visibleMessages.slice(0, tailStartIdx);
-		const pendingUserMessages = params.visibleMessages
-			.slice(tailStartIdx)
-			.filter((m): m is UserMessage => m.role === "user");
-
-		const priorProjection = inspectTrafficOptProjectionState(priorHistory);
-		const branchEntries = this.activeContext?.sessionManager?.getBranch?.() ?? [];
-		let anchorMatch =
-			!params.skipAnchorRestore && priorHistory.length > 0 && pendingUserMessages.length > 0
-				? findBranchAnchorForHistory({
-						branchEntries,
-						priorMessages: priorHistory,
-						toolMode: this.currentConfig.toolMode,
-						mountDigest: params.mountDigest,
-						config: this.currentConfig,
-					})
-				: ({ kind: "none" } as const);
-
-		// 自愈校验：若历史锚点指向的本地库缺失 trajectory_metadata_blob 或 pi-bridge 规格（如旧版裸建库），
-		// 跳过直接恢复/分叉，改由路径 3 通过官方模板重建，防止回退启用 Antigravity 原生内置工具与工作流。
-		if (
-			anchorMatch.kind !== "none" &&
-			this.currentConfig.toolMode === "pi-tools" &&
-			!anchorMatch.anchor.importedRaw
-		) {
-			const metadataValid = await hasValidAgentMetadataBlob(
-				this.currentConfig,
-				anchorMatch.anchor.agySessionId,
-				BRIDGE_AGENT_NAME,
+		let boundToLedger = false;
+		try {
+			mcpServers.push(
+				...(await this.buildSessionMcpServersSpec({
+					mcpToken,
+					useHttpMcp,
+					cwd: params.cwd,
+					isProjectTrusted: params.isProjectTrusted,
+				})),
 			);
-			if (!metadataValid) {
-				anchorMatch = { kind: "none" };
-			}
-		}
 
-		const addDirs =
-			params.additionalDirectories.length > 0 ? params.additionalDirectories : undefined;
-
-		let sessionInfo: AcpSessionNewResult | undefined;
-		let initialPromptBlocks: AcpPromptBlock[] | undefined;
-		let syncedProjectionDigest = priorProjection.projectionDigest;
-		let syncedProjectedCount = priorProjection.archivedCount;
-
-		// 路径 1：精确命中分支末尾锚点且未发生需同步的新一轮归档 GC -> 调用 session/resume 零历史回放开销恢复
-		if (
-			anchorMatch.kind === "exact" &&
-			conn.capabilities?.sessionCapabilities?.resume &&
-			!shouldRebuildForProjectionSync(
-				anchorMatch.anchor.projectionDigest ?? "",
-				anchorMatch.anchor.projectedCount ?? 0,
-				priorProjection,
-			)
-		) {
-			const pendingBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
-			const pendingPlan = buildPromptBlocksPreloadPlan(pendingBlocks, {
-				segmentLabel: "user-message-part",
-			});
-
-			// 若本轮单条新提问本身超过单步 64k 安全线，先只读分叉并预注入前序分片，再恢复分叉会话仅发最后一片
-			if (
-				pendingPlan.preloadedTurns.length > 0 &&
-				this.currentConfig.enableSqliteFork &&
-				anchorMatch.anchor.dbCheckpoint
+			// 拆分前序历史与末尾待发送的新增用户消息，尝试沿会话分支查找锚点恢复
+			let tailStartIdx = params.visibleMessages.length;
+			while (
+				tailStartIdx > 0 &&
+				params.visibleMessages[tailStartIdx - 1].role === "user"
 			) {
-				const forkedId = await forkSqliteConversationAtCheckpoint(
+				tailStartIdx--;
+			}
+			const priorHistory = params.visibleMessages.slice(0, tailStartIdx);
+			const pendingUserMessages = params.visibleMessages
+				.slice(tailStartIdx)
+				.filter((m): m is UserMessage => m.role === "user");
+
+			const priorProjection = inspectTrafficOptProjectionState(priorHistory);
+			const branchEntries = this.activeContext?.sessionManager?.getBranch?.() ?? [];
+			let anchorMatch =
+				!params.skipAnchorRestore && priorHistory.length > 0 && pendingUserMessages.length > 0
+					? findBranchAnchorForHistory({
+							branchEntries,
+							priorMessages: priorHistory,
+							toolMode: this.currentConfig.toolMode,
+							mountDigest: params.mountDigest,
+							config: this.currentConfig,
+						})
+					: ({ kind: "none" } as const);
+
+			// 自愈校验：若历史锚点指向的本地库缺失 trajectory_metadata_blob（以及 pi-tools 模式下的 pi-bridge 规格），
+			// 跳过直接恢复/分叉，改由路径 3 通过官方模板重建，防止回退或加载受损裸库。
+			if (anchorMatch.kind !== "none" && !anchorMatch.anchor.importedRaw) {
+				const requiredAgent =
+					this.currentConfig.toolMode === "pi-tools" ? BRIDGE_AGENT_NAME : undefined;
+				const metadataValid = await hasValidAgentMetadataBlob(
 					this.currentConfig,
 					anchorMatch.anchor.agySessionId,
-					anchorMatch.anchor.dbCheckpoint,
+					requiredAgent,
 				);
-				if (forkedId) {
-					const appended = await appendPreloadedTurnsToSqliteConversation(
+				if (!metadataValid) {
+					anchorMatch = { kind: "none" };
+				}
+			}
+
+			const addDirs =
+				params.additionalDirectories.length > 0 ? params.additionalDirectories : undefined;
+
+			let sessionInfo: AcpSessionNewResult | undefined;
+			let initialPromptBlocks: AcpPromptBlock[] | undefined;
+			let appliedPreloadedTurns: readonly PreloadedSqliteTurn[] | undefined;
+			let syncedProjectionDigest = priorProjection.projectionDigest;
+			let syncedProjectedCount = priorProjection.archivedCount;
+
+			// 路径 1：精确命中分支末尾锚点且未发生需同步的新一轮归档 GC -> 调用 session/resume 零历史回放开销恢复
+			if (
+				anchorMatch.kind === "exact" &&
+				conn.capabilities?.sessionCapabilities?.resume &&
+				!shouldRebuildForProjectionSync(
+					anchorMatch.anchor.projectionDigest ?? "",
+					anchorMatch.anchor.projectedCount ?? 0,
+					priorProjection,
+					anchorMatch.anchor.usedTokens,
+				)
+			) {
+				const pendingBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
+				const pendingPlan = buildPromptBlocksPreloadPlan(pendingBlocks, {
+					segmentLabel: "user-message-part",
+				});
+
+				// 若本轮单条新提问本身超过单步 64k 安全线，先只读分叉并预注入前序分片，再恢复分叉会话仅发最后一片
+				if (
+					!params.signal?.aborted &&
+					pendingPlan.preloadedTurns.length > 0 &&
+					this.currentConfig.enableSqliteFork &&
+					anchorMatch.anchor.dbCheckpoint
+				) {
+					const forkedId = await forkSqliteConversationAtCheckpoint(
 						this.currentConfig,
-						forkedId,
-						pendingPlan.preloadedTurns,
+						anchorMatch.anchor.agySessionId,
+						anchorMatch.anchor.dbCheckpoint,
 					);
-					if (appended) {
+					if (forkedId) {
+						const appended = await appendPreloadedTurnsToSqliteConversation(
+							this.currentConfig,
+							forkedId,
+							pendingPlan.preloadedTurns,
+						);
+						if (appended) {
+							try {
+								sessionInfo = await conn.request<AcpSessionResumeResult>(
+									"session/resume",
+									{
+										sessionId: forkedId,
+										cwd: params.cwd,
+										mcpServers,
+										additionalDirectories: addDirs,
+									},
+									{ timeoutMs: 25_000, signal: params.signal },
+								);
+								initialPromptBlocks = pendingPlan.finalPromptBlocks;
+								appliedPreloadedTurns = pendingPlan.preloadedTurns;
+								syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+								syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+							} catch (error) {
+								sessionInfo = undefined;
+								removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+								if (params.signal?.aborted) {
+									throw error;
+								}
+							}
+						} else {
+							removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+						}
+					}
+				}
+
+				if (!sessionInfo && !params.signal?.aborted && pendingPlan.preloadedTurns.length === 0) {
+					try {
+						sessionInfo = await conn.request<AcpSessionResumeResult>(
+							"session/resume",
+							{
+								sessionId: anchorMatch.anchor.agySessionId,
+								cwd: params.cwd,
+								mcpServers,
+								additionalDirectories: addDirs,
+							},
+							{ timeoutMs: 20_000, signal: params.signal },
+						);
+						initialPromptBlocks = pendingPlan.finalPromptBlocks;
+						syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+						syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+					} catch (error) {
+						sessionInfo = undefined;
+						if (params.signal?.aborted) {
+							throw error;
+						}
+					}
+				}
+			}
+
+			// 路径 2：命中历史中间锚点且锚点前缀未落后于新一轮归档 GC -> 只读 VACUUM INTO 快照分叉截断 + 按需预注入超长增量 + session/resume
+			if (
+				!sessionInfo &&
+				!params.signal?.aborted &&
+				anchorMatch.kind === "forkable" &&
+				anchorMatch.anchor.dbCheckpoint &&
+				conn.capabilities?.sessionCapabilities?.resume
+			) {
+				const forkPrefixProjection = inspectTrafficOptProjectionState(
+					priorHistory.slice(0, anchorMatch.anchor.messageCount),
+				);
+				const forkStaleByProjection = shouldRebuildForProjectionSync(
+					anchorMatch.anchor.projectionDigest ?? "",
+					anchorMatch.anchor.projectedCount ?? 0,
+					forkPrefixProjection,
+					anchorMatch.anchor.usedTokens,
+				);
+				if (!forkStaleByProjection) {
+					const forkedId = await forkSqliteConversationAtCheckpoint(
+						this.currentConfig,
+						anchorMatch.anchor.agySessionId,
+						anchorMatch.anchor.dbCheckpoint,
+					);
+					if (forkedId) {
+						const remainingAfterFork = params.visibleMessages.slice(
+							anchorMatch.anchor.messageCount,
+						);
+						const forkPlan = buildFreshReplayPlan({
+							visibleMessages: remainingAfterFork,
+							maxContextWindowTokens: params.modelContextWindow,
+						});
+
+						let forkPromptBlocks = forkPlan.finalPromptBlocks;
+						let forkUsedPreload = false;
+						if (forkPlan.preloadedTurns.length > 0) {
+							const appended = await appendPreloadedTurnsToSqliteConversation(
+								this.currentConfig,
+								forkedId,
+								forkPlan.preloadedTurns,
+							);
+							if (appended) {
+								forkUsedPreload = true;
+							} else {
+								forkPromptBlocks = forkPlan.singleStepFallbackBlocks;
+							}
+						}
+
 						try {
 							sessionInfo = await conn.request<AcpSessionResumeResult>(
 								"session/resume",
@@ -1902,122 +2036,44 @@ export class TurnCoordinator {
 								},
 								{ timeoutMs: 25_000, signal: params.signal },
 							);
-							initialPromptBlocks = pendingPlan.finalPromptBlocks;
-							syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
-							syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
-						} catch {
+							initialPromptBlocks = forkPromptBlocks;
+							if (forkUsedPreload) {
+								appliedPreloadedTurns = forkPlan.preloadedTurns;
+							}
+							if (
+								forkPrefixProjection.projectionDigest ===
+								(anchorMatch.anchor.projectionDigest ?? "")
+							) {
+								syncedProjectionDigest = priorProjection.projectionDigest;
+								syncedProjectedCount = priorProjection.archivedCount;
+							} else {
+								syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+								syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+							}
+						} catch (error) {
 							sessionInfo = undefined;
 							removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+							if (params.signal?.aborted) {
+								throw error;
+							}
 						}
-					} else {
-						removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
 					}
 				}
 			}
 
-			if (!sessionInfo && pendingPlan.preloadedTurns.length === 0) {
-				try {
-					sessionInfo = await conn.request<AcpSessionResumeResult>(
-						"session/resume",
-						{
-							sessionId: anchorMatch.anchor.agySessionId,
-							cwd: params.cwd,
-							mcpServers,
-							additionalDirectories: addDirs,
-						},
-						{ timeoutMs: 20_000, signal: params.signal },
-					);
-					initialPromptBlocks = pendingPlan.finalPromptBlocks;
-					syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
-					syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
-				} catch {
-					sessionInfo = undefined;
-				}
+			if (params.signal?.aborted) {
+				throw new Error("Request aborted by user");
 			}
-		}
 
-		// 路径 2：命中历史中间锚点且锚点前缀未落后于新一轮归档 GC -> 只读 VACUUM INTO 快照分叉截断 + 按需预注入超长增量 + session/resume
-		if (
-			!sessionInfo &&
-			anchorMatch.kind === "forkable" &&
-			anchorMatch.anchor.dbCheckpoint &&
-			conn.capabilities?.sessionCapabilities?.resume
-		) {
-			const forkPrefixProjection = inspectTrafficOptProjectionState(
-				priorHistory.slice(0, anchorMatch.anchor.messageCount),
-			);
-			const forkStaleByProjection = shouldRebuildForProjectionSync(
-				anchorMatch.anchor.projectionDigest ?? "",
-				anchorMatch.anchor.projectedCount ?? 0,
-				forkPrefixProjection,
-			);
-			if (!forkStaleByProjection) {
-				const forkedId = await forkSqliteConversationAtCheckpoint(
-					this.currentConfig,
-					anchorMatch.anchor.agySessionId,
-					anchorMatch.anchor.dbCheckpoint,
-				);
-				if (forkedId) {
-					const remainingAfterFork = params.visibleMessages.slice(
-						anchorMatch.anchor.messageCount,
-					);
-					const forkPlan = buildFreshReplayPlan({
-						visibleMessages: remainingAfterFork,
-						maxContextWindowTokens: params.modelContextWindow,
-					});
+			// 路径 3：新建会话并重放历史（超出单步 64k 安全线时优先经官方 session/new 模板克隆 + 多步预注入 + session/resume 零额外调用恢复，失败则平滑降级为单步安全重放）
+			if (!sessionInfo || !initialPromptBlocks) {
+				const replayPlan = buildFreshReplayPlan({
+					visibleMessages: params.visibleMessages,
+					workspaceContextBlock: params.workspaceContextBlock,
+					maxContextWindowTokens: params.modelContextWindow,
+				});
 
-					let forkPromptBlocks = forkPlan.finalPromptBlocks;
-					if (forkPlan.preloadedTurns.length > 0) {
-						const appended = await appendPreloadedTurnsToSqliteConversation(
-							this.currentConfig,
-							forkedId,
-							forkPlan.preloadedTurns,
-						);
-						if (!appended) {
-							forkPromptBlocks = forkPlan.singleStepFallbackBlocks;
-						}
-					}
-
-					try {
-						sessionInfo = await conn.request<AcpSessionResumeResult>(
-							"session/resume",
-							{
-								sessionId: forkedId,
-								cwd: params.cwd,
-								mcpServers,
-								additionalDirectories: addDirs,
-							},
-							{ timeoutMs: 25_000, signal: params.signal },
-						);
-						initialPromptBlocks = forkPromptBlocks;
-						if (
-							forkPrefixProjection.projectionDigest ===
-							(anchorMatch.anchor.projectionDigest ?? "")
-						) {
-							syncedProjectionDigest = priorProjection.projectionDigest;
-							syncedProjectedCount = priorProjection.archivedCount;
-						} else {
-							syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
-							syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
-						}
-					} catch {
-						sessionInfo = undefined;
-						removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
-					}
-				}
-			}
-		}
-
-		// 路径 3：新建会话并重放历史（超出单步 64k 安全线时优先经官方 session/new 模板克隆 + 多步预注入 + session/resume 零额外调用恢复，失败则平滑降级为单步安全重放）
-		if (!sessionInfo || !initialPromptBlocks) {
-			const replayPlan = buildFreshReplayPlan({
-				visibleMessages: params.visibleMessages,
-				workspaceContextBlock: params.workspaceContextBlock,
-				maxContextWindowTokens: params.modelContextWindow,
-			});
-
-			if (replayPlan.preloadedTurns.length > 0) {
-				try {
+				if (replayPlan.preloadedTurns.length > 0) {
 					const preloadedRes = await this.createPreloadedSessionFromTemplate({
 						conn,
 						cwd: params.cwd,
@@ -2029,17 +2085,11 @@ export class TurnCoordinator {
 					if (preloadedRes) {
 						sessionInfo = preloadedRes;
 						initialPromptBlocks = replayPlan.finalPromptBlocks;
+						appliedPreloadedTurns = replayPlan.preloadedTurns;
 					}
-				} catch (error) {
-					if (mcpToken) {
-						this.httpMcpBridge.unregisterSessionBinding(mcpToken);
-					}
-					throw error;
 				}
-			}
 
-			if (!sessionInfo || !initialPromptBlocks) {
-				try {
+				if (!sessionInfo || !initialPromptBlocks) {
 					sessionInfo = await conn.request<AcpSessionNewResult>(
 						"session/new",
 						{
@@ -2049,73 +2099,74 @@ export class TurnCoordinator {
 						},
 						{ timeoutMs: 25_000, signal: params.signal },
 					);
-				} catch (error) {
-					if (mcpToken) {
-						this.httpMcpBridge.unregisterSessionBinding(mcpToken);
-					}
-					throw error;
+					initialPromptBlocks =
+						replayPlan.preloadedTurns.length > 0
+							? replayPlan.singleStepFallbackBlocks
+							: replayPlan.finalPromptBlocks;
 				}
-				initialPromptBlocks =
-					replayPlan.preloadedTurns.length > 0
-						? replayPlan.singleStepFallbackBlocks
-						: replayPlan.finalPromptBlocks;
+
+				syncedProjectionDigest = priorProjection.projectionDigest;
+				syncedProjectedCount = priorProjection.archivedCount;
 			}
 
-			syncedProjectionDigest = priorProjection.projectionDigest;
-			syncedProjectedCount = priorProjection.archivedCount;
+			conn.trackSession(sessionInfo.sessionId);
+			if (mcpToken) {
+				this.httpMcpBridge.updateBindingSessionId(mcpToken, sessionInfo.sessionId);
+			}
+
+			const tier = sessionInfo._meta?.antigravity?.tier;
+			if (tier) {
+				this.latestTier = tier;
+			}
+
+			const initialMaxStepIdx = await readCurrentMaxSqliteStepIdx(
+				this.currentConfig,
+				sessionInfo.sessionId,
+			);
+
+			const ledger: ManagedSessionLedger = Object.assign(ledgerDraft, {
+				piSessionKey: params.piSessionKey,
+				agySessionId: sessionInfo.sessionId,
+				conn,
+				cwd: params.cwd,
+				isProjectTrusted: params.isProjectTrusted,
+				additionalDirectories: [...params.additionalDirectories],
+				useHttpMcp,
+				mcpToken,
+				hostMcpTools: params.hostMcpTools,
+				toolsDigest: params.toolsDigest,
+				mountDigest: params.mountDigest,
+				toolMode: this.currentConfig.toolMode,
+				configOptions: sessionInfo.configOptions ?? [],
+				availableModels: sessionInfo.models?.availableModels ?? [],
+				pendingPreloadedTurns: appliedPreloadedTurns,
+				syncedMessageCount: priorHistory.length,
+				syncedTranscriptDigest: computeTranscriptDigest(priorHistory),
+				syncedProjectionDigest,
+				syncedProjectedCount,
+				cachedPrefixTokens: 0,
+				lastConsumedStepIdx: initialMaxStepIdx,
+				tier,
+				parkedCalls: ledgerDraft.parkedCalls!,
+				detachedCallIds: ledgerDraft.detachedCallIds!,
+				hostMcpAnnouncementIds: new Set<string>(),
+			});
+
+			this.ledgers.set(params.piSessionKey, ledger);
+			this.ledgersByAgyId.set(sessionInfo.sessionId, ledger);
+			boundToLedger = true;
+			updateAntigravityStatusBar(
+				this.activeContext,
+				this.currentConfig,
+				this.getTelemetrySnapshot(params.piSessionKey),
+			);
+
+			return { ledger, initialPromptBlocks };
+		} finally {
+			if (!boundToLedger && mcpToken) {
+				this.httpMcpBridge.unregisterSessionBinding(mcpToken);
+			}
 		}
-
-		conn.trackSession(sessionInfo.sessionId);
-		if (mcpToken) {
-			this.httpMcpBridge.updateBindingSessionId(mcpToken, sessionInfo.sessionId);
-		}
-
-		const tier = sessionInfo._meta?.antigravity?.tier;
-		if (tier) {
-			this.latestTier = tier;
-		}
-
-		const initialMaxStepIdx = await readCurrentMaxSqliteStepIdx(
-			this.currentConfig,
-			sessionInfo.sessionId,
-		);
-
-		const ledger: ManagedSessionLedger = Object.assign(ledgerDraft, {
-			piSessionKey: params.piSessionKey,
-			agySessionId: sessionInfo.sessionId,
-			conn,
-			cwd: params.cwd,
-			isProjectTrusted: params.isProjectTrusted,
-			additionalDirectories: [...params.additionalDirectories],
-			useHttpMcp,
-			mcpToken,
-			hostMcpTools: params.hostMcpTools,
-			toolsDigest: params.toolsDigest,
-			mountDigest: params.mountDigest,
-			toolMode: this.currentConfig.toolMode,
-			configOptions: sessionInfo.configOptions ?? [],
-			availableModels: sessionInfo.models?.availableModels ?? [],
-			syncedMessageCount: priorHistory.length,
-			syncedTranscriptDigest: computeTranscriptDigest(priorHistory),
-			syncedProjectionDigest,
-			syncedProjectedCount,
-			cachedPrefixTokens: 0,
-			lastConsumedStepIdx: initialMaxStepIdx,
-			tier,
-			parkedCalls: ledgerDraft.parkedCalls!,
-			detachedCallIds: ledgerDraft.detachedCallIds!,
-			hostMcpAnnouncementIds: new Set<string>(),
-		});
-
-		this.ledgers.set(params.piSessionKey, ledger);
-		this.ledgersByAgyId.set(sessionInfo.sessionId, ledger);
-		updateAntigravityStatusBar(
-			this.activeContext,
-			this.currentConfig,
-			this.getTelemetrySnapshot(params.piSessionKey),
-		);
-
-		return { ledger, initialPromptBlocks };
 	}
 
 	private async syncSessionModelAndMode(
@@ -2255,12 +2306,21 @@ export class TurnCoordinator {
 		model: Model<Api>,
 		options?: SimpleStreamOptions,
 	): Promise<void> {
-		await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+		const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 		if (options?.signal?.aborted) {
 			writer.fail("aborted", "Request aborted by user");
 			return;
 		}
+		if (!idleOk) {
+			await this.discardWedgedLedger(ledger);
+			writer.fail(
+				"error",
+				"Previous Antigravity request did not finish in time; session was reset. Please retry.",
+			);
+			return;
+		}
 
+		ledger.lastSelectedModelId = model.id;
 		await this.syncSessionModelAndMode(ledger, model, options);
 		if (options?.signal?.aborted || writer.isTerminated) {
 			if (!writer.isTerminated) {
@@ -2274,9 +2334,16 @@ export class TurnCoordinator {
 			providerThinkingLevel: ledger.appliedThoughtLevel,
 		});
 
-		let outboundPayload: { sessionId: string; prompt: AcpPromptBlock[] } = {
+		const preloadedTurns = ledger.pendingPreloadedTurns;
+		ledger.pendingPreloadedTurns = undefined;
+		let outboundPayload: {
+			sessionId: string;
+			prompt: AcpPromptBlock[];
+			preloadedTurns?: readonly PreloadedSqliteTurn[];
+		} = {
 			sessionId: ledger.agySessionId,
 			prompt: promptBlocks.length > 0 ? promptBlocks : [{ type: "text", text: "Continue." }],
+			...(preloadedTurns && preloadedTurns.length > 0 ? { preloadedTurns } : {}),
 		};
 
 		if (options?.onPayload) {
@@ -2286,7 +2353,7 @@ export class TurnCoordinator {
 				typeof replaced === "object" &&
 				"prompt" in (replaced as Record<string, unknown>)
 			) {
-				outboundPayload = replaced as { sessionId: string; prompt: AcpPromptBlock[] };
+				outboundPayload = replaced as typeof outboundPayload;
 			}
 		}
 
@@ -2306,16 +2373,24 @@ export class TurnCoordinator {
 			hasSqliteGenTelemetry: false,
 			pendingAnnouncedMcpCount: 0,
 			emittedMcpCallIds: new Set<string>(),
-			pendingSteeringUsers: [],
 		};
 		ledger.activePump = pump;
-		this.startTrackedSessionPrompt(ledger, pump, outboundPayload);
+		this.startTrackedSessionPrompt(ledger, pump, {
+			sessionId: outboundPayload.sessionId,
+			prompt: outboundPayload.prompt,
+		});
 
 		if (options?.onResponse) {
+			const currentProjection = inspectTrafficOptProjectionState(visibleMessagesBeforeAssistant);
+			const isProjectionSynced =
+				currentProjection.projectionDigest === ledger.syncedProjectionDigest;
 			await options.onResponse(
 				{
 					status: 200,
-					headers: { "x-acp-session-id": ledger.agySessionId },
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-projection-synced": isProjectionSynced ? "1" : "0",
+					},
 				},
 				model,
 			);
@@ -2520,42 +2595,6 @@ export class TurnCoordinator {
 					ledger.activePump = undefined;
 					writer.fail("error", "Model refused the request");
 					return;
-				}
-
-				// 若运行中存在排队进入的转向用户消息，在当前轮次完全结束后立即以真实用户身份串行续接下一轮 session/prompt
-				if (
-					pump.pendingSteeringUsers.length > 0 &&
-					!signal?.aborted &&
-					item.response.stopReason !== "cancelled"
-				) {
-					const raw = convertAcpUsageToPiUsage(item.response.usage);
-					const rawPromptTotal = raw.input + raw.cacheRead + raw.cacheWrite;
-					if (
-						rawPromptTotal > 0 &&
-						(pump.intermediateStepCount === 0 || !pump.hasSqliteGenTelemetry)
-					) {
-						ledger.lastObservedCacheRatio = Math.min(
-							1,
-							Math.max(0, raw.cacheRead / rawPromptTotal),
-						);
-					}
-					const steerBlocks = convertUserMessagesToPromptBlocks(
-						pump.pendingSteeringUsers.splice(0),
-					);
-					if (steerBlocks.length > 0) {
-						if (writer.estimatedOutputTokens > 0) {
-							writer.appendTextDelta("\n\n");
-						}
-						ledger.pendingGenSlicePool = undefined;
-						pump.accountedOutputTokens = 0;
-						pump.intermediateStepCount = 0;
-						pump.lastAccountedWindowUsed = undefined;
-						this.startTrackedSessionPrompt(ledger, pump, {
-							sessionId: ledger.agySessionId,
-							prompt: steerBlocks,
-						});
-						continue;
-					}
 				}
 
 				ledger.activePump = undefined;
@@ -3038,6 +3077,7 @@ export class TurnCoordinator {
 
 		let sessionRes: AcpSessionNewResult | undefined;
 		let promptBlocks: AcpPromptBlock[] = auxPlan.finalPromptBlocks;
+		let usedAuxPreload = false;
 
 		if (auxPlan.preloadedTurns.length > 0) {
 			sessionRes = await this.createPreloadedSessionFromTemplate({
@@ -3047,6 +3087,9 @@ export class TurnCoordinator {
 				preloadedTurns: auxPlan.preloadedTurns,
 				signal: options?.signal,
 			});
+			if (sessionRes) {
+				usedAuxPreload = true;
+			}
 		}
 
 		if (!sessionRes) {
@@ -3132,18 +3175,65 @@ export class TurnCoordinator {
 				};
 				options?.signal?.addEventListener("abort", onAuxAbort, { once: true });
 				try {
+					let auxOutboundPayload: {
+						sessionId: string;
+						prompt: AcpPromptBlock[];
+						preloadedTurns?: readonly PreloadedSqliteTurn[];
+					} = {
+						sessionId: tempSessionId,
+						prompt: promptBlocks,
+						...(usedAuxPreload && auxPlan.preloadedTurns.length > 0
+							? { preloadedTurns: auxPlan.preloadedTurns }
+							: {}),
+					};
+					if (options?.onPayload) {
+						const replaced = await options.onPayload(auxOutboundPayload, model);
+						if (
+							replaced &&
+							typeof replaced === "object" &&
+							"prompt" in (replaced as Record<string, unknown>)
+						) {
+							auxOutboundPayload = replaced as typeof auxOutboundPayload;
+						}
+					}
+					if (options?.signal?.aborted || writer.isTerminated) {
+						if (!writer.isTerminated) {
+							writer.fail("aborted", "Request aborted by user");
+						}
+						return;
+					}
+					if (options?.onResponse) {
+						await options.onResponse(
+							{
+								status: 200,
+								headers: {
+									"x-acp-session-id": tempSessionId,
+									"x-acp-auxiliary": "1",
+								},
+							},
+							model,
+						);
+					}
 					writer.ensureStarted();
 					const promptRes = await conn.request<AcpPromptResponse>(
 						"session/prompt",
 						{
-							sessionId: tempSessionId,
-							prompt: promptBlocks,
+							sessionId: auxOutboundPayload.sessionId,
+							prompt: auxOutboundPayload.prompt,
 						},
 						{ signal: options?.signal },
 					);
 					await cleanupTempSession();
 					if (detectedQuotaErr) {
 						writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);
+						return;
+					}
+					if (promptRes.stopReason === "cancelled") {
+						writer.fail("aborted", "Request aborted");
+						return;
+					}
+					if (promptRes.stopReason === "refusal") {
+						writer.fail("error", "Model refused the request");
 						return;
 					}
 					const { quotaError } = writer.finishTurn(promptRes.stopReason, promptRes.usage);

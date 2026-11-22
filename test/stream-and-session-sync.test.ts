@@ -8,6 +8,7 @@ import {
 	normalizeContext,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -924,5 +925,112 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
+	});
+
+	it("重放截断保留单图归档 ctx://image/ 句柄、多图短文本不被误裁且预注入历史图片携带来源标签", () => {
+		const imagePlaceholder =
+			"[已归档图片 ctx://image/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef]";
+		const longToolMsg: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_img_mixed",
+			toolName: "read",
+			content: [
+				{
+					type: "text",
+					text: `${"前面超长正文 ".repeat(600)}\n${imagePlaceholder}\n${"后面超长正文 ".repeat(600)}`,
+				},
+			],
+			isError: false,
+			timestamp: 10,
+		};
+		const replayBlocks = buildFreshReplayPromptBlocks([
+			{ role: "user", content: "读取结果", timestamp: 1 },
+			longToolMsg,
+			{ role: "user", content: "继续分析", timestamp: 20 },
+		]);
+		const toolBlock = replayBlocks.find(
+			(b) => b.type === "text" && b.text.includes('id="call_img_mixed"'),
+		);
+		assert.ok(toolBlock && toolBlock.type === "text");
+		assert.ok(
+			toolBlock.text.includes(imagePlaceholder),
+			"超长正文截断时必须完整保留 ctx://image/ 归档句柄",
+		);
+
+		// 45 张图片 + 2000 字节短文本：超限源自图片数量而非文本过长，不应无故切分或截断短文本
+		const manyImages = Array.from({ length: 45 }, () => ({
+			type: "image" as const,
+			data: "AAAA",
+			mimeType: "image/png",
+		}));
+		const shortQuestion = `SHORT_QUESTION_KEEP_INTACT ${"说明文字 ".repeat(150)}`;
+		const multiImgPlan = buildPromptBlocksPreloadPlan([
+			{ type: "text", text: shortQuestion },
+			...manyImages,
+		]);
+		assert.equal(multiImgPlan.preloadedTurns.length, 0);
+		assert.ok(
+			multiImgPlan.finalPromptBlocks.some(
+				(b) => b.type === "text" && b.text === shortQuestion,
+			),
+			"大量图片场景下短文本必须完整保留不被裁切",
+		);
+
+		// SQLite 多步预注入中保留的近期历史工具图片应包裹 <tool_result> 标签以保留工具归属
+		const dummyAssistant: AssistantMessage = {
+			role: "assistant",
+			api: "antigravity-acp",
+			provider: "antigravity",
+			model: "gemini-4-neon",
+			content: [{ type: "text", text: `长回答 ${"中文文本段 ".repeat(3_500)}` }],
+			usage: {
+				input: 10,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 20,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const longHistoryMsgs: Array<UserMessage | AssistantMessage | ToolResultMessage> = [];
+		for (let i = 0; i < 16; i++) {
+			longHistoryMsgs.push({
+				role: "user",
+				content: `长提问 ${i} ${"上下文内容 alpha beta ".repeat(500)}`,
+				timestamp: i * 2 + 1,
+			});
+			longHistoryMsgs.push({ ...dummyAssistant, timestamp: i * 2 + 2 });
+		}
+		longHistoryMsgs.push(
+			{
+				role: "toolResult",
+				toolCallId: "agy_mcp_snap_1",
+				toolName: "read",
+				content: [
+					{ type: "text", text: "截图已读" },
+					{ type: "image", data: "BBBB", mimeType: "image/png" },
+				],
+				isError: false,
+				timestamp: 100,
+			},
+			{ role: "user", content: "结合上面的截图回答", timestamp: 101 },
+		);
+		const preloadWithHistoryImage = buildFreshReplayPlan({
+			visibleMessages: longHistoryMsgs,
+			maxContextWindowTokens: 1_000_000,
+		});
+		assert.ok(preloadWithHistoryImage.preloadedTurns.length > 0);
+		const imgIdx = preloadWithHistoryImage.finalPromptBlocks.findIndex(
+			(b) => b.type === "image" && b.data === "BBBB",
+		);
+		assert.ok(imgIdx > 0, "多步预注入末片应附带近期历史图片");
+		const prevBlock = preloadWithHistoryImage.finalPromptBlocks[imgIdx - 1];
+		assert.ok(
+			prevBlock.type === "text" &&
+				prevBlock.text.includes('<tool_result id="agy_mcp_snap_1" tool="read" status="ok">'),
+			"历史保留的工具图片前应附带 <tool_result> 来源标签",
+		);
 	});
 });

@@ -624,13 +624,22 @@ function serializeReplayHistoryEntry(
 			.map((c) => c.text)
 			.join("\n");
 		// 对 pi-traffic-optimization 已生成的紧凑 ctx:// 归档占位符保留原文不裁切，确保 handle 与 context_recall 指引完整
-		const cappedTexts = isTrafficOptToolPlaceholder(rawTexts)
+		let cappedTexts = isTrafficOptToolPlaceholder(rawTexts)
 			? rawTexts
 			: truncateUtf8Middle(
 					rawTexts,
 					limits.maxToolBytes,
 					"\n...[tool output truncated in replay]...\n",
 				);
+		// 若仅单图归档的工具结果因正文过长被截断，补回被裁掉的 ctx://image/ 归档句柄行，避免模型丢失图片引用
+		if (cappedTexts !== rawTexts) {
+			const missingImagePlaceholders = rawTexts
+				.split("\n")
+				.filter((line) => isTrafficOptImagePlaceholder(line) && !cappedTexts.includes(line));
+			if (missingImagePlaceholders.length > 0) {
+				cappedTexts = `${cappedTexts}\n${missingImagePlaceholders.join("\n")}`;
+			}
+		}
 		entryBlocks.push({
 			type: "text",
 			text: `<tool_result id="${msg.toolCallId}" tool="${msg.toolName}" status="${status}">\n${cappedTexts}\n</tool_result>`,
@@ -741,14 +750,27 @@ export function buildPromptBlocksPreloadPlan(
 		512,
 		Math.floor((maxStepTokens - wrapperOverheadTokens) * 0.9),
 	);
+	const minProtectedTextBytes = Math.min(chunkBytesLimit, 16_384);
+	const minProtectedTextTokens = Math.min(chunkTokensLimit, 4_096);
 	const finalTextBytesLimit = Math.max(
-		1_024,
+		minProtectedTextBytes,
 		Math.min(chunkBytesLimit, maxStepBytes - nonTextMeasured.bytes - wrapperOverheadBytes),
 	);
 	const finalTextTokensLimit = Math.max(
-		512,
+		minProtectedTextTokens,
 		Math.min(chunkTokensLimit, maxStepTokens - nonTextMeasured.tokens - wrapperOverheadTokens),
 	);
+
+	// 若超限纯粹源自图片数量过多而文本本身位于保护预算内，原样保留块结构，避免无意义裁切短文本
+	const combinedTextBytes = Buffer.byteLength(combinedText, "utf8");
+	const combinedTextTokens = estimateStepTokens(combinedText);
+	if (combinedTextBytes <= finalTextBytesLimit && combinedTextTokens <= finalTextTokensLimit) {
+		return {
+			preloadedTurns: [],
+			finalPromptBlocks: [...promptBlocks],
+			singleStepFallbackBlocks: [...promptBlocks],
+		};
+	}
 
 	// 单步安全降级块：保留头部 35% 与末尾 65%（优先保住末尾问题与输出格式要求）
 	const fallbackText = truncateTextMiddleToSafeBudget(
@@ -981,13 +1003,19 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 		Math.min(MAX_PRELOAD_TOTAL_HISTORY_BYTES, totalHistoryTokenBudget * 4);
 
 	const preloadEntriesReversed: { text: string; bytes: number; tokens: number }[] = [];
-	const preservedRecentHistoryImages: AcpPromptBlock[] = [];
+	const preservedRecentHistoryImages: Array<{
+		block: Extract<AcpPromptBlock, { type: "image" }>;
+		source:
+			| { kind: "toolResult"; toolCallId: string; toolName: string; status: "ok" | "error" }
+			| { kind: "user" };
+	}> = [];
 	let totalUsedHistoryBytes = 0;
 	let totalUsedHistoryTokens = 0;
 	let omittedMessageCount = 0;
 
 	for (let i = historySlice.length - 1; i >= 0; i--) {
-		const serialized = serializeReplayHistoryEntry(historySlice[i], {
+		const historyMsg = historySlice[i];
+		const serialized = serializeReplayHistoryEntry(historyMsg, {
 			maxMessageBytes: MAX_PRELOAD_SINGLE_MESSAGE_TEXT_BYTES,
 			maxToolBytes: MAX_PRELOAD_SINGLE_TOOL_TEXT_BYTES,
 		});
@@ -999,7 +1027,18 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 				textSegments.push(block.text);
 			} else if (block.type === "image") {
 				if (preservedRecentHistoryImages.length < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
-					preservedRecentHistoryImages.push(block);
+					preservedRecentHistoryImages.push({
+						block,
+						source:
+							historyMsg.role === "toolResult"
+								? {
+										kind: "toolResult",
+										toolCallId: historyMsg.toolCallId,
+										toolName: historyMsg.toolName,
+										status: historyMsg.isError ? "error" : "ok",
+									}
+								: { kind: "user" },
+					});
 					textSegments.push(`[attached recent ${block.mimeType} image from history]`);
 				} else {
 					textSegments.push(`[earlier ${block.mimeType} image omitted in replay]`);
@@ -1141,14 +1180,29 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 	if (workspaceContextBlock && !workspacePlaced) {
 		finalCandidateBlocks.push({ type: "text", text: workspaceContextBlock });
 	}
-	// 仅在剩余预算充足时附带少量近期历史图片，绝不挤爆末尾用户提问
+	// 仅在剩余预算充足时附带少量近期历史图片（保留来源标签），绝不挤爆末尾用户提问
 	if (preservedRecentHistoryImages.length > 0) {
+		const wrappedHistoryImageBlocks: AcpPromptBlock[] = [];
+		for (const item of [...preservedRecentHistoryImages].reverse()) {
+			if (item.source.kind === "toolResult") {
+				wrappedHistoryImageBlocks.push({
+					type: "text",
+					text: `<tool_result id="${item.source.toolCallId}" tool="${item.source.toolName}" status="${item.source.status}">\n[recent image preserved from history]\n</tool_result>`,
+				});
+			} else {
+				wrappedHistoryImageBlocks.push({
+					type: "text",
+					text: "[recent user image preserved from history]",
+				});
+			}
+			wrappedHistoryImageBlocks.push(item.block);
+		}
 		const tailWithImgs = measurePromptBlocksSize([
-			...preservedRecentHistoryImages,
+			...wrappedHistoryImageBlocks,
 			...rawTailBlocks,
 		]);
 		if (tailWithImgs.bytes <= maxStepBytes && tailWithImgs.tokens <= maxStepTokens) {
-			finalCandidateBlocks.push(...preservedRecentHistoryImages.reverse());
+			finalCandidateBlocks.push(...wrappedHistoryImageBlocks);
 		}
 	}
 	finalCandidateBlocks.push(...rawTailBlocks);

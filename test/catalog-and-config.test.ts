@@ -191,6 +191,8 @@ describe("跨平台可执行文件定位", () => {
 
 			// 验证 Windows .cmd 包装脚本含空格及特殊字符参数通过 cmd.exe /d /s /c + windowsVerbatimArguments 安全引用
 			assert.equal(quoteWindowsCmdArg("C:\\Users\\John Doe\\.gemini"), '"C:\\Users\\John Doe\\.gemini"');
+			assert.equal(quoteWindowsCmdArg("C:\\My Dir\\"), '"C:\\My Dir\\\\"');
+			assert.equal(quoteWindowsCmdArg('C:\\My Dir\\"quoted"'), '"C:\\My Dir\\\\""quoted"""');
 			assert.equal(quoteWindowsCmdArg("--flag=a;b,c"), '"--flag=a;b,c"');
 			assert.equal(quoteWindowsCmdArg("%USERPROFILE%\\agy"), '"%%USERPROFILE%%\\agy"');
 			const cmdSpec = buildAgySpawnSpec(

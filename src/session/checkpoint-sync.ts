@@ -39,6 +39,8 @@ export interface AgySessionAnchor {
 	projectionDigest?: string;
 	/** 可选：该 AGY 会话实际承载的 `pi-traffic-optimization` 归档占位符总数 */
 	projectedCount?: number;
+	/** 可选：该锚点落盘时后端已使用的上下文 token 水位（供恢复时评估是否因归档投影重建） */
+	usedTokens?: number;
 	/** 可选的本地 SQLite 会话数据库检查点水位 */
 	dbCheckpoint?: SqliteDbCheckpoint;
 }
@@ -891,8 +893,8 @@ export async function cloneTemplateSqliteConversationWithPreload(
 	const convDir = resolveAgyConversationsDir(config);
 	const templateDbPath = path.join(convDir, `${templateSessionId}.db`);
 
-	// 等待刚刚关闭的模板会话完成 SQLite/WAL 落盘（最长 240ms，响应取消信号）
-	const deadline = Date.now() + 240;
+	// 等待刚刚关闭的模板会话完成 SQLite/WAL 落盘（最长 1200ms，快速轮询并响应取消信号）
+	const deadline = Date.now() + 1_200;
 	let templateReady = false;
 	while (!options?.signal?.aborted) {
 		if (fs.existsSync(templateDbPath)) {

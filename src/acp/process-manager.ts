@@ -21,9 +21,22 @@ import {
 	NdjsonLineParser,
 } from "./protocol.ts";
 
+function readPackageVersion(): string {
+	try {
+		const raw = fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8");
+		const parsed = JSON.parse(raw) as { version?: unknown };
+		if (typeof parsed.version === "string" && parsed.version.trim().length > 0) {
+			return parsed.version.trim();
+		}
+	} catch {
+		// 忽略读取异常，回退默认版本号
+	}
+	return "0.1.10";
+}
+
 export const BRIDGE_AGENT_NAME = "pi-bridge";
 export const CLIENT_INFO_NAME = "pi-antigravity-bridge";
-export const CLIENT_INFO_VERSION = "0.1.10";
+export const CLIENT_INFO_VERSION = readPackageVersion();
 
 export class AcpRpcError extends Error {
 	readonly code: number;
@@ -640,20 +653,20 @@ export class AcpClientConnection {
 		}
 
 		if (this.isAlive) {
-			await new Promise<void>((resolve) => {
+			const exitedGracefully = await new Promise<boolean>((resolve) => {
 				let settled = false;
 				let killTimer: ReturnType<typeof setTimeout> | undefined;
-				const finish = () => {
+				const finish = (graceful: boolean) => {
 					if (settled) return;
 					settled = true;
 					if (killTimer) {
 						clearTimeout(killTimer);
 						killTimer = undefined;
 					}
-					resolve();
+					resolve(graceful);
 				};
 
-				this.proc.once("close", finish);
+				this.proc.once("close", () => finish(true));
 				try {
 					this.proc.stdin.end();
 				} catch {
@@ -662,12 +675,15 @@ export class AcpClientConnection {
 
 				killTimer = setTimeout(() => {
 					if (!settled) {
-						this.forceKillProcessTree();
-						finish();
+						finish(false);
 					}
 				}, 1_500);
 				killTimer.unref();
 			});
+
+			if (!exitedGracefully && this.proc.exitCode === null) {
+				await this.forceKillProcessTree();
+			}
 		}
 
 		this.closed = true;
@@ -683,7 +699,7 @@ export class AcpClientConnection {
 		void this.managedAgentDir;
 	}
 
-	private forceKillProcessTree(): void {
+	private async forceKillProcessTree(): Promise<void> {
 		const pid = this.proc.pid;
 		if (!pid) return;
 
@@ -717,11 +733,27 @@ export class AcpClientConnection {
 		};
 
 		sendPosixGroupOrPid("SIGTERM");
-		setTimeout(() => {
-			if (this.proc.exitCode === null) {
-				sendPosixGroupOrPid("SIGKILL");
-			}
-		}, 500).unref();
+		if (this.proc.exitCode !== null) {
+			return;
+		}
+
+		await new Promise<void>((resolve) => {
+			let done = false;
+			const finish = () => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				this.proc.off("close", finish);
+				resolve();
+			};
+			const timer = setTimeout(() => {
+				if (this.proc.exitCode === null) {
+					sendPosixGroupOrPid("SIGKILL");
+				}
+				finish();
+			}, 500);
+			this.proc.once("close", finish);
+		});
 	}
 
 	private writeJson(payload: unknown): void {

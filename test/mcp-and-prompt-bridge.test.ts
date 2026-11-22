@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { SystemMessage, Tool } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildAgySpawnSpec, resolveAgyBinary } from "../src/acp/binary-resolver.ts";
@@ -805,6 +805,18 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			const mount = prepareCustomizationMount([sysMsg], cfg, tmpRoot);
 			assert.ok(mount.workspaceContextBlock?.includes("ctx://"));
 			assert.ok(mount.workspaceContextBlock?.includes("context_recall"));
+
+			// 验证 agy_read 镜像工具能归一化 file:// URI 并提取 StartLine/EndLine 映射为 line 与 limit
+			const sampleFile = path.join(tmpRoot, "demo.ts");
+			const classifiedRead = classifyAgyToolCall({
+				title: "View demo.ts",
+				kind: "read",
+				rawInput: { uri: pathToFileURL(sampleFile).href, StartLine: 10, EndLine: 24 },
+			});
+			assert.equal(classifiedRead.mirrorToolName, "agy_read");
+			assert.equal(classifiedRead.arguments.path, sampleFile);
+			assert.equal(classifiedRead.arguments.line, 10);
+			assert.equal(classifiedRead.arguments.limit, 15);
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}

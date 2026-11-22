@@ -232,6 +232,16 @@ rl.on("line", async (line) => {
 
     const lastBlockText = prompt?.[prompt.length - 1]?.text || "";
 
+    if (lastBlockText === "AUX_STOP_REFUSAL") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "refusal" } });
+      return;
+    }
+
+    if (lastBlockText === "AUX_STOP_CANCELLED") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "cancelled" } });
+      return;
+    }
+
     if (lastBlockText === "HANG_FOREVER") {
       if (sess) sess.inFlightPromptId = msg.id;
       send({
@@ -1905,6 +1915,7 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 		};
 
 		const capturedPayloads: Array<{ sessionId: string; prompt: Array<{ type: string; text?: string; mimeType?: string }> }> = [];
+		const capturedResponseHeaders: Array<Record<string, string>> = [];
 		const pm = new AcpProcessManager();
 		const broker = new AgyTurnMirrorBroker();
 		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
@@ -1948,6 +1959,9 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 						onPayload: (payload) => {
 							capturedPayloads.push(payload as any);
 						},
+						onResponse: (response) => {
+							capturedResponseHeaders.push(response.headers);
+						},
 					})
 					.result();
 
@@ -1974,6 +1988,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(t1End.stopReason, "stop");
 			const originalAgyId = t1End.responseId!;
 			hist.push(t1End);
+			const mcpHeaders = capturedResponseHeaders.filter(
+				(h) => h["x-acp-transport"] === "acp-mcp-result",
+			);
+			assert.equal(mcpHeaders.length, 4, "4 次宿主 MCP 回传均应通告 x-acp-transport=acp-mcp-result");
+			assert.ok(mcpHeaders.every((h) => Boolean(h["x-acp-settled-mcp-ids"])));
 
 			// Turn 2：pi-traffic-optimization 仅压缩历史用户图片 PNG -> WebP（未触发 GC），必须复用同一原会话保热缓存
 			const histCompressed = hist.map((m, idx) =>
@@ -1991,7 +2010,32 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			const t2End = await runStep([...histCompressed, u2]);
 			assert.equal(t2End.stopReason, "stop");
 			assert.equal(t2End.responseId, originalAgyId, "仅图片压缩不应拆毁热缓存会话");
+			assert.equal(capturedResponseHeaders.at(-1)?.["x-acp-projection-synced"], "1");
 			histCompressed.push(u2, t2End);
+
+			// Turn 2.5：少量归档（delta=1 < 4 且低水位）复用原会话时，必须显式通告 x-acp-projection-synced=0
+			const histPartialGc = histCompressed.map((m) => ({ ...m }));
+			const firstTrMeta = toolResults[0];
+			const h1 = "1".repeat(64);
+			histPartialGc[firstTrMeta.idx] = {
+				...histPartialGc[firstTrMeta.idx],
+				content: [
+					{
+						type: "text",
+						text: `[已归档 ctx://tool/${h1}]\n{"tool":"read","call":"${firstTrMeta.callId}"}\n这是历史结果。精确取回：context_recall({id:"ctx://tool/${h1}"})`,
+					},
+				],
+			};
+			const u25 = { role: "user", content: "FOLLOWUP_MSG:partial-gc", timestamp: 15 };
+			const t25End = await runStep([...histPartialGc, u25]);
+			assert.equal(t25End.stopReason, "stop");
+			assert.equal(t25End.responseId, originalAgyId, "少量归档在低水位下应复用热缓存会话");
+			assert.equal(
+				capturedResponseHeaders.at(-1)?.["x-acp-projection-synced"],
+				"0",
+				"未瘦身复用旧会话时必须通过 x-acp-projection-synced=0 告知流量扩展跳过失真校准",
+			);
+			histCompressed.push(u25, t25End);
 
 			// Turn 3：pi-traffic-optimization 触发批量 GC，将 4 条旧 toolResult 替换为紧凑 [已归档 ctx://tool/...] 占位符
 			const histProjected = histCompressed.map((m) => ({ ...m }));
@@ -2014,6 +2058,11 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(t3End.stopReason, "stop");
 			const slimAgyId = t3End.responseId!;
 			assert.notEqual(slimAgyId, originalAgyId, "批量 GC 后应重建瘦身后的新 AGY 会话以释放后端上下文");
+			assert.equal(
+				capturedResponseHeaders.at(-1)?.["x-acp-projection-synced"],
+				"1",
+				"重建瘦身新会话后应通告 x-acp-projection-synced=1 恢复校准",
+			);
 			// 验证重建的 FreshReplay 确实携带了 ctx:// 归档占位符，且不再携带 6KB 原始大输出
 			const gcReplayText = capturedPayloads
 				.slice(payloadCountBeforeGc)
@@ -2100,7 +2149,8 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				timestamp: 9999,
 			};
 
-			// 1. 开启 enableSqliteFork（默认）：应自动创建预注入 .db 并经 session/resume 零额外 LLM 调用直达，单次 session/prompt 仅含末尾提问
+			// 1. 开启 enableSqliteFork（默认）：应自动创建预注入 .db 并经 session/resume 零额外 LLM 调用直达，单次 session/prompt 仅含末尾提问，且 onPayload 附带 preloadedTurns 观测字段
+			const capturedResponseHeaders: Array<Record<string, string>> = [];
 			const resPreload = await coord
 				.streamSimple(
 					{ ...TEST_MODEL, contextWindow: 1_000_000 },
@@ -2110,12 +2160,21 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 						onPayload: (payload) => {
 							capturedPayloads.push(payload as any);
 						},
+						onResponse: (response) => {
+							capturedResponseHeaders.push(response.headers);
+						},
 					},
 				)
 				.result();
 			assert.equal(resPreload.stopReason, "stop");
 			const seededId = resPreload.responseId!;
 			assert.equal(capturedPayloads.length, 1, "SQLite 多步预注入应零额外 LLM 调用，仅发 1 次 session/prompt");
+			assert.ok(
+				Array.isArray((capturedPayloads[0] as any).preloadedTurns) &&
+					(capturedPayloads[0] as any).preloadedTurns.length >= 2,
+				"onPayload 应附带 preloadedTurns 供流量观测扩展统计多步预注入负载",
+			);
+			assert.equal(capturedResponseHeaders[0]?.["x-acp-projection-synced"], "1");
 
 			const seededDbPath = path.join(convDir, `${seededId}.db`);
 			assert.ok(fs.existsSync(seededDbPath), "应已生成独立 UUID 的预注入 SQLite 会话库");
@@ -2143,8 +2202,10 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.ok(sentPromptText.includes("FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777"));
 			assert.ok(Buffer.byteLength(sentPromptText, "utf8") < 10_000, "最终 prompt 应仅发送安全大小内的末尾提问");
 
-			// 2. 辅助单轮请求（如 /compact 摘要）面对 > 220 KB 单条超长待压缩对话：预注入后零截断完成并自动清理临时 .db
+			// 2. 辅助单轮请求（如 /compact 摘要）面对 > 220 KB 单条超长待压缩对话：预注入后零截断完成、触发 onPayload/onResponse(x-acp-auxiliary=1) 并自动清理临时 .db
 			const beforeCompactDbs = new Set(fs.readdirSync(convDir));
+			const auxPayloads: any[] = [];
+			const auxHeaders: Array<Record<string, string>> = [];
 			const hugeCompactPrompt = `<conversation>\n${"历史记录条目 0123456789 中文测试\n".repeat(6_000)}\n</conversation>\nSummarize this conversation for compaction.`;
 			const compactRes = await coord
 				.streamSimple(
@@ -2153,12 +2214,48 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 						tools: [],
 						messages: [{ role: "user", content: hugeCompactPrompt, timestamp: 1 }],
 					}),
-					{ sessionId: "pi-sess-preload-on", disableContinuation: true },
+					{
+						sessionId: "pi-sess-preload-on",
+						disableContinuation: true,
+						onPayload: (payload) => {
+							auxPayloads.push(payload);
+						},
+						onResponse: (response) => {
+							auxHeaders.push(response.headers);
+						},
+					},
 				)
 				.result();
 			assert.equal(compactRes.stopReason, "stop");
+			assert.equal(auxPayloads.length, 1, "辅助请求应触发 onPayload");
+			assert.ok(Array.isArray(auxPayloads[0].preloadedTurns) && auxPayloads[0].preloadedTurns.length > 0);
+			assert.equal(auxHeaders[0]?.["x-acp-auxiliary"], "1", "辅助请求响应头应标记 x-acp-auxiliary=1");
 			const afterCompactDbs = fs.readdirSync(convDir).filter((f) => !beforeCompactDbs.has(f));
 			assert.equal(afterCompactDbs.length, 0, "辅助请求使用的临时预注入 SQLite 文件必须在结束后彻底清理");
+
+			// 2b. 辅助请求遇 refusal / cancelled 必须明确失败为 error / aborted，绝不写入损坏摘要
+			const refusalRes = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [],
+						messages: [{ role: "user", content: "AUX_STOP_REFUSAL", timestamp: 2 }],
+					}),
+					{ sessionId: "pi-sess-preload-on", disableContinuation: true },
+				)
+				.result();
+			assert.equal(refusalRes.stopReason, "error");
+			const cancelledRes = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [],
+						messages: [{ role: "user", content: "AUX_STOP_CANCELLED", timestamp: 3 }],
+					}),
+					{ sessionId: "pi-sess-preload-on", disableContinuation: true },
+				)
+				.result();
+			assert.equal(cancelledRes.stopReason, "aborted");
 
 			// 3. 禁用 enableSqliteFork 时：平滑降级为 session/new + 单步双阈值安全预算，不新建 .db 且 100% 保留末尾提问
 			coord.setConfig({ ...cfg, enableSqliteFork: false });

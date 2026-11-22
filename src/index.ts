@@ -219,13 +219,21 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	pi.registerToolRenderer(createAgyToolRendererResolver());
 
 	// 3. 注册 `/agy` 命令族
-	const refreshAndReRegisterModels = async (ctx: ExtensionContext): Promise<number> => {
+	let backgroundRefreshController: AbortController | undefined;
+	const refreshAndReRegisterModels = async (
+		ctx: ExtensionContext,
+		overrideSignal?: AbortSignal,
+	): Promise<number> => {
+		const signal = overrideSignal ?? ctx.signal;
 		const snapshot = await probeLiveAntigravityCatalog(
 			processManager,
 			coordinator.config,
 			ctx.cwd,
-			{ signal: ctx.signal, force: true },
+			{ signal, force: true },
 		);
+		if (signal?.aborted) {
+			return currentModels.length;
+		}
 		if (snapshot.tier) {
 			coordinator.setLatestTier(snapshot.tier);
 		}
@@ -274,7 +282,9 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 			typeof diskCache.updatedAt !== "number" ||
 			Date.now() - diskCache.updatedAt > MODEL_CACHE_STALE_MS;
 		if (isCacheStale) {
-			void refreshAndReRegisterModels(ctx).catch(() => {});
+			backgroundRefreshController?.abort();
+			backgroundRefreshController = new AbortController();
+			void refreshAndReRegisterModels(ctx, backgroundRefreshController.signal).catch(() => {});
 		}
 	});
 
@@ -330,6 +340,8 @@ export default function antigravityBridgeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		backgroundRefreshController?.abort();
+		backgroundRefreshController = undefined;
 		await coordinator.dispose();
 	});
 }

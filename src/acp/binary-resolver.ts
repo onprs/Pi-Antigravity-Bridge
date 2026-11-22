@@ -155,7 +155,9 @@ export function quoteWindowsCmdArg(arg: string): string {
 	if (arg.length === 0) return '""';
 	const escapedPercents = arg.replace(/%/g, "%%");
 	if (!/[\s"&|<>^()!;,=%]/.test(escapedPercents)) return escapedPercents;
-	return `"${escapedPercents.replace(/"/g, '""')}"`;
+	const escapedQuotes = escapedPercents.replace(/(\\*)"/g, '$1$1""');
+	const escapedTrailingBackslashes = escapedQuotes.replace(/(\\+)$/, "$1$1");
+	return `"${escapedTrailingBackslashes}"`;
 }
 
 /**
