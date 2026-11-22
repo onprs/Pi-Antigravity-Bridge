@@ -2000,4 +2000,138 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
+
+	it("超长历史与超长辅助压缩请求自动通过 SQLite 多步预注入零额外调用恢复，禁用 SQLite 时平滑降级至单步安全预算且保住末尾提问", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-preload-"));
+		const binPath = writeMockAgyExecutable(tmpRoot);
+		const convDir = path.join(tmpRoot, ".gemini", "antigravity-cli", "conversations");
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: binPath,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+			enableSqliteFork: true,
+		};
+
+		const capturedPayloads: Array<{ sessionId: string; prompt: Array<{ type: string; text?: string }> }> = [];
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		try {
+			// 构造 > 240 KB 超长历史（远超单步 64k 安全线）
+			const longHistory: any[] = [];
+			for (let i = 0; i < 36; i++) {
+				longHistory.push({
+					role: "user",
+					content: `HIST_USER_${i}: ${"长上下文历史日志 code=12345 token_density_check ".repeat(85)}`,
+					timestamp: i * 2 + 1,
+				});
+				longHistory.push({
+					role: "assistant",
+					content: [{ type: "text", text: `HIST_ASST_${i}: ${"助手历史回复内容 alpha beta gamma 67890 ".repeat(85)}` }],
+					api: "antigravity-acp",
+					provider: "antigravity",
+					model: "gemini-4-neon",
+					usage: {
+						input: 100,
+						output: 50,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 150,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: i * 2 + 2,
+				});
+			}
+			const tailUser = {
+				role: "user",
+				content: "FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777",
+				timestamp: 9999,
+			};
+
+			// 1. 开启 enableSqliteFork（默认）：应自动创建预注入 .db 并经 session/resume 零额外 LLM 调用直达，单次 session/prompt 仅含末尾提问
+			const resPreload = await coord
+				.streamSimple(
+					{ ...TEST_MODEL, contextWindow: 1_000_000 },
+					normalizeContext({ tools: [], messages: [...longHistory, tailUser] }),
+					{
+						sessionId: "pi-sess-preload-on",
+						onPayload: (payload) => {
+							capturedPayloads.push(payload as any);
+						},
+					},
+				)
+				.result();
+			assert.equal(resPreload.stopReason, "stop");
+			const seededId = resPreload.responseId!;
+			assert.equal(capturedPayloads.length, 1, "SQLite 多步预注入应零额外 LLM 调用，仅发 1 次 session/prompt");
+
+			const seededDbPath = path.join(convDir, `${seededId}.db`);
+			assert.ok(fs.existsSync(seededDbPath), "应已生成独立 UUID 的预注入 SQLite 会话库");
+			const db = new DatabaseSync(seededDbPath, { readOnly: true });
+			const stepCountRow = db.prepare("SELECT COUNT(*) AS n FROM steps").get() as { n: number };
+			const firstPayload = db.prepare("SELECT step_payload FROM steps WHERE idx = 0").get() as {
+				step_payload: Uint8Array;
+			};
+			db.close();
+			assert.ok(stepCountRow.n >= 4, `预注入库应包含多对交替步，实际 steps=${stepCountRow.n}`);
+			assert.ok(Buffer.from(firstPayload.step_payload).includes("HIST_USER_0:"));
+
+			const sentPromptText = capturedPayloads[0].prompt
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			assert.ok(sentPromptText.includes("FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777"));
+			assert.ok(Buffer.byteLength(sentPromptText, "utf8") < 10_000, "最终 prompt 应仅发送安全大小内的末尾提问");
+
+			// 2. 辅助单轮请求（如 /compact 摘要）面对 > 220 KB 单条超长待压缩对话：预注入后零截断完成并自动清理临时 .db
+			const beforeCompactDbs = new Set(fs.readdirSync(convDir));
+			const hugeCompactPrompt = `<conversation>\n${"历史记录条目 0123456789 中文测试\n".repeat(6_000)}\n</conversation>\nSummarize this conversation for compaction.`;
+			const compactRes = await coord
+				.streamSimple(
+					{ ...TEST_MODEL, contextWindow: 1_000_000 },
+					normalizeContext({
+						tools: [],
+						messages: [{ role: "user", content: hugeCompactPrompt, timestamp: 1 }],
+					}),
+					{ sessionId: "pi-sess-preload-on", disableContinuation: true },
+				)
+				.result();
+			assert.equal(compactRes.stopReason, "stop");
+			const afterCompactDbs = fs.readdirSync(convDir).filter((f) => !beforeCompactDbs.has(f));
+			assert.equal(afterCompactDbs.length, 0, "辅助请求使用的临时预注入 SQLite 文件必须在结束后彻底清理");
+
+			// 3. 禁用 enableSqliteFork 时：平滑降级为 session/new + 单步双阈值安全预算，不新建 .db 且 100% 保留末尾提问
+			coord.setConfig({ ...cfg, enableSqliteFork: false });
+			const fallbackPayloads: Array<{ sessionId: string; prompt: Array<{ type: string; text?: string }> }> = [];
+			const beforeFallbackDbs = new Set(fs.readdirSync(convDir));
+			const resFallback = await coord
+				.streamSimple(
+					{ ...TEST_MODEL, contextWindow: 1_000_000 },
+					normalizeContext({ tools: [], messages: [...longHistory, tailUser] }),
+					{
+						sessionId: "pi-sess-preload-off",
+						onPayload: (payload) => {
+							fallbackPayloads.push(payload as any);
+						},
+					},
+				)
+				.result();
+			assert.equal(resFallback.stopReason, "stop");
+			assert.equal(fallbackPayloads.length, 1);
+			const fallbackText = fallbackPayloads[0].prompt
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			assert.ok(fallbackText.includes("FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777"), "降级模式必须 100% 保住末尾提问");
+			assert.ok(Buffer.byteLength(fallbackText, "utf8") <= 110_000, "降级模式单步字节数不得超过安全红线");
+			const newFallbackDbs = fs.readdirSync(convDir).filter((f) => !beforeFallbackDbs.has(f));
+			assert.equal(newFallbackDbs.length, 0, "禁用 enableSqliteFork 时不得创建预注入 .db");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
 });

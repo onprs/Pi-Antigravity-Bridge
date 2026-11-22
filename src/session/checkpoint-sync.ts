@@ -8,7 +8,7 @@ import {
 	type ToolMode,
 	resolveAgyConversationsDir,
 } from "../config.ts";
-import { computeTranscriptDigest } from "./reconcile.ts";
+import { computeTranscriptDigest, type PreloadedSqliteTurn } from "./reconcile.ts";
 
 export const AGY_SESSION_ANCHOR_CUSTOM_TYPE = "antigravity-acp-state";
 
@@ -696,6 +696,271 @@ export async function forkSqliteConversationAtCheckpoint(
 	} finally {
 		try {
 			dstDb?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+const CORTEX_STEP_TYPE_USER_INPUT = 14;
+const CORTEX_STEP_TYPE_PLANNER_RESPONSE = 15;
+const CORTEX_STEP_STATUS_DONE = 3;
+const CORTEX_TRAJECTORY_TYPE_INTERACTIVE_CASCADE = 4;
+const CORTEX_TRAJECTORY_SOURCE_CLI = 17;
+
+function encodeProtobufVarint(value: number | bigint): Buffer {
+	let v = typeof value === "bigint" ? value : BigInt(value);
+	const out: number[] = [];
+	while (v >= 0x80n) {
+		out.push(Number((v & 0x7fn) | 0x80n));
+		v >>= 7n;
+	}
+	out.push(Number(v));
+	return Buffer.from(out);
+}
+
+function encodeProtobufVarintField(fieldNo: number, value: number | bigint): Buffer {
+	return Buffer.concat([encodeProtobufVarint((fieldNo << 3) | 0), encodeProtobufVarint(value)]);
+}
+
+function encodeProtobufBytesField(fieldNo: number, payload: Buffer | string): Buffer {
+	const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, "utf8");
+	return Buffer.concat([
+		encodeProtobufVarint((fieldNo << 3) | 2),
+		encodeProtobufVarint(buf.length),
+		buf,
+	]);
+}
+
+/** 构造 AGY `CortexStep`（`USER_INPUT`）最小标准 Protobuf 载荷 */
+export function encodeUserInputStepPayload(text: string): Buffer {
+	// CortexStepUserInput: field 2 = user_response, field 3 = items (TextOrScopeItem { field 1 = text })
+	const textItem = encodeProtobufBytesField(1, text);
+	const userInput = Buffer.concat([
+		encodeProtobufBytesField(2, text),
+		encodeProtobufBytesField(3, textItem),
+	]);
+	return Buffer.concat([
+		encodeProtobufVarintField(1, CORTEX_STEP_TYPE_USER_INPUT),
+		encodeProtobufVarintField(4, CORTEX_STEP_STATUS_DONE),
+		encodeProtobufBytesField(19, userInput),
+	]);
+}
+
+/** 构造 AGY `CortexStep`（`PLANNER_RESPONSE`）最小标准 Protobuf 载荷 */
+export function encodePlannerResponseStepPayload(text: string): Buffer {
+	// CortexStepPlannerResponse: field 1 = response, field 8 = modified_response
+	const plannerResponse = Buffer.concat([
+		encodeProtobufBytesField(1, text),
+		encodeProtobufBytesField(8, text),
+	]);
+	return Buffer.concat([
+		encodeProtobufVarintField(1, CORTEX_STEP_TYPE_PLANNER_RESPONSE),
+		encodeProtobufVarintField(4, CORTEX_STEP_STATUS_DONE),
+		encodeProtobufBytesField(20, plannerResponse),
+	]);
+}
+
+/**
+ * 新建一个独立 UUID 的 AGY 本地 SQLite 会话数据库，并将超长历史的多个安全分片以
+ * `(USER_INPUT, PLANNER_RESPONSE)` 交替步预注入 `steps` 表，供随后通过 `session/resume`
+ * 零额外 LLM 调用直接恢复，规避 `agy` 单条 `USER_INPUT` 64,000 token 截断上限。
+ *
+ * 严格仅新建独立 UUID 文件，永不改动任何已有会话库；任何异常均立即清理临时文件并返回 `undefined`。
+ */
+export async function createPreloadedSqliteConversation(
+	config: BridgeConfig,
+	turns: readonly PreloadedSqliteTurn[],
+): Promise<string | undefined> {
+	if (!config.enableSqliteFork || turns.length === 0) {
+		return undefined;
+	}
+
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return undefined;
+
+	const convDir = resolveAgyConversationsDir(config);
+	try {
+		fs.mkdirSync(convDir, { recursive: true });
+	} catch {
+		return undefined;
+	}
+
+	const sessionId = crypto.randomUUID();
+	const dbPath = path.join(convDir, `${sessionId}.db`);
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = openSqliteWithTimeout(sqlite, dbPath, false);
+		db.exec(`
+			PRAGMA user_version = 1;
+			CREATE TABLE trajectory_meta (
+				trajectory_id text,
+				cascade_id text,
+				trajectory_type integer,
+				source integer,
+				PRIMARY KEY (trajectory_id)
+			);
+			CREATE TABLE steps (
+				idx integer,
+				step_type integer NOT NULL DEFAULT 0,
+				status integer NOT NULL DEFAULT 0,
+				has_subtrajectory numeric NOT NULL DEFAULT false,
+				metadata blob,
+				error_details blob,
+				permissions blob,
+				task_details blob,
+				render_info blob,
+				step_payload blob,
+				step_format integer NOT NULL DEFAULT 0,
+				PRIMARY KEY (idx)
+			);
+			CREATE INDEX idx_steps_status ON steps(status);
+			CREATE INDEX idx_steps_step_type ON steps(step_type);
+			CREATE TABLE gen_metadata (
+				idx integer,
+				data blob,
+				size integer NOT NULL DEFAULT 0,
+				PRIMARY KEY (idx)
+			);
+			CREATE TABLE executor_metadata (
+				idx integer,
+				data blob,
+				PRIMARY KEY (idx)
+			);
+			CREATE TABLE parent_references (
+				idx integer,
+				data blob,
+				PRIMARY KEY (idx)
+			);
+			CREATE TABLE trajectory_metadata_blob (
+				id text DEFAULT "main",
+				data blob,
+				PRIMARY KEY (id)
+			);
+			CREATE TABLE battle_mode_infos (
+				idx integer,
+				data blob,
+				PRIMARY KEY (idx)
+			);
+		`);
+
+		db.exec("BEGIN IMMEDIATE");
+		db.prepare(
+			"INSERT INTO trajectory_meta (trajectory_id, cascade_id, trajectory_type, source) VALUES (?, ?, ?, ?)",
+		).run(
+			sessionId,
+			sessionId,
+			CORTEX_TRAJECTORY_TYPE_INTERACTIVE_CASCADE,
+			CORTEX_TRAJECTORY_SOURCE_CLI,
+		);
+
+		const insertStep = db.prepare(
+			"INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload, step_format) VALUES (?, ?, ?, 0, ?, 0)",
+		);
+		let idx = 0;
+		for (const turn of turns) {
+			insertStep.run(
+				idx++,
+				CORTEX_STEP_TYPE_USER_INPUT,
+				CORTEX_STEP_STATUS_DONE,
+				encodeUserInputStepPayload(turn.userText),
+			);
+			insertStep.run(
+				idx++,
+				CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+				CORTEX_STEP_STATUS_DONE,
+				encodePlannerResponseStepPayload(turn.assistantAckText),
+			);
+		}
+		db.exec("COMMIT");
+		return sessionId;
+	} catch {
+		try {
+			db?.exec("ROLLBACK");
+		} catch {
+			// 忽略
+		}
+		cleanupDbFilesSafe(dbPath);
+		return undefined;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+/**
+ * 向刚通过 `forkSqliteConversationAtCheckpoint` 克隆出的新分叉 `.db` 末尾追加预注入分片步。
+ * 仅用于尚未被 `agy` 打开的新分叉副本，严禁对正在运行的原库直接调用。
+ */
+export async function appendPreloadedTurnsToSqliteConversation(
+	config: BridgeConfig,
+	forkedSessionId: string,
+	turns: readonly PreloadedSqliteTurn[],
+): Promise<boolean> {
+	if (!config.enableSqliteFork || !forkedSessionId || turns.length === 0) {
+		return false;
+	}
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${forkedSessionId}.db`);
+	if (!fs.existsSync(dbPath)) {
+		return false;
+	}
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return false;
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = openSqliteWithTimeout(sqlite, dbPath, false);
+		if (!verifyRequiredTables(db)) {
+			return false;
+		}
+		const lastRow = db
+			.prepare("SELECT idx, step_type FROM steps ORDER BY idx DESC LIMIT 1")
+			.get() as { idx?: number; step_type?: number } | undefined;
+		let nextIdx = typeof lastRow?.idx === "number" ? lastRow.idx + 1 : 0;
+
+		db.exec("BEGIN IMMEDIATE");
+		const insertStep = db.prepare(
+			"INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload, step_format) VALUES (?, ?, ?, 0, ?, 0)",
+		);
+		// 若原分叉尾部停在 USER_INPUT，先补一条中性 PLANNER_RESPONSE 保持严格交替角色合法性
+		if (lastRow?.step_type === CORTEX_STEP_TYPE_USER_INPUT) {
+			insertStep.run(
+				nextIdx++,
+				CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+				CORTEX_STEP_STATUS_DONE,
+				encodePlannerResponseStepPayload("Continuing session context."),
+			);
+		}
+		for (const turn of turns) {
+			insertStep.run(
+				nextIdx++,
+				CORTEX_STEP_TYPE_USER_INPUT,
+				CORTEX_STEP_STATUS_DONE,
+				encodeUserInputStepPayload(turn.userText),
+			);
+			insertStep.run(
+				nextIdx++,
+				CORTEX_STEP_TYPE_PLANNER_RESPONSE,
+				CORTEX_STEP_STATUS_DONE,
+				encodePlannerResponseStepPayload(turn.assistantAckText),
+			);
+		}
+		db.exec("COMMIT");
+		return true;
+	} catch {
+		try {
+			db?.exec("ROLLBACK");
+		} catch {
+			// 忽略
+		}
+		return false;
+	} finally {
+		try {
+			db?.close();
 		} catch {
 			// 忽略
 		}

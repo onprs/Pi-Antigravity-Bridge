@@ -58,7 +58,9 @@ import {
 import {
 	AGY_SESSION_ANCHOR_CUSTOM_TYPE,
 	type AgySessionAnchor,
+	appendPreloadedTurnsToSqliteConversation,
 	captureSqliteCheckpoint,
+	createPreloadedSqliteConversation,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
 	hasLocalConversationDb,
@@ -70,9 +72,11 @@ import {
 import { prepareCustomizationMount } from "./customization-mounter.ts";
 import {
 	buildDetachedToolResultBlocks,
-	buildFreshReplayPromptBlocks,
+	buildFreshReplayPlan,
+	buildPromptBlocksPreloadPlan,
 	computeTranscriptDigest,
 	convertUserMessagesToPromptBlocks,
+	exceedsSafeSingleStepBudget,
 	extractAuxiliaryTaskInstructions,
 	extractVisibleMessages,
 	inspectTrafficOptProjectionState,
@@ -866,6 +870,34 @@ export class TurnCoordinator {
 					) {
 						// pi-traffic-optimization 触发批量 GC（或用户关闭优化恢复原文）：在空闲轮次边界重建瘦身/还原后的新 AGY 会话
 						skipAnchorRestoreForProjectionSync = true;
+					} else if (exceedsSafeSingleStepBudget(continuationPrompts)) {
+						// 热会话中单次追问本身超过单步 64k 安全线：只读分叉并预注入前序分片后无缝续接，失败则落入路径 3 全量预注入重建
+						const toolsReady =
+							idleCandidate.toolsDigest === toolsDigest ||
+							(await this.syncLedgerToolsBetweenTurns(
+								idleCandidate,
+								hostMcpTools,
+								toolsDigest,
+								options?.signal,
+							));
+						if (toolsReady) {
+							const preloadedBlocks = await this.tryPreloadOversizedContinuationOnLedger(
+								idleCandidate,
+								continuationPrompts,
+								options?.signal,
+							);
+							if (preloadedBlocks) {
+								await this.executePromptOnLedger(
+									idleCandidate,
+									preloadedBlocks,
+									visibleMessages,
+									writer,
+									model,
+									options,
+								);
+								return;
+							}
+						}
 					} else if (idleCandidate.toolsDigest === toolsDigest) {
 						await this.executePromptOnLedger(
 							idleCandidate,
@@ -922,6 +954,7 @@ export class TurnCoordinator {
 			mountDigest: mountInfo.mountDigest,
 			additionalDirectories: mountInfo.additionalDirectories,
 			workspaceContextBlock: mountInfo.workspaceContextBlock,
+			modelContextWindow: model.contextWindow,
 			skipAnchorRestore: skipAnchorRestoreForProjectionSync,
 			signal: options?.signal,
 		});
@@ -1013,6 +1046,103 @@ export class TurnCoordinator {
 	 * 通过 `session/close` + `session/resume`（同 `agySessionId`）原地重拉 `tools/list`，
 	 * 在默认 `processPerSession: true`（无 SSE 通道）下让新解锁工具立即可见且 100% 保留会话历史与热缓存。
 	 */
+	/**
+	 * 热会话中遇到单条追问超过单步 64k 安全预算时，严格遵循只读原库原则：
+	 * 通过 `VACUUM INTO` 克隆当前会话快照至新 UUID `.db`，追加前 N-1 个安全文本分片后切换 `session/resume`，
+	 * 返回仅包含最后 1 片（及原图）的安全 `finalPromptBlocks`。若不可行则返回 `undefined` 交由上层重建兜底。
+	 */
+	private async tryPreloadOversizedContinuationOnLedger(
+		ledger: ManagedSessionLedger,
+		continuationPrompts: readonly AcpPromptBlock[],
+		signal?: AbortSignal,
+	): Promise<AcpPromptBlock[] | undefined> {
+		if (
+			!this.currentConfig.enableSqliteFork ||
+			!ledger.conn.isAlive ||
+			!ledger.conn.capabilities?.sessionCapabilities?.resume ||
+			!hasLocalConversationDb(this.currentConfig, ledger.agySessionId)
+		) {
+			return undefined;
+		}
+		const plan = buildPromptBlocksPreloadPlan(continuationPrompts, {
+			segmentLabel: "user-message-part",
+		});
+		if (plan.preloadedTurns.length === 0) {
+			return plan.finalPromptBlocks;
+		}
+
+		const ckpt = await captureSqliteCheckpoint(this.currentConfig, ledger.agySessionId);
+		if (!ckpt) {
+			return undefined;
+		}
+		const forkedId = await forkSqliteConversationAtCheckpoint(
+			this.currentConfig,
+			ledger.agySessionId,
+			ckpt,
+		);
+		if (!forkedId) {
+			return undefined;
+		}
+
+		const appended = await appendPreloadedTurnsToSqliteConversation(
+			this.currentConfig,
+			forkedId,
+			plan.preloadedTurns,
+		);
+		if (!appended) {
+			removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+			return undefined;
+		}
+
+		const mcpServers = await this.buildSessionMcpServersSpec({
+			mcpToken: ledger.mcpToken,
+			useHttpMcp: ledger.useHttpMcp,
+			cwd: ledger.cwd,
+			isProjectTrusted: ledger.isProjectTrusted,
+		});
+		const addDirs =
+			ledger.additionalDirectories.length > 0 ? ledger.additionalDirectories : undefined;
+		const previousSessionId = ledger.agySessionId;
+
+		try {
+			await ledger.conn.closeSessionSafe(previousSessionId);
+			const resumed = await ledger.conn.request<AcpSessionResumeResult>(
+				"session/resume",
+				{
+					sessionId: forkedId,
+					cwd: ledger.cwd,
+					mcpServers,
+					additionalDirectories: addDirs,
+				},
+				{ timeoutMs: 25_000, signal },
+			);
+			ledger.conn.trackSession(resumed.sessionId);
+			this.ledgersByAgyId.delete(previousSessionId);
+			ledger.agySessionId = resumed.sessionId;
+			this.ledgersByAgyId.set(resumed.sessionId, ledger);
+			if (ledger.mcpToken) {
+				this.httpMcpBridge.updateBindingSessionId(ledger.mcpToken, resumed.sessionId);
+			}
+			if (resumed.configOptions) {
+				ledger.configOptions = resumed.configOptions;
+			}
+			if (resumed.models?.availableModels) {
+				ledger.availableModels = resumed.models.availableModels;
+			}
+			ledger.appliedModelValue = undefined;
+			ledger.appliedThoughtLevel = undefined;
+			ledger.appliedExecMode = undefined;
+			ledger.lastConsumedStepIdx = await readCurrentMaxSqliteStepIdx(
+				this.currentConfig,
+				resumed.sessionId,
+			);
+			return plan.finalPromptBlocks;
+		} catch {
+			removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+			return undefined;
+		}
+	}
+
 	private async reloadLedgerSessionForTools(
 		ledger: ManagedSessionLedger,
 		hostMcpTools: Tool[],
@@ -1183,6 +1313,7 @@ export class TurnCoordinator {
 					mountDigest: mountInfo.mountDigest,
 					additionalDirectories: mountInfo.additionalDirectories,
 					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					modelContextWindow: model.contextWindow,
 					signal: options?.signal,
 				});
 				await this.executePromptOnLedger(
@@ -1200,8 +1331,13 @@ export class TurnCoordinator {
 
 			const lateBlocks =
 				detachedResults.length > 0
-					? buildDetachedToolResultBlocks(detachedResults, trailingUsers)
-					: buildFreshReplayPromptBlocks(visibleMessages);
+					? buildPromptBlocksPreloadPlan(
+							buildDetachedToolResultBlocks(detachedResults, trailingUsers),
+						).singleStepFallbackBlocks
+					: buildFreshReplayPlan({
+							visibleMessages,
+							maxContextWindowTokens: model.contextWindow,
+						}).singleStepFallbackBlocks;
 
 			await this.executePromptOnLedger(
 				ledger,
@@ -1249,6 +1385,7 @@ export class TurnCoordinator {
 					mountDigest: mountInfo.mountDigest,
 					additionalDirectories: mountInfo.additionalDirectories,
 					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					modelContextWindow: model.contextWindow,
 					signal: options?.signal,
 				});
 				await this.executePromptOnLedger(
@@ -1261,8 +1398,51 @@ export class TurnCoordinator {
 				);
 				return;
 			}
-			const replay = buildFreshReplayPromptBlocks(visibleMessages);
-			await this.executePromptOnLedger(ledger, replay, visibleMessages, writer, model, options);
+			const fallbackPlan = buildFreshReplayPlan({
+				visibleMessages,
+				maxContextWindowTokens: model.contextWindow,
+			});
+			if (fallbackPlan.preloadedTurns.length > 0) {
+				await this.teardownLedger(ledger);
+				const cwd = this.activeContext?.cwd ?? process.cwd();
+				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
+				const mountInfo = prepareCustomizationMount(
+					fullContextMessages,
+					this.currentConfig,
+					cwd,
+				);
+				const restored = await this.bootstrapOrRestoreLedger({
+					piSessionKey: ledger.piSessionKey,
+					cwd,
+					isProjectTrusted,
+					visibleMessages,
+					hostMcpTools,
+					toolsDigest,
+					mountedPluginPaths: mountInfo.mountedPluginPaths,
+					mountDigest: mountInfo.mountDigest,
+					additionalDirectories: mountInfo.additionalDirectories,
+					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					modelContextWindow: model.contextWindow,
+					signal: options?.signal,
+				});
+				await this.executePromptOnLedger(
+					restored.ledger,
+					restored.initialPromptBlocks,
+					visibleMessages,
+					writer,
+					model,
+					options,
+				);
+				return;
+			}
+			await this.executePromptOnLedger(
+				ledger,
+				fallbackPlan.finalPromptBlocks,
+				visibleMessages,
+				writer,
+				model,
+				options,
+			);
 			return;
 		}
 
@@ -1334,6 +1514,7 @@ export class TurnCoordinator {
 					mountDigest: mountInfo.mountDigest,
 					additionalDirectories: mountInfo.additionalDirectories,
 					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					modelContextWindow: model.contextWindow,
 					signal: options?.signal,
 				});
 				await this.executePromptOnLedger(
@@ -1426,6 +1607,7 @@ export class TurnCoordinator {
 				mountDigest: mountInfo.mountDigest,
 				additionalDirectories: mountInfo.additionalDirectories,
 				workspaceContextBlock: mountInfo.workspaceContextBlock,
+				modelContextWindow: model.contextWindow,
 				signal: options?.signal,
 			});
 			await this.executePromptOnLedger(
@@ -1462,6 +1644,7 @@ export class TurnCoordinator {
 		mountDigest: string;
 		additionalDirectories: string[];
 		workspaceContextBlock?: string;
+		modelContextWindow?: number;
 		skipAnchorRestore?: boolean;
 		signal?: AbortSignal;
 	}): Promise<{ ledger: ManagedSessionLedger; initialPromptBlocks: AcpPromptBlock[] }> {
@@ -1595,26 +1778,75 @@ export class TurnCoordinator {
 				priorProjection,
 			)
 		) {
-			try {
-				sessionInfo = await conn.request<AcpSessionResumeResult>(
-					"session/resume",
-					{
-						sessionId: anchorMatch.anchor.agySessionId,
-						cwd: params.cwd,
-						mcpServers,
-						additionalDirectories: addDirs,
-					},
-					{ timeoutMs: 20_000, signal: params.signal },
+			const pendingBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
+			const pendingPlan = buildPromptBlocksPreloadPlan(pendingBlocks, {
+				segmentLabel: "user-message-part",
+			});
+
+			// 若本轮单条新提问本身超过单步 64k 安全线，先只读分叉并预注入前序分片，再恢复分叉会话仅发最后一片
+			if (
+				pendingPlan.preloadedTurns.length > 0 &&
+				this.currentConfig.enableSqliteFork &&
+				anchorMatch.anchor.dbCheckpoint
+			) {
+				const forkedId = await forkSqliteConversationAtCheckpoint(
+					this.currentConfig,
+					anchorMatch.anchor.agySessionId,
+					anchorMatch.anchor.dbCheckpoint,
 				);
-				initialPromptBlocks = convertUserMessagesToPromptBlocks(pendingUserMessages);
-				syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
-				syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
-			} catch {
-				sessionInfo = undefined;
+				if (forkedId) {
+					const appended = await appendPreloadedTurnsToSqliteConversation(
+						this.currentConfig,
+						forkedId,
+						pendingPlan.preloadedTurns,
+					);
+					if (appended) {
+						try {
+							sessionInfo = await conn.request<AcpSessionResumeResult>(
+								"session/resume",
+								{
+									sessionId: forkedId,
+									cwd: params.cwd,
+									mcpServers,
+									additionalDirectories: addDirs,
+								},
+								{ timeoutMs: 25_000, signal: params.signal },
+							);
+							initialPromptBlocks = pendingPlan.finalPromptBlocks;
+							syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+							syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+						} catch {
+							sessionInfo = undefined;
+							removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+						}
+					} else {
+						removeEmptyProbeSessionFiles(this.currentConfig, forkedId);
+					}
+				}
+			}
+
+			if (!sessionInfo && pendingPlan.preloadedTurns.length === 0) {
+				try {
+					sessionInfo = await conn.request<AcpSessionResumeResult>(
+						"session/resume",
+						{
+							sessionId: anchorMatch.anchor.agySessionId,
+							cwd: params.cwd,
+							mcpServers,
+							additionalDirectories: addDirs,
+						},
+						{ timeoutMs: 20_000, signal: params.signal },
+					);
+					initialPromptBlocks = pendingPlan.finalPromptBlocks;
+					syncedProjectionDigest = anchorMatch.anchor.projectionDigest ?? "";
+					syncedProjectedCount = anchorMatch.anchor.projectedCount ?? 0;
+				} catch {
+					sessionInfo = undefined;
+				}
 			}
 		}
 
-		// 路径 2：命中历史中间锚点且锚点前缀未落后于新一轮归档 GC -> 只读 VACUUM INTO 快照分叉截断 + session/resume
+		// 路径 2：命中历史中间锚点且锚点前缀未落后于新一轮归档 GC -> 只读 VACUUM INTO 快照分叉截断 + 按需预注入超长增量 + session/resume
 		if (
 			!sessionInfo &&
 			anchorMatch.kind === "forkable" &&
@@ -1636,6 +1868,26 @@ export class TurnCoordinator {
 					anchorMatch.anchor.dbCheckpoint,
 				);
 				if (forkedId) {
+					const remainingAfterFork = params.visibleMessages.slice(
+						anchorMatch.anchor.messageCount,
+					);
+					const forkPlan = buildFreshReplayPlan({
+						visibleMessages: remainingAfterFork,
+						maxContextWindowTokens: params.modelContextWindow,
+					});
+
+					let forkPromptBlocks = forkPlan.finalPromptBlocks;
+					if (forkPlan.preloadedTurns.length > 0) {
+						const appended = await appendPreloadedTurnsToSqliteConversation(
+							this.currentConfig,
+							forkedId,
+							forkPlan.preloadedTurns,
+						);
+						if (!appended) {
+							forkPromptBlocks = forkPlan.singleStepFallbackBlocks;
+						}
+					}
+
 					try {
 						sessionInfo = await conn.request<AcpSessionResumeResult>(
 							"session/resume",
@@ -1645,12 +1897,9 @@ export class TurnCoordinator {
 								mcpServers,
 								additionalDirectories: addDirs,
 							},
-							{ timeoutMs: 20_000, signal: params.signal },
+							{ timeoutMs: 25_000, signal: params.signal },
 						);
-						const remainingAfterFork = params.visibleMessages.slice(
-							anchorMatch.anchor.messageCount,
-						);
-						initialPromptBlocks = buildFreshReplayPromptBlocks(remainingAfterFork);
+						initialPromptBlocks = forkPromptBlocks;
 						if (
 							forkPrefixProjection.projectionDigest ===
 							(anchorMatch.anchor.projectionDigest ?? "")
@@ -1669,28 +1918,66 @@ export class TurnCoordinator {
 			}
 		}
 
-		// 路径 3：新建会话并发送完整结构化图文检查点重放（FreshReplay）
+		// 路径 3：新建会话并重放历史（超出单步 64k 安全线时优先通过本地新建 SQLite 多步预注入 + session/resume 零额外调用恢复，失败则平滑降级为单步安全重放）
 		if (!sessionInfo || !initialPromptBlocks) {
-			try {
-				sessionInfo = await conn.request<AcpSessionNewResult>(
-					"session/new",
-					{
-						cwd: params.cwd,
-						mcpServers,
-						additionalDirectories: addDirs,
-					},
-					{ timeoutMs: 25_000, signal: params.signal },
+			const replayPlan = buildFreshReplayPlan({
+				visibleMessages: params.visibleMessages,
+				workspaceContextBlock: params.workspaceContextBlock,
+				maxContextWindowTokens: params.modelContextWindow,
+			});
+
+			if (
+				replayPlan.preloadedTurns.length > 0 &&
+				this.currentConfig.enableSqliteFork &&
+				conn.capabilities?.sessionCapabilities?.resume
+			) {
+				const seededSessionId = await createPreloadedSqliteConversation(
+					this.currentConfig,
+					replayPlan.preloadedTurns,
 				);
-			} catch (error) {
-				if (mcpToken) {
-					this.httpMcpBridge.unregisterSessionBinding(mcpToken);
+				if (seededSessionId) {
+					try {
+						sessionInfo = await conn.request<AcpSessionResumeResult>(
+							"session/resume",
+							{
+								sessionId: seededSessionId,
+								cwd: params.cwd,
+								mcpServers,
+								additionalDirectories: addDirs,
+							},
+							{ timeoutMs: 25_000, signal: params.signal },
+						);
+						initialPromptBlocks = replayPlan.finalPromptBlocks;
+					} catch {
+						sessionInfo = undefined;
+						removeEmptyProbeSessionFiles(this.currentConfig, seededSessionId);
+					}
 				}
-				throw error;
 			}
-			const replayBlocks = buildFreshReplayPromptBlocks(params.visibleMessages);
-			initialPromptBlocks = params.workspaceContextBlock
-				? [{ type: "text", text: params.workspaceContextBlock }, ...replayBlocks]
-				: replayBlocks;
+
+			if (!sessionInfo || !initialPromptBlocks) {
+				try {
+					sessionInfo = await conn.request<AcpSessionNewResult>(
+						"session/new",
+						{
+							cwd: params.cwd,
+							mcpServers,
+							additionalDirectories: addDirs,
+						},
+						{ timeoutMs: 25_000, signal: params.signal },
+					);
+				} catch (error) {
+					if (mcpToken) {
+						this.httpMcpBridge.unregisterSessionBinding(mcpToken);
+					}
+					throw error;
+				}
+				initialPromptBlocks =
+					replayPlan.preloadedTurns.length > 0
+						? replayPlan.singleStepFallbackBlocks
+						: replayPlan.finalPromptBlocks;
+			}
+
 			syncedProjectionDigest = priorProjection.projectionDigest;
 			syncedProjectedCount = priorProjection.archivedCount;
 		}
@@ -2656,14 +2943,59 @@ export class TurnCoordinator {
 			options?.signal,
 		);
 
-		const sessionRes = await conn.request<AcpSessionNewResult>(
-			"session/new",
-			{
-				cwd,
-				mcpServers: [],
-			},
-			{ timeoutMs: 20_000, signal: options?.signal },
-		);
+		const visible = extractVisibleMessages(context.messages);
+		const auxInstructions = extractAuxiliaryTaskInstructions(context);
+		const auxPlan = buildFreshReplayPlan({
+			visibleMessages: visible,
+			workspaceContextBlock: auxInstructions
+				? `<task_instructions>\n${auxInstructions}\n</task_instructions>`
+				: undefined,
+			maxContextWindowTokens: model.contextWindow,
+		});
+
+		let sessionRes: AcpSessionNewResult | undefined;
+		let promptBlocks: AcpPromptBlock[] = auxPlan.finalPromptBlocks;
+
+		if (
+			auxPlan.preloadedTurns.length > 0 &&
+			this.currentConfig.enableSqliteFork &&
+			conn.capabilities?.sessionCapabilities?.resume
+		) {
+			const seededId = await createPreloadedSqliteConversation(
+				this.currentConfig,
+				auxPlan.preloadedTurns,
+			);
+			if (seededId) {
+				try {
+					sessionRes = await conn.request<AcpSessionResumeResult>(
+						"session/resume",
+						{
+							sessionId: seededId,
+							cwd,
+							mcpServers: [],
+						},
+						{ timeoutMs: 25_000, signal: options?.signal },
+					);
+				} catch {
+					sessionRes = undefined;
+					removeEmptyProbeSessionFiles(this.currentConfig, seededId);
+				}
+			}
+		}
+
+		if (!sessionRes) {
+			sessionRes = await conn.request<AcpSessionNewResult>(
+				"session/new",
+				{
+					cwd,
+					mcpServers: [],
+				},
+				{ timeoutMs: 20_000, signal: options?.signal },
+			);
+			if (auxPlan.preloadedTurns.length > 0) {
+				promptBlocks = auxPlan.singleStepFallbackBlocks;
+			}
+		}
 
 		const tempSessionId = sessionRes.sessionId;
 		const resolved = resolveSessionModelSelection(
@@ -2672,6 +3004,14 @@ export class TurnCoordinator {
 			sessionRes.configOptions ?? [],
 			sessionRes.models?.availableModels ?? [],
 		);
+
+		let tempSessionCleaned = false;
+		const cleanupTempSession = async () => {
+			if (tempSessionCleaned) return;
+			tempSessionCleaned = true;
+			await conn.closeSessionSafe(tempSessionId);
+			removeEmptyProbeSessionFiles(this.currentConfig, tempSessionId);
+		};
 
 		try {
 			const modelRes = await conn
@@ -2721,18 +3061,6 @@ export class TurnCoordinator {
 			});
 
 			try {
-				const visible = extractVisibleMessages(context.messages);
-				const basePromptBlocks = buildFreshReplayPromptBlocks(visible);
-				const auxInstructions = extractAuxiliaryTaskInstructions(context);
-				const promptBlocks: AcpPromptBlock[] = auxInstructions
-					? [
-							{
-								type: "text",
-								text: `<task_instructions>\n${auxInstructions}\n</task_instructions>`,
-							},
-							...basePromptBlocks,
-						]
-					: basePromptBlocks;
 				const onAuxAbort = () => {
 					conn.notify("session/cancel", { sessionId: tempSessionId });
 				};
@@ -2747,6 +3075,7 @@ export class TurnCoordinator {
 						},
 						{ signal: options?.signal },
 					);
+					await cleanupTempSession();
 					if (detectedQuotaErr) {
 						writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);
 						return;
@@ -2762,8 +3091,7 @@ export class TurnCoordinator {
 				unsubscribe();
 			}
 		} finally {
-			await conn.closeSessionSafe(tempSessionId);
-			removeEmptyProbeSessionFiles(this.currentConfig, tempSessionId);
+			await cleanupTempSession();
 		}
 	}
 

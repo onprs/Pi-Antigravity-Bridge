@@ -14,19 +14,30 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
 import {
 	AGY_SESSION_ANCHOR_CUSTOM_TYPE,
+	appendPreloadedTurnsToSqliteConversation,
 	captureSqliteCheckpoint,
+	createPreloadedSqliteConversation,
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
 	parseStepMetadataGenerationUsage,
 	parseStepPayloadPlannedToolCount,
+	readCurrentMaxSqliteStepIdx,
 	readSqliteGenerationUsagesSince,
 } from "../src/session/checkpoint-sync.ts";
 import {
+	buildFreshReplayPlan,
 	buildFreshReplayPromptBlocks,
+	buildPromptBlocksPreloadPlan,
 	computeTranscriptDigest,
+	estimateStepTokens,
+	exceedsSafeSingleStepBudget,
 	extractAuxiliaryTaskInstructions,
 	inspectTrafficOptProjectionState,
 	isAuxiliarySingleTurnRequest,
+	measurePromptBlocksSize,
+	SAFE_SINGLE_STEP_MAX_BYTES,
+	SAFE_SINGLE_STEP_MAX_TOKENS,
+	splitTextToSafeChunks,
 } from "../src/session/reconcile.ts";
 import {
 	convertAcpUsageToPiUsage,
@@ -585,5 +596,231 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			.join("\n");
 		assert.ok(mergedReplayText.includes(`context_recall({id:"ctx://tool/${hash64}"})`));
 		assert.ok(!mergedReplayText.includes("[tool output truncated in replay]"));
+	});
+
+	it("buildFreshReplayPlan 与 buildPromptBlocksPreloadPlan 在单步内零开销直发，超限时生成严守双阈值的多步预注入与安全降级", () => {
+		const baseAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "ok" }],
+			api: "antigravity-acp",
+			provider: "antigravity",
+			model: "gemini-4-neon",
+			usage: {
+				input: 10,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 15,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+
+		// 1. 短历史 + 工作区上下文可在单步安全预算内装下 -> preloadedTurns 为空
+		const shortPlan = buildFreshReplayPlan({
+			visibleMessages: [
+				{ role: "user", content: "第一句", timestamp: 1 },
+				baseAssistant,
+				{ role: "user", content: "第二句", timestamp: 2 },
+			],
+			workspaceContextBlock: "<workspace_context>short</workspace_context>",
+		});
+		assert.equal(shortPlan.preloadedTurns.length, 0);
+		assert.equal(shortPlan.omittedMessageCount, 0);
+		assert.ok(
+			shortPlan.finalPromptBlocks.some(
+				(b) => b.type === "text" && b.text.includes("<workspace_context>short</workspace_context>"),
+			),
+		);
+
+		// 2. 超长中英代码混合历史 + 32KB workspaceContextBlock -> 多步预注入零丢失 + 单步降级严守双阈值且保住末尾提问
+		const bigWorkspace = `<workspace_context>\n${"规则描述与技能清单 ".repeat(1_200)}\n</workspace_context>`;
+		const longMessages: (UserMessage | AssistantMessage)[] = [];
+		for (let i = 0; i < 40; i++) {
+			longMessages.push({
+				role: "user",
+				content: `TURN_${i}_SECRET_${i * 7}: ${"代码片段 { key: 12345, val: '中文测试' } ".repeat(90)}`,
+				timestamp: i * 2 + 1,
+			});
+			longMessages.push({
+				...baseAssistant,
+				content: [
+					{
+						type: "text",
+						text: `REPLY_${i}: ${"分析结果与调用说明 alpha beta gamma 9876543210 ".repeat(85)}`,
+					},
+				],
+				timestamp: i * 2 + 2,
+			});
+		}
+		const criticalTail: UserMessage = {
+			role: "user",
+			content: "FINAL_TAIL_QUESTION_MUST_SURVIVE_BOTH_PATHS_9999",
+			timestamp: 99999,
+		};
+
+		const bigPlan = buildFreshReplayPlan({
+			visibleMessages: [...longMessages, criticalTail],
+			workspaceContextBlock: bigWorkspace,
+			maxContextWindowTokens: 1_000_000,
+		});
+		assert.ok(bigPlan.preloadedTurns.length >= 2, `应拆分为多步预注入，实际=${bigPlan.preloadedTurns.length}`);
+		assert.equal(bigPlan.omittedMessageCount, 0, "1M 窗口下应完整保留全部 80 条历史零省略");
+
+		// 验证每一条预注入 USER_INPUT 步与最终 prompt 均严格低于单步安全红线
+		for (const turn of bigPlan.preloadedTurns) {
+			assert.ok(
+				Buffer.byteLength(turn.userText, "utf8") <= SAFE_SINGLE_STEP_MAX_BYTES,
+				"预注入步字节数超标",
+			);
+			assert.ok(
+				estimateStepTokens(turn.userText) <= SAFE_SINGLE_STEP_MAX_TOKENS,
+				"预注入步估算 token 超标",
+			);
+			assert.ok(turn.assistantAckText.length > 0);
+		}
+		assert.equal(exceedsSafeSingleStepBudget(bigPlan.finalPromptBlocks), false);
+		const allPreloadedText = bigPlan.preloadedTurns.map((t) => t.userText).join("\n");
+		assert.ok(allPreloadedText.includes("<workspace_context>"), "首步应包含 workspace_context");
+		assert.ok(allPreloadedText.includes("TURN_0_SECRET_0"), "最早一轮历史必须完整保留");
+		assert.ok(allPreloadedText.includes("TURN_39_SECRET_273"), "最近历史必须完整保留");
+		const finalText = bigPlan.finalPromptBlocks
+			.filter((b): b is { type: "text"; text: string } => b.type === "text")
+			.map((b) => b.text)
+			.join("\n");
+		assert.ok(finalText.includes("FINAL_TAIL_QUESTION_MUST_SURVIVE_BOTH_PATHS_9999"));
+		assert.ok(!finalText.includes("<workspace_context>"), "workspace_context 不应重复发送");
+
+		// 验证无 SQLite 单步降级块也严格低于双阈值，且完整保留末尾提问
+		const fallbackMeasured = measurePromptBlocksSize(bigPlan.singleStepFallbackBlocks);
+		assert.ok(fallbackMeasured.bytes <= SAFE_SINGLE_STEP_MAX_BYTES);
+		assert.ok(fallbackMeasured.tokens <= SAFE_SINGLE_STEP_MAX_TOKENS);
+		const fallbackText = bigPlan.singleStepFallbackBlocks
+			.filter((b): b is { type: "text"; text: string } => b.type === "text")
+			.map((b) => b.text)
+			.join("\n");
+		assert.ok(fallbackText.includes("FINAL_TAIL_QUESTION_MUST_SURVIVE_BOTH_PATHS_9999"));
+
+		// 3. 超长单条文本切片不撕裂 UTF-16 代理对，且 buildPromptBlocksPreloadPlan 保留末尾指令与图片块
+		const emojiLog = `HEAD_MARKER\n${"日志🔥🚀代码 0123456789\n".repeat(4_500)}TAIL_MARKER_8888`;
+		const chunks = splitTextToSafeChunks(emojiLog, 20_000, 12_000);
+		assert.ok(chunks.length >= 4);
+		assert.equal(chunks.join(""), emojiLog, "切片拼接必须 100% 无损还原原文");
+		for (const c of chunks) {
+			assert.ok(Buffer.byteLength(c, "utf8") <= 20_000);
+			assert.ok(estimateStepTokens(c) <= 12_000);
+			// 不允许末尾悬挂高代理项或开头悬挂低代理项
+			const first = c.charCodeAt(0);
+			const last = c.charCodeAt(c.length - 1);
+			assert.ok(!(first >= 0xdc00 && first <= 0xdfff), "切片开头出现残缺低代理项");
+			assert.ok(!(last >= 0xd800 && last <= 0xdbff), "切片末尾出现残缺高代理项");
+		}
+
+		const singleBlockPlan = buildPromptBlocksPreloadPlan([
+			{ type: "text", text: emojiLog },
+			{ type: "image", data: "BASE64IMG", mimeType: "image/png" },
+		]);
+		assert.ok(singleBlockPlan.preloadedTurns.length >= 1);
+		assert.ok(singleBlockPlan.finalPromptBlocks.some((b) => b.type === "image" && b.data === "BASE64IMG"));
+		assert.equal(exceedsSafeSingleStepBudget(singleBlockPlan.finalPromptBlocks), false);
+		assert.equal(exceedsSafeSingleStepBudget(singleBlockPlan.singleStepFallbackBlocks), false);
+		const fallbackSingleText = singleBlockPlan.singleStepFallbackBlocks
+			.filter((b): b is { type: "text"; text: string } => b.type === "text")
+			.map((b) => b.text)
+			.join("\n");
+		assert.ok(fallbackSingleText.includes("HEAD_MARKER"));
+		assert.ok(fallbackSingleText.includes("TAIL_MARKER_8888"));
+	});
+
+	it("createPreloadedSqliteConversation 与 appendPreloadedTurnsToSqliteConversation 写入合规库结构且不污染统计水位", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-preload-db-"));
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+			enableSqliteFork: true,
+		};
+
+		try {
+			const seededId = await createPreloadedSqliteConversation(cfg, [
+				{ userText: "PART_1_CONTENT_你好", assistantAckText: "Ack 1" },
+				{ userText: "PART_2_CONTENT_世界", assistantAckText: "Ack 2" },
+			]);
+			assert.ok(seededId);
+
+			const dbPath = path.join(cfg.geminiDir, "antigravity-cli", "conversations", `${seededId}.db`);
+			assert.ok(fs.existsSync(dbPath));
+
+			const db = new DatabaseSync(dbPath, { readOnly: true });
+			const uv = db.prepare("PRAGMA user_version").get() as { user_version: number };
+			assert.equal(uv.user_version, 1);
+
+			const meta = db.prepare("SELECT * FROM trajectory_meta").get() as {
+				trajectory_id: string;
+				cascade_id: string;
+				trajectory_type: number;
+				source: number;
+			};
+			assert.equal(meta.trajectory_id, seededId);
+			assert.equal(meta.cascade_id, seededId);
+			assert.equal(meta.trajectory_type, 4);
+			assert.equal(meta.source, 17);
+
+			const rows = db
+				.prepare("SELECT idx, step_type, status, metadata, step_payload FROM steps ORDER BY idx ASC")
+				.all() as Array<{
+				idx: number;
+				step_type: number;
+				status: number;
+				metadata: Uint8Array | null;
+				step_payload: Uint8Array;
+			}>;
+			assert.equal(rows.length, 4);
+			assert.deepEqual(
+				rows.map((r) => [r.idx, r.step_type, r.status, r.metadata]),
+				[
+					[0, 14, 3, null],
+					[1, 15, 3, null],
+					[2, 14, 3, null],
+					[3, 15, 3, null],
+				],
+			);
+			assert.ok(Buffer.from(rows[0].step_payload).includes("PART_1_CONTENT_你好"));
+			assert.ok(Buffer.from(rows[3].step_payload).includes("Ack 2"));
+			db.close();
+
+			// 水位读取与真实 token 统计不被预注入步污染
+			assert.equal(await readCurrentMaxSqliteStepIdx(cfg, seededId), 3);
+			assert.deepEqual(await readSqliteGenerationUsagesSince(cfg, seededId, -1), []);
+
+			// 模拟分叉尾部停在 USER_INPUT（step_type=14），追加时应自动补一条 PLANNER_RESPONSE 保持严格交替
+			const dbEdit = new DatabaseSync(dbPath);
+			dbEdit.prepare("DELETE FROM steps WHERE idx = 3").run();
+			dbEdit.close();
+
+			const appended = await appendPreloadedTurnsToSqliteConversation(cfg, seededId, [
+				{ userText: "APPENDED_PART_3", assistantAckText: "Ack 3" },
+			]);
+			assert.equal(appended, true);
+
+			const dbCheck = new DatabaseSync(dbPath, { readOnly: true });
+			const afterRows = dbCheck
+				.prepare("SELECT idx, step_type FROM steps ORDER BY idx ASC")
+				.all() as Array<{ idx: number; step_type: number }>;
+			dbCheck.close();
+			assert.deepEqual(
+				afterRows.map((r) => [r.idx, r.step_type]),
+				[
+					[0, 14],
+					[1, 15],
+					[2, 14],
+					[3, 15],
+					[4, 14],
+					[5, 15],
+				],
+			);
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
 	});
 });
