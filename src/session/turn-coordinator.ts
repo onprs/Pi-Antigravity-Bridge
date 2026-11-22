@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import {
 	getCurrentTools,
 	type Api,
@@ -38,6 +39,7 @@ import {
 } from "../catalog/model-discovery.ts";
 import {
 	type BridgeConfig,
+	resolveAgyConversationsDir,
 	resolveEffectiveFlags,
 	type ToolMode,
 } from "../config.ts";
@@ -67,7 +69,9 @@ import {
 	forkSqliteConversationAtCheckpoint,
 	hasLocalConversationDb,
 	hasValidAgentMetadataBlob,
+	readCurrentMaxSqliteGenIdx,
 	readCurrentMaxSqliteStepIdx,
+	readLatestSqliteUpstreamRequestSince,
 	readSqliteGenerationUsagesSince,
 	readSqliteGenerationUsagesSinceWithRetry,
 	waitForSqliteToolStepsSettled,
@@ -213,6 +217,12 @@ interface ActiveTurnPump {
 	readonly emittedMcpCallIds: Set<string>;
 	/** 本轮宿主 MCP 工具返回中因超过 `agy` 10KB 媒体内联上限而延迟到工具边界多模态 `session/prompt` 投递的图片 */
 	readonly deferredMcpImages: DeferredMcpImagePayload[];
+	/** 本步是否已向观测扩展通告 `x-acp-upstream-pending: 1` 等待上游全量快照 */
+	awaitingUpstreamTelemetry: boolean;
+	/** 本步进入时的归档投影是否与后端会话一致（透传给 `acp-upstream` 响应头） */
+	lastStepProjectionSynced: boolean;
+	/** 本步刚完成的中间步骤是否复用了同一次生成的工具切片池（未向云端发起新请求） */
+	lastStepUsedSlicePool: boolean;
 }
 
 interface PendingGenSlicePool {
@@ -259,6 +269,8 @@ interface ManagedSessionLedger {
 	lastObservedCacheRatio?: number;
 	/** 本地 SQLite `steps` 表已消费至的最大 `idx`（仅对大于该水位的 `step_type=15` 新生成记账） */
 	lastConsumedStepIdx: number;
+	/** 本地 SQLite `gen_metadata` 表已上报上游流量快照的最大 `idx`（防顺序工具切片重复计费） */
+	lastReportedUpstreamGenIdx: number;
 	/** 单次模型生成内含多个顺序工具调用时的整数守恒分摊池（消除后续子步 0 提示词造成的缓存命中率闪烁） */
 	pendingGenSlicePool?: PendingGenSlicePool;
 	/** 是否正处于工具边界 steer/reload 切入收口窗口，期间拒绝新冲入的同批后续 MCP 调用 */
@@ -874,6 +886,10 @@ export class TurnCoordinator {
 							existing.lastConsumedStepIdx,
 							await readCurrentMaxSqliteStepIdx(this.currentConfig, existing.agySessionId),
 						);
+						existing.lastReportedUpstreamGenIdx = Math.max(
+							existing.lastReportedUpstreamGenIdx,
+							await readCurrentMaxSqliteGenIdx(this.currentConfig, existing.agySessionId),
+						);
 						this.httpMcpBridge.clearSessionCancelled(existing.agySessionId);
 						await this.executePromptOnLedger(
 							existing,
@@ -886,6 +902,10 @@ export class TurnCoordinator {
 						return;
 					}
 				} else {
+					const currentProjection = inspectTrafficOptProjectionState(visibleMessages);
+					existing.activePump.lastStepProjectionSynced =
+						currentProjection.projectionDigest === existing.syncedProjectionDigest;
+					existing.activePump.lastStepUsedSlicePool = false;
 					writer.setResponseMetadata({
 						responseId: existing.agySessionId,
 						providerThinkingLevel: existing.appliedThoughtLevel,
@@ -1272,6 +1292,10 @@ export class TurnCoordinator {
 			ledger.appliedThoughtLevel = undefined;
 			ledger.appliedExecMode = undefined;
 			ledger.lastConsumedStepIdx = await readCurrentMaxSqliteStepIdx(
+				this.currentConfig,
+				resumed.sessionId,
+			);
+			ledger.lastReportedUpstreamGenIdx = await readCurrentMaxSqliteGenIdx(
 				this.currentConfig,
 				resumed.sessionId,
 			);
@@ -1677,17 +1701,31 @@ export class TurnCoordinator {
 			});
 		}
 
+		const currentProjectionForMcp = inspectTrafficOptProjectionState(visibleMessages);
+		const isMcpProjectionSynced =
+			currentProjectionForMcp.projectionDigest === ledger.syncedProjectionDigest;
+		const willCutInAny =
+			willCutInForSteer || willCutInForToolsReload || willCutInForDeferredImages;
+		const hasUpstreamDb = this.isLocalSqliteUpstreamLikelyAvailable(ledger.agySessionId);
+
 		if (options?.onResponse && settledMcpIds.length > 0) {
-			const currentProjection = inspectTrafficOptProjectionState(visibleMessages);
 			const responseHeaders: Record<string, string> = {
 				"x-acp-session-id": ledger.agySessionId,
 				"x-acp-transport": "acp-mcp-result",
 				"x-acp-settled-mcp-ids": settledMcpIds.join(","),
-				"x-acp-projection-synced":
-					currentProjection.projectionDigest === ledger.syncedProjectionDigest ? "1" : "0",
+				"x-acp-projection-synced": isMcpProjectionSynced ? "1" : "0",
 			};
 			if (hasDeferredImagesInSettledBatch) {
 				responseHeaders["x-acp-mcp-images-deferred"] = String(AGY_MCP_INLINE_IMAGE_SAFE_BYTES);
+			}
+			if (willCutInAny) {
+				responseHeaders["x-acp-mcp-cutin"] = "1";
+			}
+			if (hasUpstreamDb) {
+				responseHeaders["x-acp-upstream-pending"] = "1";
+				if (!willCutInAny) {
+					pump.awaitingUpstreamTelemetry = true;
+				}
 			}
 			await options.onResponse(
 				{
@@ -1697,6 +1735,8 @@ export class TurnCoordinator {
 				model,
 			);
 		}
+		pump.lastStepProjectionSynced = isMcpProjectionSynced;
+		pump.lastStepUsedSlicePool = false;
 
 		// 若用户在工具执行期间按 Enter 发送了转向消息（steer）：
 		// 先等待刚结算的工具输出落盘至本地会话库，随即在当前工具边界收口后台自动循环，立即在同一热缓存会话上以真实用户身份发送转向消息！
@@ -1755,6 +1795,7 @@ export class TurnCoordinator {
 				return;
 			}
 
+			await this.flushCutInCancelledUpstreamTelemetry(ledger, model, options);
 			if (needsMidTurnToolsReload) {
 				await this.reloadLedgerSessionForTools(ledger, hostMcpTools, toolsDigest, options?.signal);
 			} else {
@@ -1795,6 +1836,7 @@ export class TurnCoordinator {
 			this.abortLedgerTurnNonBlocking(ledger);
 			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
 			if (idleOk) {
+				await this.flushCutInCancelledUpstreamTelemetry(ledger, model, options);
 				const reloaded = await this.reloadLedgerSessionForTools(
 					ledger,
 					hostMcpTools,
@@ -1906,6 +1948,7 @@ export class TurnCoordinator {
 				return;
 			}
 
+			await this.flushCutInCancelledUpstreamTelemetry(ledger, model, options);
 			ledger.lastConsumedStepIdx = Math.max(
 				ledger.lastConsumedStepIdx,
 				await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
@@ -2319,6 +2362,10 @@ export class TurnCoordinator {
 				this.currentConfig,
 				sessionInfo.sessionId,
 			);
+			const initialMaxGenIdx = await readCurrentMaxSqliteGenIdx(
+				this.currentConfig,
+				sessionInfo.sessionId,
+			);
 
 			const ledger: ManagedSessionLedger = Object.assign(ledgerDraft, {
 				piSessionKey: params.piSessionKey,
@@ -2342,6 +2389,7 @@ export class TurnCoordinator {
 				syncedProjectedCount,
 				cachedPrefixTokens: 0,
 				lastConsumedStepIdx: initialMaxStepIdx,
+				lastReportedUpstreamGenIdx: initialMaxGenIdx,
 				tier,
 				parkedCalls: ledgerDraft.parkedCalls!,
 				detachedCallIds: ledgerDraft.detachedCallIds!,
@@ -2560,6 +2608,11 @@ export class TurnCoordinator {
 			return;
 		}
 
+		const currentProjection = inspectTrafficOptProjectionState(visibleMessagesBeforeAssistant);
+		const isProjectionSynced =
+			currentProjection.projectionDigest === ledger.syncedProjectionDigest;
+		const willReportUpstream = this.isLocalSqliteUpstreamLikelyAvailable(ledger.agySessionId);
+
 		const pump: ActiveTurnPump = {
 			queue: new AsyncEventQueue<PumpQueueItem>(),
 			finished: false,
@@ -2570,6 +2623,9 @@ export class TurnCoordinator {
 			pendingAnnouncedMcpCount: 0,
 			emittedMcpCallIds: new Set<string>(),
 			deferredMcpImages: [],
+			awaitingUpstreamTelemetry: willReportUpstream,
+			lastStepProjectionSynced: isProjectionSynced,
+			lastStepUsedSlicePool: false,
 		};
 		ledger.activePump = pump;
 		this.startTrackedSessionPrompt(ledger, pump, {
@@ -2578,16 +2634,17 @@ export class TurnCoordinator {
 		});
 
 		if (options?.onResponse) {
-			const currentProjection = inspectTrafficOptProjectionState(visibleMessagesBeforeAssistant);
-			const isProjectionSynced =
-				currentProjection.projectionDigest === ledger.syncedProjectionDigest;
+			const headers: Record<string, string> = {
+				"x-acp-session-id": ledger.agySessionId,
+				"x-acp-projection-synced": isProjectionSynced ? "1" : "0",
+			};
+			if (willReportUpstream) {
+				headers["x-acp-upstream-pending"] = "1";
+			}
 			await options.onResponse(
 				{
 					status: 200,
-					headers: {
-						"x-acp-session-id": ledger.agySessionId,
-						"x-acp-projection-synced": isProjectionSynced ? "1" : "0",
-					},
+					headers,
 				},
 				model,
 			);
@@ -2650,6 +2707,9 @@ export class TurnCoordinator {
 					if (update.content.type === "text") {
 						const { quotaError } = writer.appendTextDelta(update.content.text);
 						if (quotaError) {
+							await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+								status: 429,
+							});
 							abortCurrentTurnSync();
 							writer.fail("error", `Antigravity quota exhausted (429): ${quotaError}`);
 							return;
@@ -2704,7 +2764,11 @@ export class TurnCoordinator {
 						return;
 					}
 
-					writer.finishWithToolUse(await this.buildIntermediateStepUsage(ledger, pump, writer));
+					const mirrorUsage = await this.buildIntermediateStepUsage(ledger, pump, writer);
+					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+						status: 200,
+					});
+					writer.finishWithToolUse(mirrorUsage);
 					return;
 				}
 
@@ -2771,7 +2835,11 @@ export class TurnCoordinator {
 					return;
 				}
 
-				writer.finishWithToolUse(await this.buildIntermediateStepUsage(ledger, pump, writer));
+				const mcpUsage = await this.buildIntermediateStepUsage(ledger, pump, writer);
+				await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+					status: 200,
+				});
+				writer.finishWithToolUse(mcpUsage);
 				return;
 			}
 
@@ -2789,6 +2857,9 @@ export class TurnCoordinator {
 					return;
 				}
 				if (item.response.stopReason === "refusal") {
+					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+						status: 400,
+					});
 					ledger.activePump = undefined;
 					writer.fail("error", "Model refused the request");
 					return;
@@ -2802,6 +2873,9 @@ export class TurnCoordinator {
 					writer,
 					item.response.usage,
 				);
+				await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+					status: 200,
+				});
 				const { quotaError } = writer.finishTurn(
 					item.response.stopReason,
 					calibratedUsage,
@@ -2813,13 +2887,156 @@ export class TurnCoordinator {
 			}
 
 			if (item.kind === "prompt_error") {
-				this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
-				ledger.activePump = undefined;
 				const errMsg =
 					item.error instanceof Error ? item.error.message : String(item.error);
+				const statusMatch = /\b([45]\d\d)\b/.exec(errMsg);
+				if (!signal?.aborted) {
+					await this.emitUpstreamTelemetryForStep(ledger, pump, model, options, {
+						status: statusMatch ? Number(statusMatch[1]) : 500,
+					});
+				}
+				this.mirrorBroker.abortSessionCalls(ledger.agySessionId, "ACP prompt error");
+				ledger.activePump = undefined;
 				writer.fail(signal?.aborted ? "aborted" : "error", errMsg);
 				return;
 			}
+		}
+	}
+
+	/**
+	 * 工具边界切入（延迟大图、steer、动态重载）触发 `session/cancel` 并等待前序在途请求收敛后，
+	 * 若 `agy` 已在 20ms 落盘窗口内抢跑发起了 1 次被取消的上游生成，提前按其自身真实快照独立结算并推进水位，
+	 * 防止随后的切入多模态请求因 `newGenCount > 1` 而把新大图误重计到前序被取消代次中。
+	 */
+	private async flushCutInCancelledUpstreamTelemetry(
+		ledger: ManagedSessionLedger,
+		model: Model<Api>,
+		options: SimpleStreamOptions | undefined,
+	): Promise<void> {
+		if (!hasLocalConversationDb(this.currentConfig, ledger.agySessionId)) {
+			return;
+		}
+		const query = await readLatestSqliteUpstreamRequestSince(
+			this.currentConfig,
+			ledger.agySessionId,
+			ledger.lastReportedUpstreamGenIdx,
+			[],
+		);
+		if (query.newGenCount <= 0) {
+			return;
+		}
+		ledger.lastReportedUpstreamGenIdx = Math.max(
+			ledger.lastReportedUpstreamGenIdx,
+			query.maxGenIdx,
+		);
+		if (query.latest && options?.onResponse) {
+			await options.onResponse(
+				{
+					status: 499,
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-transport": "acp-upstream",
+						"x-acp-upstream-detached": "1",
+						"x-acp-upstream-gen-count": String(Math.max(1, query.newGenCount)),
+						"x-acp-upstream-snapshot": JSON.stringify(query.latest),
+					},
+				},
+				model,
+			);
+		}
+	}
+
+	private isLocalSqliteUpstreamLikelyAvailable(agySessionId: string): boolean {
+		if (!agySessionId) return false;
+		if (hasLocalConversationDb(this.currentConfig, agySessionId)) return true;
+		try {
+			return fs.existsSync(resolveAgyConversationsDir(this.currentConfig));
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * 在当前推理步完成后，从只读 SQLite `gen_metadata` 提取 `agy` 实际发往远端云端的全量请求分类统计并通过 `options.onResponse` 上报。
+	 * - 若本步产生了新上游生成：发射 `x-acp-transport: acp-upstream` 携带精确全量统计与图片清单；
+	 * - 若本步仅复用同一次生成的顺序工具切片（未新发外网请求）：发射 `x-acp-transport: acp-upstream-reused` 防止重复计费；
+	 * - 若本地库不可用或无快照且曾通告 `x-acp-upstream-pending: 1`：发射 `x-acp-transport: acp-upstream-unavailable` 让观测扩展平滑回退至本地载荷计量。
+	 */
+	private async emitUpstreamTelemetryForStep(
+		ledger: ManagedSessionLedger,
+		pump: ActiveTurnPump,
+		model: Model<Api>,
+		options: SimpleStreamOptions | undefined,
+		params: { status: number },
+	): Promise<void> {
+		if (!options?.onResponse) return;
+		const wasAwaiting = pump.awaitingUpstreamTelemetry;
+		pump.awaitingUpstreamTelemetry = false;
+
+		const hasDb = hasLocalConversationDb(this.currentConfig, ledger.agySessionId);
+		if (!hasDb && !wasAwaiting) {
+			return;
+		}
+
+		const projectionHeader = pump.lastStepProjectionSynced ? "1" : "0";
+		const retryDelays = pump.lastStepUsedSlicePool ? [] : [20, 40];
+		const query = hasDb
+			? await readLatestSqliteUpstreamRequestSince(
+					this.currentConfig,
+					ledger.agySessionId,
+					ledger.lastReportedUpstreamGenIdx,
+					retryDelays,
+				)
+			: { maxGenIdx: ledger.lastReportedUpstreamGenIdx, newGenCount: 0 };
+
+		if (query.latest) {
+			ledger.lastReportedUpstreamGenIdx = Math.max(
+				ledger.lastReportedUpstreamGenIdx,
+				query.maxGenIdx,
+			);
+			await options.onResponse(
+				{
+					status: params.status,
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-transport": "acp-upstream",
+						"x-acp-projection-synced": projectionHeader,
+						"x-acp-upstream-gen-count": String(Math.max(1, query.newGenCount)),
+						"x-acp-upstream-snapshot": JSON.stringify(query.latest),
+					},
+				},
+				model,
+			);
+			return;
+		}
+
+		if (query.newGenCount === 0 && pump.lastStepUsedSlicePool) {
+			await options.onResponse(
+				{
+					status: params.status,
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-transport": "acp-upstream-reused",
+						"x-acp-projection-synced": projectionHeader,
+					},
+				},
+				model,
+			);
+			return;
+		}
+
+		if (wasAwaiting) {
+			await options.onResponse(
+				{
+					status: params.status,
+					headers: {
+						"x-acp-session-id": ledger.agySessionId,
+						"x-acp-transport": "acp-upstream-unavailable",
+						"x-acp-projection-synced": projectionHeader,
+					},
+				},
+				model,
+			);
 		}
 	}
 
@@ -2975,6 +3192,7 @@ export class TurnCoordinator {
 			pump.hasSqliteGenTelemetry ||
 			(liveWindowUsed > 0 && pump.lastAccountedWindowUsed === liveWindowUsed)
 		) {
+			pump.lastStepUsedSlicePool = true;
 			const pool = ledger.pendingGenSlicePool;
 			if (pool && pool.remainingSlices > 0) {
 				const k = pool.remainingSlices;
@@ -3399,27 +3617,109 @@ export class TurnCoordinator {
 						}
 						return;
 					}
+					const auxWillReportUpstream =
+						this.isLocalSqliteUpstreamLikelyAvailable(tempSessionId);
 					if (options?.onResponse) {
+						const auxHeaders: Record<string, string> = {
+							"x-acp-session-id": tempSessionId,
+							"x-acp-auxiliary": "1",
+						};
+						if (auxWillReportUpstream) {
+							auxHeaders["x-acp-upstream-pending"] = "1";
+						}
 						await options.onResponse(
 							{
 								status: 200,
-								headers: {
-									"x-acp-session-id": tempSessionId,
-									"x-acp-auxiliary": "1",
-								},
+								headers: auxHeaders,
 							},
 							model,
 						);
 					}
 					writer.ensureStarted();
-					const promptRes = await conn.request<AcpPromptResponse>(
-						"session/prompt",
-						{
-							sessionId: auxOutboundPayload.sessionId,
-							prompt: auxOutboundPayload.prompt,
-						},
-						{ signal: options?.signal },
-					);
+					let promptRes: AcpPromptResponse;
+					try {
+						promptRes = await conn.request<AcpPromptResponse>(
+							"session/prompt",
+							{
+								sessionId: auxOutboundPayload.sessionId,
+								prompt: auxOutboundPayload.prompt,
+							},
+							{ signal: options?.signal },
+						);
+					} catch (auxError) {
+						if (options?.onResponse && auxWillReportUpstream) {
+							const auxErrMsg =
+								auxError instanceof Error ? auxError.message : String(auxError);
+							const statusMatch = /\b([45]\d\d)\b/.exec(auxErrMsg);
+							const auxStatus = statusMatch ? Number(statusMatch[1]) : 500;
+							const auxQuery = await readLatestSqliteUpstreamRequestSince(
+								this.currentConfig,
+								tempSessionId,
+								-1,
+								[],
+							);
+							await options.onResponse(
+								{
+									status: auxStatus,
+									headers: auxQuery.latest
+										? {
+												"x-acp-session-id": tempSessionId,
+												"x-acp-auxiliary": "1",
+												"x-acp-transport": "acp-upstream",
+												"x-acp-upstream-gen-count": String(Math.max(1, auxQuery.newGenCount)),
+												"x-acp-upstream-snapshot": JSON.stringify(auxQuery.latest),
+											}
+										: {
+												"x-acp-session-id": tempSessionId,
+												"x-acp-auxiliary": "1",
+												"x-acp-transport": "acp-upstream-unavailable",
+											},
+								},
+								model,
+							);
+						}
+						throw auxError;
+					}
+					if (options?.onResponse && auxWillReportUpstream) {
+						const auxStatus = detectedQuotaErr
+							? 429
+							: promptRes.stopReason === "refusal"
+								? 400
+								: 200;
+						const auxQuery = await readLatestSqliteUpstreamRequestSince(
+							this.currentConfig,
+							tempSessionId,
+							-1,
+							[20, 40],
+						);
+						if (auxQuery.latest) {
+							await options.onResponse(
+								{
+									status: auxStatus,
+									headers: {
+										"x-acp-session-id": tempSessionId,
+										"x-acp-auxiliary": "1",
+										"x-acp-transport": "acp-upstream",
+										"x-acp-upstream-gen-count": String(Math.max(1, auxQuery.newGenCount)),
+										"x-acp-upstream-snapshot": JSON.stringify(auxQuery.latest),
+									},
+								},
+								model,
+							);
+						} else {
+							await options.onResponse(
+								{
+									status: auxStatus,
+									headers: {
+										"x-acp-session-id": tempSessionId,
+										"x-acp-auxiliary": "1",
+										"x-acp-transport": "acp-upstream-unavailable",
+									},
+								},
+								model,
+							);
+						}
+					}
 					await cleanupTempSession();
 					if (detectedQuotaErr) {
 						writer.fail("error", `Antigravity quota exhausted (429): ${detectedQuotaErr}`);

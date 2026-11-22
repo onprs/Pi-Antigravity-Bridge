@@ -205,6 +205,52 @@ export interface SqliteGenerationUsage {
 	plannedToolCalls?: number;
 }
 
+export interface SqliteUpstreamImageSnapshot {
+	image_hash: string;
+	mime_type: string;
+	decoded_bytes: number;
+	base64_bytes: number;
+	image_payload_bytes: number;
+	source_type: string;
+	tool_name: string;
+}
+
+export interface SqliteUpstreamToolResultSnapshot {
+	tool_name: string;
+	text_bytes: number;
+	image_bytes: number;
+}
+
+/**
+ * 从 `agy` 本地只读 SQLite `gen_metadata` 最新代次还原的完整上游发包分类统计。
+ * 反映 `agy` 实际向远端模型接口发送的全量上下文（含历史消息、工具声明、内联图片与不透明思考签名）。
+ */
+export interface SqliteUpstreamRequestSnapshot {
+	genIdx: number;
+	total_payload_bytes: number;
+	json_payload_bytes: number;
+	system_bytes: number;
+	user_text_bytes: number;
+	assistant_text_bytes: number;
+	tool_call_bytes: number;
+	tool_result_bytes: number;
+	image_payload_bytes: number;
+	image_decoded_bytes: number;
+	tool_schema_bytes: number;
+	opaque_reasoning_bytes: number;
+	other_bytes: number;
+	text_content_utf8_bytes: number;
+	image_count: number;
+	images: SqliteUpstreamImageSnapshot[];
+	results: SqliteUpstreamToolResultSnapshot[];
+}
+
+export interface SqliteUpstreamQueryResult {
+	latest?: SqliteUpstreamRequestSnapshot;
+	maxGenIdx: number;
+	newGenCount: number;
+}
+
 function readProtobufVarint(buf: Uint8Array, offset: number): [number, number] | undefined {
 	let result = 0;
 	let shift = 0;
@@ -484,6 +530,485 @@ export async function readSqliteGenerationUsagesSinceWithRetry(
 		}
 	}
 	return [];
+}
+
+interface RawProtobufField {
+	field: number;
+	wire: number;
+	val?: number;
+	sub?: Uint8Array;
+}
+
+/** 支持完整 64 位（含负数 10 字节）varint 解析，防止 `ChatRequest` 中负整型枚举或偏移量截断扫描 */
+function readProtobufVarint64(buf: Uint8Array, offset: number): [bigint, number] | undefined {
+	let result = 0n;
+	let shift = 0n;
+	let pos = offset;
+	while (pos < buf.length && shift <= 63n) {
+		const byte = buf[pos++];
+		result |= BigInt(byte & 0x7f) << shift;
+		if ((byte & 0x80) === 0) {
+			return [result, pos];
+		}
+		shift += 7n;
+	}
+	return undefined;
+}
+
+function parseRawProtobufFields(buf: Uint8Array): RawProtobufField[] {
+	const fields: RawProtobufField[] = [];
+	let pos = 0;
+	while (pos < buf.length) {
+		const tagRes = readProtobufVarint64(buf, pos);
+		if (!tagRes) break;
+		const [tagBig, afterTag] = tagRes;
+		pos = afterTag;
+		const field = Number(tagBig >> 3n);
+		const wire = Number(tagBig & 7n);
+		if (field <= 0) break;
+
+		if (wire === 0) {
+			const valRes = readProtobufVarint64(buf, pos);
+			if (!valRes) break;
+			pos = valRes[1];
+			fields.push({ field, wire, val: Number(valRes[0]) });
+		} else if (wire === 2) {
+			const lenRes = readProtobufVarint64(buf, pos);
+			if (!lenRes) break;
+			const len = Number(lenRes[0]);
+			const start = lenRes[1];
+			if (!Number.isSafeInteger(len) || len < 0 || start + len > buf.length) break;
+			fields.push({ field, wire, sub: buf.subarray(start, start + len) });
+			pos = start + len;
+		} else if (wire === 1) {
+			if (pos + 8 > buf.length) break;
+			fields.push({ field, wire });
+			pos += 8;
+		} else if (wire === 5) {
+			if (pos + 4 > buf.length) break;
+			fields.push({ field, wire });
+			pos += 4;
+		} else {
+			break;
+		}
+	}
+	return fields;
+}
+
+const utf8Decoder = new TextDecoder("utf-8", { fatal: false });
+
+function encodedJsonStringBytes(text: string): number {
+	return Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
+}
+
+function isReadLikeToolName(name: string): boolean {
+	return name === "read" || name === "agy_read";
+}
+
+function stripHostMcpPrefix(rawName: string): string {
+	return rawName.replace(/^mcp_pi_tools_/, "");
+}
+
+/**
+ * 解析 AGY 本地 SQLite `gen_metadata.data`（最新代次 `field 1` 即完整 `ChatRequest` protobuf），
+ * 还原发往上游云端 `streamGenerateContent` 的全量 JSON 请求体积与内容分类（支持 `pi-tools` / `agy-tools` / `hybrid` 及 Gemini/Claude 全模型）。
+ * 若该条记录已被 `agy` 裁剪为仅剩摘要元数据（无 `field 2` 消息体），返回 `undefined`。
+ */
+export function parseGenMetadataUpstreamRequest(
+	data: Uint8Array,
+	genIdx: number,
+): SqliteUpstreamRequestSnapshot | undefined {
+	if (!data || data.byteLength === 0) return undefined;
+	const topFields = parseRawProtobufFields(data);
+	const chatReqField = topFields.find((f) => f.field === 1 && f.sub && f.sub.byteLength > 0);
+	if (!chatReqField?.sub) return undefined;
+
+	const reqFields = parseRawProtobufFields(chatReqField.sub);
+	const hasMessages = reqFields.some((f) => f.field === 2 && f.sub && f.sub.byteLength > 0);
+	if (!hasMessages) return undefined;
+
+	let system_bytes = 0;
+	let user_text_bytes = 0;
+	let assistant_text_bytes = 0;
+	let tool_call_bytes = 0;
+	let tool_result_bytes = 0;
+	let image_payload_bytes = 0;
+	let image_decoded_bytes = 0;
+	let tool_schema_bytes = 0;
+	let opaque_reasoning_bytes = 0;
+	// 顶层 CCPA JSON 外壳（model/project/requestId/generationConfig 等基础字段）
+	let other_bytes = 256;
+	let text_content_utf8_bytes = 0;
+
+	const callIdToTool = new Map<string, string>();
+	const images: SqliteUpstreamImageSnapshot[] = [];
+	const toolResultTotals = new Map<string, SqliteUpstreamToolResultSnapshot>();
+
+	const recordToolResultBytes = (
+		toolName: string,
+		textDelta: number,
+		imageDelta: number,
+	): SqliteUpstreamToolResultSnapshot => {
+		const normalized = toolName || "unknown";
+		let entry = toolResultTotals.get(normalized);
+		if (!entry) {
+			entry = { tool_name: normalized, text_bytes: 0, image_bytes: 0 };
+			toolResultTotals.set(normalized, entry);
+		}
+		entry.text_bytes += textDelta;
+		entry.image_bytes += imageDelta;
+		return entry;
+	};
+
+	const analyzeEmbeddedAssistantText = (chunk: string): void => {
+		const callRe = /<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/g;
+		let cursor = 0;
+		let match: RegExpExecArray | null;
+		while ((match = callRe.exec(chunk)) !== null) {
+			if (match.index > cursor) {
+				const seg = chunk.slice(cursor, match.index);
+				assistant_text_bytes += encodedJsonStringBytes(seg);
+				text_content_utf8_bytes += Buffer.byteLength(seg, "utf8");
+			}
+			const callChunk = match[0];
+			tool_call_bytes += encodedJsonStringBytes(callChunk);
+			text_content_utf8_bytes += Buffer.byteLength(callChunk, "utf8");
+			cursor = match.index + callChunk.length;
+		}
+		if (cursor < chunk.length) {
+			const tail = chunk.slice(cursor);
+			assistant_text_bytes += encodedJsonStringBytes(tail);
+			text_content_utf8_bytes += Buffer.byteLength(tail, "utf8");
+		}
+	};
+
+	const analyzeEmbeddedUserText = (text: string): string => {
+		const unwrapped = text
+			.replace(/^\s*<USER_REQUEST>\s*/i, "")
+			.replace(/\s*<\/USER_REQUEST>[\s\S]*$/i, "");
+		const totalEncoded = encodedJsonStringBytes(text);
+		const unwrappedEncoded = encodedJsonStringBytes(unwrapped);
+		if (totalEncoded > unwrappedEncoded) {
+			other_bytes += totalEncoded - unwrappedEncoded;
+		}
+
+		const blockRe =
+			/(<(?:workspace_context|task_instructions)>[\s\S]*?<\/(?:workspace_context|task_instructions)>)|(<tool_result\b([^>]*)>[\s\S]*?<\/tool_result>)|(<assistant\b[^>]*>[\s\S]*?<\/assistant>)/g;
+		let cursor = 0;
+		let match: RegExpExecArray | null;
+		let trailingTool = "";
+
+		while ((match = blockRe.exec(unwrapped)) !== null) {
+			if (match.index > cursor) {
+				const gap = unwrapped.slice(cursor, match.index);
+				user_text_bytes += encodedJsonStringBytes(gap);
+				text_content_utf8_bytes += Buffer.byteLength(gap, "utf8");
+				if (gap.trim().length > 0) trailingTool = "";
+			}
+			const chunk = match[0];
+			if (match[1] !== undefined) {
+				system_bytes += encodedJsonStringBytes(chunk);
+				text_content_utf8_bytes += Buffer.byteLength(chunk, "utf8");
+				trailingTool = "";
+			} else if (match[2] !== undefined) {
+				const nameMatch = /\btool="([^"]+)"/.exec(match[3] ?? "");
+				trailingTool = nameMatch?.[1] ?? "unknown";
+				const enc = encodedJsonStringBytes(chunk);
+				tool_result_bytes += enc;
+				text_content_utf8_bytes += Buffer.byteLength(chunk, "utf8");
+				recordToolResultBytes(trailingTool, enc, 0);
+			} else {
+				analyzeEmbeddedAssistantText(chunk);
+				trailingTool = "";
+			}
+			cursor = match.index + chunk.length;
+		}
+
+		if (cursor < unwrapped.length) {
+			const tail = unwrapped.slice(cursor);
+			user_text_bytes += encodedJsonStringBytes(tail);
+			text_content_utf8_bytes += Buffer.byteLength(tail, "utf8");
+			if (
+				tail.trim().length > 0 &&
+				!/Please inspect the attached tool result image/i.test(tail)
+			) {
+				trailingTool = "";
+			}
+		}
+		return trailingTool;
+	};
+
+	let lastMessageFieldIdx = -1;
+	for (let i = reqFields.length - 1; i >= 0; i--) {
+		if (reqFields[i].field === 2 && reqFields[i].sub && reqFields[i].sub!.byteLength > 0) {
+			lastMessageFieldIdx = i;
+			break;
+		}
+	}
+
+	for (let fieldIdx = 0; fieldIdx < reqFields.length; fieldIdx++) {
+		const field = reqFields[fieldIdx];
+		if (field.field === 1 && field.sub && field.sub.byteLength > 0) {
+			// agy-tools / hybrid 模式下的原生系统提示词（如 <identity>...）
+			const sysText = utf8Decoder.decode(field.sub);
+			system_bytes += encodedJsonStringBytes(sysText);
+			text_content_utf8_bytes += field.sub.byteLength;
+			other_bytes += 36;
+		} else if (field.field === 16 && field.sub && field.sub.byteLength > 0) {
+			// 挂载的附加系统规则块（如 user_rules），提取子字段中的文本计入 system_bytes
+			const ruleFields = parseRawProtobufFields(field.sub);
+			for (const rf of ruleFields) {
+				if (rf.sub && rf.sub.byteLength > 0) {
+					const ruleText = utf8Decoder.decode(rf.sub);
+					system_bytes += encodedJsonStringBytes(ruleText);
+					text_content_utf8_bytes += rf.sub.byteLength;
+				}
+			}
+			other_bytes += 24;
+		} else if (field.field === 8 && field.sub && field.sub.byteLength > 0) {
+			// ChatToolDefinition: f1=name, f2=description, f3=parametersSchemaJson
+			const tf = parseRawProtobufFields(field.sub);
+			const nameSub = tf.find((t) => t.field === 1)?.sub;
+			const descSub = tf.find((t) => t.field === 2)?.sub;
+			const schemaSub = tf.find((t) => t.field === 3)?.sub;
+			const name = nameSub ? utf8Decoder.decode(nameSub) : "";
+			const description = descSub ? utf8Decoder.decode(descSub) : "";
+			const schemaBytes = schemaSub ? schemaSub.byteLength : 2;
+			tool_schema_bytes +=
+				Buffer.byteLength(JSON.stringify({ name, description }), "utf8") + schemaBytes + 18;
+		} else if (field.field === 2 && field.sub && field.sub.byteLength > 0) {
+			// ChatMessagePrompt
+			const msgFields = parseRawProtobufFields(field.sub);
+			const role = msgFields.find((m) => m.field === 2)?.val;
+			// agy 在生成结束落盘 gen_metadata 时会将本轮刚产出的 assistant 输出追加为末尾 role=2 消息，
+			// 该条消息尚未作为本轮输入发往云端（将在下一轮作为历史输入上传），须从本轮上传统计中排除。
+			if (fieldIdx === lastMessageFieldIdx && role === 2) {
+				continue;
+			}
+			other_bytes += 32;
+			const callIdSub = msgFields.find((m) => m.field === 7)?.sub;
+			const roleToolCallId = callIdSub ? utf8Decoder.decode(callIdSub) : "";
+			let trailingTool = "";
+
+			for (const mf of msgFields) {
+				if (mf.field === 3 && mf.sub && mf.sub.byteLength > 0) {
+					const text = utf8Decoder.decode(mf.sub);
+					other_bytes += 12;
+					if (role === 1) {
+						trailingTool = analyzeEmbeddedUserText(text);
+					} else if (role === 2) {
+						assistant_text_bytes += encodedJsonStringBytes(text);
+						text_content_utf8_bytes += mf.sub.byteLength;
+					} else if (role === 4) {
+						const enc = encodedJsonStringBytes(text);
+						tool_result_bytes += enc;
+						text_content_utf8_bytes += mf.sub.byteLength;
+						const toolName = callIdToTool.get(roleToolCallId) ?? "unknown";
+						recordToolResultBytes(toolName, enc, 0);
+					} else {
+						system_bytes += encodedJsonStringBytes(text);
+						text_content_utf8_bytes += mf.sub.byteLength;
+					}
+				} else if (mf.field === 6 && mf.sub && mf.sub.byteLength > 0) {
+					// ToolCall: f1=callId, f2=name, f3=argsJson, f7=thoughtSignature
+					const tcf = parseRawProtobufFields(mf.sub);
+					const tcIdSub = tcf.find((t) => t.field === 1)?.sub;
+					const tcNameSub = tcf.find((t) => t.field === 2)?.sub;
+					const tcArgsSub = tcf.find((t) => t.field === 3)?.sub;
+					const tcSigSub = tcf.find((t) => t.field === 7)?.sub;
+					const tcId = tcIdSub ? utf8Decoder.decode(tcIdSub) : "";
+					const rawName = tcNameSub ? utf8Decoder.decode(tcNameSub) : "";
+					const cleanName = stripHostMcpPrefix(rawName);
+					if (tcId) callIdToTool.set(tcId, cleanName);
+					const argsBytes = tcArgsSub ? tcArgsSub.byteLength : 2;
+					tool_call_bytes +=
+						Buffer.byteLength(JSON.stringify({ id: tcId, name: rawName }), "utf8") +
+						argsBytes +
+						12;
+					other_bytes += 24;
+					if (tcSigSub && tcSigSub.byteLength > 0) {
+						const sigB64 = Math.ceil(tcSigSub.byteLength / 3) * 4;
+						opaque_reasoning_bytes += sigB64;
+						other_bytes += sigB64 + 24;
+					}
+				} else if (mf.field === 11 && mf.sub && mf.sub.byteLength > 0) {
+					const thinkingText = utf8Decoder.decode(mf.sub);
+					assistant_text_bytes += encodedJsonStringBytes(thinkingText);
+					text_content_utf8_bytes += mf.sub.byteLength;
+					other_bytes += 26;
+				} else if (mf.field === 19 && mf.sub && mf.sub.byteLength > 0) {
+					// Media: f1=mimeType, f2=rawImageBytes
+					const mediaFields = parseRawProtobufFields(mf.sub);
+					const mimeSub = mediaFields.find((m) => m.field === 1)?.sub;
+					const rawSub = mediaFields.find((m) => m.field === 2)?.sub;
+					const mimeType = mimeSub ? utf8Decoder.decode(mimeSub) : "";
+					if (rawSub && rawSub.byteLength > 0 && mimeType.startsWith("image/")) {
+						const decodedBytes = rawSub.byteLength;
+						const base64Bytes = Math.ceil(decodedBytes / 3) * 4;
+						const imageHash = crypto.createHash("sha256").update(rawSub).digest("hex");
+						let toolName = "";
+						let sourceType = "user image";
+						if (role === 4) {
+							toolName = callIdToTool.get(roleToolCallId) ?? "unknown";
+							sourceType = isReadLikeToolName(toolName)
+								? "toolResult/read image"
+								: "toolResult/other";
+							recordToolResultBytes(toolName, 0, base64Bytes);
+						} else if (role === 1 && trailingTool) {
+							toolName = trailingTool;
+							sourceType = isReadLikeToolName(toolName)
+								? "toolResult/read image"
+								: "toolResult/other";
+							recordToolResultBytes(toolName, 0, base64Bytes);
+						}
+						image_payload_bytes += base64Bytes;
+						image_decoded_bytes += decodedBytes;
+						other_bytes += 48 + Buffer.byteLength(mimeType, "utf8");
+						images.push({
+							image_hash: imageHash,
+							mime_type: mimeType,
+							decoded_bytes: decodedBytes,
+							base64_bytes: base64Bytes,
+							image_payload_bytes: base64Bytes,
+							source_type: sourceType,
+							tool_name: toolName,
+						});
+					}
+				} else if (mf.field === 20 && mf.sub && mf.sub.byteLength > 0) {
+					const sigB64 = Math.ceil(mf.sub.byteLength / 3) * 4;
+					opaque_reasoning_bytes += sigB64;
+					other_bytes += sigB64 + 24;
+				}
+			}
+		}
+	}
+
+	const total_payload_bytes =
+		system_bytes +
+		user_text_bytes +
+		assistant_text_bytes +
+		tool_call_bytes +
+		tool_result_bytes +
+		image_payload_bytes +
+		tool_schema_bytes +
+		other_bytes;
+
+	const results = Array.from(toolResultTotals.values())
+		.sort((a, b) => b.text_bytes + b.image_bytes - (a.text_bytes + a.image_bytes))
+		.slice(0, 32);
+
+	return {
+		genIdx,
+		total_payload_bytes,
+		json_payload_bytes: total_payload_bytes,
+		system_bytes,
+		user_text_bytes,
+		assistant_text_bytes,
+		tool_call_bytes,
+		tool_result_bytes,
+		image_payload_bytes,
+		image_decoded_bytes,
+		tool_schema_bytes,
+		opaque_reasoning_bytes,
+		other_bytes,
+		text_content_utf8_bytes,
+		image_count: images.length,
+		images,
+		results,
+	};
+}
+
+/** 读取指定会话当前 `gen_metadata` 表的最大 `idx`（新建会话尚无记录时返回 `-1`） */
+export async function readCurrentMaxSqliteGenIdx(
+	config: BridgeConfig,
+	agySessionId: string,
+): Promise<number> {
+	if (!agySessionId) return -1;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	if (!fs.existsSync(dbPath)) return -1;
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return -1;
+
+	let db: import("node:sqlite").DatabaseSync | undefined;
+	try {
+		db = openSqliteWithTimeout(sqlite, dbPath, true);
+		const row = db
+			.prepare("SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM gen_metadata")
+			.get() as { maxIdx: number } | undefined;
+		return typeof row?.maxIdx === "number" ? row.maxIdx : -1;
+	} catch {
+		return -1;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// 忽略
+		}
+	}
+}
+
+/**
+ * 以只读方式读取指定 `gen_metadata` 水位之后新产生的最新上游完整请求快照。
+ * 若本地库不存在或无新生成，返回 `newGenCount: 0`；在 WAL 尚未完成落盘时支持短退避重试。
+ */
+export async function readLatestSqliteUpstreamRequestSince(
+	config: BridgeConfig,
+	agySessionId: string,
+	afterGenIdx: number,
+	retryDelaysMs: readonly number[] = [20, 40],
+): Promise<SqliteUpstreamQueryResult> {
+	const empty: SqliteUpstreamQueryResult = { maxGenIdx: afterGenIdx, newGenCount: 0 };
+	if (!agySessionId) return empty;
+	const dbPath = path.join(resolveAgyConversationsDir(config), `${agySessionId}.db`);
+	if (!fs.existsSync(dbPath)) return empty;
+	const sqlite = await loadNodeSqlite();
+	if (!sqlite) return empty;
+
+	const probeOnce = (): SqliteUpstreamQueryResult => {
+		let db: import("node:sqlite").DatabaseSync | undefined;
+		try {
+			db = openSqliteWithTimeout(sqlite, dbPath, true, 300);
+			const meta = db
+				.prepare(
+					"SELECT COALESCE(MAX(idx), -1) AS maxIdx, COUNT(*) AS newCount FROM gen_metadata WHERE idx > ?",
+				)
+				.get(afterGenIdx) as { maxIdx?: number; newCount?: number } | undefined;
+			const newGenCount = Number(meta?.newCount ?? 0);
+			const maxGenIdx = typeof meta?.maxIdx === "number" ? meta.maxIdx : afterGenIdx;
+			if (newGenCount <= 0 || maxGenIdx <= afterGenIdx) {
+				return { maxGenIdx: afterGenIdx, newGenCount: 0 };
+			}
+			const latestRow = db
+				.prepare("SELECT idx, data FROM gen_metadata WHERE idx = ?")
+				.get(maxGenIdx) as { idx: number; data?: Uint8Array | null } | undefined;
+			const latest =
+				latestRow?.data && latestRow.data.byteLength > 0
+					? parseGenMetadataUpstreamRequest(latestRow.data, latestRow.idx)
+					: undefined;
+			return { latest, maxGenIdx, newGenCount };
+		} catch {
+			return empty;
+		} finally {
+			try {
+				db?.close();
+			} catch {
+				// 忽略
+			}
+		}
+	};
+
+	const first = probeOnce();
+	if (first.latest || first.newGenCount > 0) {
+		return first;
+	}
+	for (const delay of retryDelaysMs) {
+		await new Promise((r) => setTimeout(r, delay));
+		const next = probeOnce();
+		if (next.latest || next.newGenCount > 0) {
+			return next;
+		}
+	}
+	return empty;
 }
 
 function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {

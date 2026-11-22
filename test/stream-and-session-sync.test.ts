@@ -22,9 +22,12 @@ import {
 	findBranchAnchorForHistory,
 	forkSqliteConversationAtCheckpoint,
 	hasValidAgentMetadataBlob,
+	parseGenMetadataUpstreamRequest,
 	parseStepMetadataGenerationUsage,
 	parseStepPayloadPlannedToolCount,
+	readCurrentMaxSqliteGenIdx,
 	readCurrentMaxSqliteStepIdx,
+	readLatestSqliteUpstreamRequestSince,
 	readSqliteGenerationUsagesSince,
 } from "../src/session/checkpoint-sync.ts";
 import {
@@ -1032,5 +1035,154 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 				prevBlock.text.includes('<tool_result id="agy_mcp_snap_1" tool="read" status="ok">'),
 			"历史保留的工具图片前应附带 <tool_result> 来源标签",
 		);
+	});
+
+	it("parseGenMetadataUpstreamRequest 与只读 SQLite 读取精确还原上游全量请求分类、图片哈希与工具声明并排除末尾本轮输出", async () => {
+		const encVarint = (val: bigint | number): Buffer => {
+			let v = typeof val === "bigint" ? val : BigInt(val);
+			if (v < 0n) v = BigInt.asUintN(64, v);
+			const out: number[] = [];
+			while (v >= 0x80n) {
+				out.push(Number((v & 0x7fn) | 0x80n));
+				v >>= 7n;
+			}
+			out.push(Number(v));
+			return Buffer.from(out);
+		};
+		const pbVarint = (field: number, val: bigint | number): Buffer =>
+			Buffer.concat([encVarint((field << 3) | 0), encVarint(val)]);
+		const pbBytes = (field: number, data: Buffer | string): Buffer => {
+			const buf = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+			return Buffer.concat([encVarint((field << 3) | 2), encVarint(buf.length), buf]);
+		};
+
+		const fakeWebp = Buffer.from("RIFF____WEBPVP8_DEMO_IMAGE_PAYLOAD_BYTES");
+		const fakeSig = Buffer.alloc(48, 0xab);
+
+		// 构造完整 ChatRequest protobuf（覆盖 agy-tools 原生系统提示、user_rules、workspace_context、工具调用与签名、延迟多模态图片、工具声明、64位负数 varint、末尾本轮输出）
+		const userMsg0 = Buffer.concat([
+			pbVarint(2, 1),
+			pbBytes(
+				3,
+				"<USER_REQUEST>\n<workspace_context>\n<cwd>/repo</cwd>\n</workspace_context>\n请查看文件\n</USER_REQUEST>",
+			),
+		]);
+		const assistantHistMsg = Buffer.concat([
+			pbVarint(2, 2),
+			pbBytes(3, "正在读取图片"),
+			pbBytes(11, "Need to read image first"),
+			pbBytes(
+				6,
+				Buffer.concat([
+					pbBytes(1, "call_101"),
+					pbBytes(2, "mcp_pi_tools_read"),
+					pbBytes(3, '{"path":"demo.png"}'),
+					pbBytes(7, fakeSig),
+				]),
+			),
+		]);
+		const toolResultMsg = Buffer.concat([
+			pbVarint(2, 4),
+			pbBytes(7, "call_101"),
+			pbBytes(3, "Read image file [image/png]\n[1 image(s) (>10KB) delivered via follow-up]"),
+		]);
+		const multimodalImgMsg = Buffer.concat([
+			pbVarint(2, 1),
+			pbBytes(
+				3,
+				'<USER_REQUEST>\n<tool_result id="agy_mcp_1" tool="read" status="ok">\n[Attached 1 image]\n</tool_result>\nPlease inspect the attached tool result image(s) above and continue.\n</USER_REQUEST>',
+			),
+			pbBytes(19, Buffer.concat([pbBytes(1, "image/webp"), pbBytes(2, fakeWebp)])),
+		]);
+		// 末尾 role=2 是 agy 在本轮生成结束后追加的输出（不应计入本轮上传字节）
+		const trailingGeneratedOutput = Buffer.concat([
+			pbVarint(2, 2),
+			pbBytes(3, "这是本轮刚生成的最终回复，绝不能算进本轮上传！"),
+			pbBytes(20, Buffer.alloc(120, 0xcd)),
+		]);
+		const toolDef = Buffer.concat([
+			pbBytes(1, "mcp_pi_tools_read"),
+			pbBytes(2, "Read file contents"),
+			pbBytes(3, '{"type":"object","properties":{"path":{"type":"string"}}}'),
+		]);
+		const userRules = Buffer.concat([pbBytes(1, "user_rules"), pbBytes(2, "<user_rules>规则</user_rules>")]);
+		const metaWithNegVarint = Buffer.concat([pbVarint(2, -1n), pbBytes(10, "Tools index")]);
+
+		const chatReq = Buffer.concat([
+			pbBytes(1, "<identity>Native system prompt</identity>"),
+			pbBytes(16, userRules),
+			pbBytes(9, metaWithNegVarint),
+			pbBytes(8, toolDef),
+			pbBytes(2, userMsg0),
+			pbBytes(2, assistantHistMsg),
+			pbBytes(2, toolResultMsg),
+			pbBytes(2, multimodalImgMsg),
+			pbBytes(2, trailingGeneratedOutput),
+		]);
+		const fullGenData = pbBytes(1, chatReq);
+
+		const snap = parseGenMetadataUpstreamRequest(fullGenData, 5);
+		assert.ok(snap, "完整 gen_metadata 应成功解析");
+		assert.equal(snap.genIdx, 5);
+		assert.ok(snap.system_bytes > 0, "应计入原生 system prompt、user_rules 与 workspace_context");
+		assert.ok(snap.user_text_bytes > 0);
+		assert.ok(snap.assistant_text_bytes > 0);
+		assert.ok(snap.tool_call_bytes > 0);
+		assert.ok(snap.tool_result_bytes > 0);
+		assert.ok(snap.tool_schema_bytes > 0);
+		assert.equal(snap.opaque_reasoning_bytes, Math.ceil(fakeSig.length / 3) * 4, "仅计入历史思考签名，排除末尾本轮输出签名");
+		assert.equal(snap.image_count, 1);
+		assert.equal(snap.image_decoded_bytes, fakeWebp.length);
+		assert.equal(snap.image_payload_bytes, Math.ceil(fakeWebp.length / 3) * 4);
+		assert.equal(snap.images[0].mime_type, "image/webp");
+		assert.equal(snap.images[0].tool_name, "read");
+		assert.equal(snap.images[0].source_type, "toolResult/read image");
+		assert.equal(
+			snap.total_payload_bytes,
+			snap.system_bytes +
+				snap.user_text_bytes +
+				snap.assistant_text_bytes +
+				snap.tool_call_bytes +
+				snap.tool_result_bytes +
+				snap.image_payload_bytes +
+				snap.tool_schema_bytes +
+				snap.other_bytes,
+			"全部分项之和必须与 total_payload_bytes 严格守恒",
+		);
+
+		// 已被 agy 裁剪的旧代次摘要（无 field 2 消息体）应返回 undefined
+		const strippedGenData = pbBytes(1, Buffer.concat([pbBytes(19, "gemini-4-neon")]));
+		assert.equal(parseGenMetadataUpstreamRequest(strippedGenData, 4), undefined);
+
+		// 端到端验证 readCurrentMaxSqliteGenIdx 与 readLatestSqliteUpstreamRequestSince 只读查询
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-gen-upstream-"));
+		try {
+			const cfg: BridgeConfig = {
+				...DEFAULT_BRIDGE_CONFIG,
+				geminiDir: path.join(tmpRoot, ".gemini"),
+			};
+			const convDir = path.join(cfg.geminiDir, cfg.appDataDirName, "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+			const sid = "11112222-3333-4444-5555-666677778888";
+			const db = new DatabaseSync(path.join(convDir, `${sid}.db`));
+			db.exec("CREATE TABLE gen_metadata (idx integer PRIMARY KEY, data blob);");
+			db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(0, strippedGenData);
+			db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(1, fullGenData);
+			db.close();
+
+			assert.equal(await readCurrentMaxSqliteGenIdx(cfg, sid), 1);
+			const res = await readLatestSqliteUpstreamRequestSince(cfg, sid, 0, []);
+			assert.equal(res.newGenCount, 1);
+			assert.equal(res.maxGenIdx, 1);
+			assert.ok(res.latest);
+			assert.equal(res.latest.total_payload_bytes, snap.total_payload_bytes);
+
+			// 无新代次时应返回 newGenCount === 0
+			const emptyRes = await readLatestSqliteUpstreamRequestSince(cfg, sid, 1, []);
+			assert.equal(emptyRes.newGenCount, 0);
+			assert.equal(emptyRes.latest, undefined);
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
 	});
 });
