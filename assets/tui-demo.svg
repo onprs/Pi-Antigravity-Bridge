@@ -1,0 +1,578 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" width="920" height="560" role="img" aria-labelledby="tuiTitle tuiDesc">
+  <title id="tuiTitle">Pi Antigravity Bridge — Pi TUI Session</title>
+  <desc id="tuiDesc">Pi TUI 终端实机演示：通过 /model 选择 Google Antigravity 模型与思考档位，通过 /agy mode 切换工具运行模式，并在原生 Pi 界面中完成思考、工具调用与代码 Diff 修改。</desc>
+
+  <defs>
+    <style>
+      .mono {
+        font-family: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, "Ubuntu Mono", "Noto Sans Mono CJK SC", "PingFang SC", "Microsoft YaHei", monospace;
+        font-variant-ligatures: none;
+      }
+
+      /* ===== 静态默认态（prefers-reduced-motion 或不支持动画时展示完整第 3 幕真实终端结果态） ===== */
+      .scene-model-cmd,
+      .scene-model-sel,
+      .scene-think-notice,
+      .scene-mode-cmd,
+      .scene-mode-sel,
+      .scene-prompt-typing,
+      .editor-med,
+      .editor-working,
+      .footer-empty,
+      .footer-m-neon,
+      .footer-m-med,
+      .status-native,
+      .status-hybrid,
+      .tool1-pending,
+      .tool2-pending {
+        opacity: 0;
+      }
+
+      .scene-turn-user,
+      .scene-turn-think,
+      .scene-turn-tool1,
+      .scene-turn-tool2,
+      .scene-turn-reply,
+      .editor-high-idle,
+      .idle-cursor-wrap,
+      .footer-used,
+      .footer-m-high,
+      .status-pi {
+        opacity: 1;
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        /* 18 秒四幕真实终端录屏时间轴 */
+        /* 0.0s - 0.8s (0% - 4.4%): 敲入 /model */
+        .scene-model-cmd { animation: visModelCmd 18s steps(1, end) infinite; }
+        .clip-model-cmd  { animation: typeShort 18s steps(7, end) infinite; }
+
+        /* 0.8s - 3.4s (4.4% - 18.9%): ModelSelectorComponent 展开并上下移动光标选中 gemini-4-carbon */
+        .scene-model-sel { animation: visModelSel 18s steps(1, end) infinite; }
+        .msel-row-0      { animation: mselRow0 18s steps(1, end) infinite; }
+        .msel-row-1      { animation: mselRow1 18s steps(1, end) infinite; }
+
+        /* 3.4s - 4.4s (18.9% - 24.4%): 切换 Thinking 档位至 high，边框变亮紫色 */
+        .scene-think-notice { animation: visThinkNotice 18s steps(1, end) infinite; }
+        .editor-med         { animation: visEditorMed 18s steps(1, end) infinite; }
+
+        /* 4.4s - 5.1s (24.4% - 28.3%): 敲入 /agy mode */
+        .scene-mode-cmd { animation: visModeCmd 18s steps(1, end) infinite; }
+        .clip-mode-cmd  { animation: typeModeCmd 18s steps(10, end) infinite; }
+
+        /* 5.1s - 8.1s (28.3% - 45.0%): ExtensionSelectorComponent 浏览三种模式 */
+        .scene-mode-sel { animation: visModeSel 18s steps(1, end) infinite; }
+        .asel-opt-0     { animation: aselOpt0 18s steps(1, end) infinite; }
+        .asel-opt-1     { animation: aselOpt1 18s steps(1, end) infinite; }
+        .asel-opt-2     { animation: aselOpt2 18s steps(1, end) infinite; }
+
+        /* 8.1s - 9.2s (45.0% - 51.1%): 在编辑器中输入用户任务指令 */
+        .scene-prompt-typing { animation: visPromptTyping 18s steps(1, end) infinite; }
+        .clip-prompt-typing  { animation: typePrompt 18s steps(28, end) infinite; }
+
+        /* 9.2s - 18.0s (51.1% - 100%): 真实对话流、Working 旋转边框、Thinking、工具 Pending->Success、Diff 与回复 */
+        .scene-turn-user  { animation: visTurnUser 18s steps(1, end) infinite; }
+        .editor-working   { animation: visEditorWorking 18s steps(1, end) infinite; }
+        .editor-high-idle { animation: visEditorHighIdle 18s steps(1, end) infinite; }
+        .idle-cursor-wrap { animation: visIdleCursor 18s steps(1, end) infinite; }
+
+        .scene-turn-think { animation: visTurnThink 18s ease-out infinite; }
+        .scene-turn-tool1 { animation: visTurnTool1 18s steps(1, end) infinite; }
+        .tool1-pending    { animation: visTool1Pending 18s steps(1, end) infinite; }
+
+        .scene-turn-tool2 { animation: visTurnTool2 18s steps(1, end) infinite; }
+        .tool2-pending    { animation: visTool2Pending 18s steps(1, end) infinite; }
+
+        .scene-turn-reply { animation: visTurnReply 18s ease-out infinite; }
+
+        /* Footer 动态同步 */
+        .footer-empty  { animation: visFooterEmpty 18s steps(1, end) infinite; }
+        .footer-used   { animation: visFooterUsed 18s steps(1, end) infinite; }
+        .footer-m-neon { animation: visFooterNeon 18s steps(1, end) infinite; }
+        .footer-m-med  { animation: visFooterMed 18s steps(1, end) infinite; }
+        .footer-m-high { animation: visFooterHigh 18s steps(1, end) infinite; }
+
+        .status-pi     { animation: visStatusPi 18s steps(1, end) infinite; }
+        .status-native { animation: visStatusNative 18s steps(1, end) infinite; }
+        .status-hybrid { animation: visStatusHybrid 18s steps(1, end) infinite; }
+
+        /* 真实 80ms 矢量 Braille 6 点顺时针旋转 (永不缺字，任意帧 4 点常亮) */
+        .bdot-0 { animation: bSpin0 0.6s steps(1, end) infinite; }
+        .bdot-1 { animation: bSpin1 0.6s steps(1, end) infinite; }
+        .bdot-2 { animation: bSpin2 0.6s steps(1, end) infinite; }
+        .bdot-3 { animation: bSpin3 0.6s steps(1, end) infinite; }
+        .bdot-4 { animation: bSpin4 0.6s steps(1, end) infinite; }
+        .bdot-5 { animation: bSpin5 0.6s steps(1, end) infinite; }
+
+        /* 终端方块光标闪烁 */
+        .cursor-blink { animation: termBlink 1s steps(2, end) infinite; }
+      }
+
+      /* --- 关键帧定义 --- */
+      @keyframes termBlink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0; }
+      }
+      @keyframes bSpin0 { 0%, 66.6% { opacity: 1; } 66.7%, 100% { opacity: 0.18; } }
+      @keyframes bSpin1 { 0%, 16.6% { opacity: 0.18; } 16.7%, 83.3% { opacity: 1; } 83.4%, 100% { opacity: 0.18; } }
+      @keyframes bSpin2 { 0%, 33.3% { opacity: 0.18; } 33.4%, 100% { opacity: 1; } }
+      @keyframes bSpin3 { 0%, 16.6% { opacity: 1; } 16.7%, 50.0% { opacity: 0.18; } 50.1%, 100% { opacity: 1; } }
+      @keyframes bSpin4 { 0%, 33.3% { opacity: 1; } 33.4%, 66.6% { opacity: 0.18; } 66.7%, 100% { opacity: 1; } }
+      @keyframes bSpin5 { 0%, 50.0% { opacity: 1; } 50.1%, 83.3% { opacity: 0.18; } 83.4%, 100% { opacity: 1; } }
+
+      /* 第一幕：/model */
+      @keyframes visModelCmd {
+        0%, 4.4% { opacity: 1; }
+        4.41%, 100% { opacity: 0; }
+      }
+      @keyframes typeShort {
+        0% { transform: translateX(-80px); }
+        3.5%, 100% { transform: translateX(0px); }
+      }
+      @keyframes visModelSel {
+        0%, 4.4% { opacity: 0; }
+        4.41%, 18.8% { opacity: 1; }
+        18.81%, 100% { opacity: 0; }
+      }
+      @keyframes mselRow0 {
+        0%, 10.5% { opacity: 1; }
+        10.51%, 100% { opacity: 0; }
+      }
+      @keyframes mselRow1 {
+        0%, 10.5% { opacity: 0; }
+        10.51%, 100% { opacity: 1; }
+      }
+      @keyframes visThinkNotice {
+        0%, 19.5% { opacity: 0; }
+        19.51%, 24.4% { opacity: 1; }
+        24.41%, 100% { opacity: 0; }
+      }
+      @keyframes visEditorMed {
+        0%, 4.4% { opacity: 1; }
+        4.41%, 18.8% { opacity: 0; }
+        18.81%, 20.0% { opacity: 1; }
+        20.01%, 100% { opacity: 0; }
+      }
+
+      /* 第二幕：/agy mode */
+      @keyframes visModeCmd {
+        0%, 24.4% { opacity: 0; }
+        24.41%, 28.3% { opacity: 1; }
+        28.31%, 100% { opacity: 0; }
+      }
+      @keyframes typeModeCmd {
+        0%, 24.5% { transform: translateX(-110px); }
+        27.5%, 100% { transform: translateX(0px); }
+      }
+      @keyframes visModeSel {
+        0%, 28.3% { opacity: 0; }
+        28.31%, 45.0% { opacity: 1; }
+        45.01%, 100% { opacity: 0; }
+      }
+      @keyframes aselOpt0 {
+        0%, 33.0% { opacity: 1; }
+        33.01%, 41.5% { opacity: 0; }
+        41.51%, 100% { opacity: 1; }
+      }
+      @keyframes aselOpt1 {
+        0%, 33.0% { opacity: 0; }
+        33.01%, 37.5% { opacity: 1; }
+        37.51%, 100% { opacity: 0; }
+      }
+      @keyframes aselOpt2 {
+        0%, 37.5% { opacity: 0; }
+        37.51%, 41.5% { opacity: 1; }
+        41.51%, 100% { opacity: 0; }
+      }
+
+      /* 第三幕：输入提示词并执行完整编码回合 */
+      @keyframes visPromptTyping {
+        0%, 45.0% { opacity: 0; }
+        45.01%, 51.1% { opacity: 1; }
+        51.11%, 100% { opacity: 0; }
+      }
+      @keyframes typePrompt {
+        0%, 45.2% { transform: translateX(-460px); }
+        50.2%, 100% { transform: translateX(0px); }
+      }
+
+      @keyframes visEditorHighIdle {
+        0%, 20.0% { opacity: 0; }
+        20.01%, 28.3% { opacity: 1; }
+        28.31%, 45.0% { opacity: 0; }
+        45.01%, 51.1% { opacity: 1; }
+        51.11%, 76.0% { opacity: 0; }
+        76.01%, 100% { opacity: 1; }
+      }
+      @keyframes visIdleCursor {
+        0%, 20.0% { opacity: 0; }
+        20.01%, 24.4% { opacity: 1; }
+        24.41%, 76.0% { opacity: 0; }
+        76.01%, 100% { opacity: 1; }
+      }
+      @keyframes visEditorWorking {
+        0%, 51.1% { opacity: 0; }
+        51.11%, 76.0% { opacity: 1; }
+        76.01%, 100% { opacity: 0; }
+      }
+
+      @keyframes visTurnUser {
+        0%, 51.1% { opacity: 0; }
+        51.11%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTurnThink {
+        0%, 53.5% { opacity: 0; }
+        55.5%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTurnTool1 {
+        0%, 58.5% { opacity: 0; }
+        58.51%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTool1Pending {
+        0%, 58.5% { opacity: 0; }
+        58.51%, 62.5% { opacity: 1; }
+        62.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTurnTool2 {
+        0%, 64.0% { opacity: 0; }
+        64.01%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTool2Pending {
+        0%, 64.0% { opacity: 0; }
+        64.01%, 68.5% { opacity: 1; }
+        68.51%, 100% { opacity: 0; }
+      }
+      @keyframes visTurnReply {
+        0%, 75.5% { opacity: 0; }
+        77.5%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+
+      /* Footer 实时联动 */
+      @keyframes visFooterEmpty {
+        0%, 75.5% { opacity: 1; }
+        75.51%, 98.5% { opacity: 0; }
+        98.51%, 100% { opacity: 1; }
+      }
+      @keyframes visFooterUsed {
+        0%, 75.5% { opacity: 0; }
+        75.51%, 98.5% { opacity: 1; }
+        98.51%, 100% { opacity: 0; }
+      }
+      @keyframes visFooterNeon {
+        0%, 17.5% { opacity: 1; }
+        17.51%, 100% { opacity: 0; }
+      }
+      @keyframes visFooterMed {
+        0%, 17.5% { opacity: 0; }
+        17.51%, 20.0% { opacity: 1; }
+        20.01%, 100% { opacity: 0; }
+      }
+      @keyframes visFooterHigh {
+        0%, 20.0% { opacity: 0; }
+        20.01%, 100% { opacity: 1; }
+      }
+      @keyframes visStatusPi {
+        0%, 33.0% { opacity: 1; }
+        33.01%, 41.5% { opacity: 0; }
+        41.51%, 100% { opacity: 1; }
+      }
+      @keyframes visStatusNative {
+        0%, 33.0% { opacity: 0; }
+        33.01%, 37.5% { opacity: 1; }
+        37.51%, 100% { opacity: 0; }
+      }
+      @keyframes visStatusHybrid {
+        0%, 37.5% { opacity: 0; }
+        37.51%, 41.5% { opacity: 1; }
+        41.51%, 100% { opacity: 0; }
+      }
+    </style>
+
+    <clipPath id="termWindowClip">
+      <rect x="1" y="1" width="918" height="558" rx="8"/>
+    </clipPath>
+
+    <clipPath id="clipModelInput">
+      <rect class="clip-model-cmd" x="20" y="449" width="90" height="22"/>
+    </clipPath>
+
+    <clipPath id="clipModeInput">
+      <rect class="clip-mode-cmd" x="20" y="449" width="120" height="22"/>
+    </clipPath>
+
+    <clipPath id="clipPromptInput">
+      <rect class="clip-prompt-typing" x="20" y="449" width="470" height="22"/>
+    </clipPath>
+  </defs>
+
+  <!-- ==================== 纯净终端窗口容器 ==================== -->
+  <g clip-path="url(#termWindowClip)">
+    <!-- 真实终端深色底 (#18181E) -->
+    <rect x="1" y="1" width="918" height="558" fill="#18181E"/>
+
+    <!-- 极简终端系统标题栏 -->
+    <rect x="1" y="1" width="918" height="28" fill="#121217"/>
+    <line x1="1" y1="29" x2="919" y2="29" stroke="#262630" stroke-width="1"/>
+    <circle cx="20" cy="15" r="5" fill="#FF5F56" fill-opacity="0.85"/>
+    <circle cx="36" cy="15" r="5" fill="#FFBD2E" fill-opacity="0.85"/>
+    <circle cx="52" cy="15" r="5" fill="#27C93F" fill-opacity="0.85"/>
+    <text x="460" y="19" class="mono" font-size="12" fill="#7E888E" text-anchor="middle">π - auth-service</text>
+
+    <!-- ==================== 1. 真实 Pi 启动 Header (piLogoLines + keyHints) ==================== -->
+    <g id="startupHeader">
+      <!-- 4x4 半块像素矩阵精确复刻 piLogoLines() (coral #E48A7A, blue #4F8EB3, yellow #EAB65D) -->
+      <g transform="translate(20, 41)">
+        <!-- Row 0: coral coral coral . -->
+        <rect x="0" y="0" width="21" height="7" fill="#E48A7A"/>
+        <!-- Row 1: blue . coral . -->
+        <rect x="0" y="7" width="7" height="7" fill="#4F8EB3"/>
+        <rect x="14" y="7" width="7" height="7" fill="#E48A7A"/>
+        <!-- Row 2: blue blue . yellow -->
+        <rect x="0" y="14" width="14" height="7" fill="#4F8EB3"/>
+        <rect x="21" y="14" width="7" height="7" fill="#EAB65D"/>
+        <!-- Row 3: blue . . yellow -->
+        <rect x="0" y="21" width="7" height="7" fill="#4F8EB3"/>
+        <rect x="21" y="21" width="7" height="7" fill="#EAB65D"/>
+      </g>
+
+      <!-- Header Line 1: v1.6.0 -->
+      <text x="56" y="52" class="mono" font-size="12.5" fill="#7E888E">v1.6.0</text>
+
+      <!-- Header Line 2: compactInstructions() -->
+      <text x="56" y="68" class="mono" font-size="12.5">
+        <tspan fill="#7E888E">esc</tspan><tspan fill="#9DA5A9"> interrupt · </tspan>
+        <tspan fill="#7E888E">ctrl+c/ctrl+d</tspan><tspan fill="#9DA5A9"> clear/exit · </tspan>
+        <tspan fill="#7E888E">/</tspan><tspan fill="#9DA5A9"> commands · </tspan>
+        <tspan fill="#7E888E">!</tspan><tspan fill="#9DA5A9"> bash · </tspan>
+        <tspan fill="#7E888E">ctrl+o</tspan><tspan fill="#9DA5A9"> more</tspan>
+      </text>
+
+      <!-- Header Line 3: compactOnboarding() -->
+      <text x="20" y="88" class="mono" font-size="12.5" fill="#7E888E">Press ctrl+o to show full startup help and loaded resources.</text>
+    </g>
+
+    <!-- ==================== 2. 切换 Thinking 档位时的瞬时状态提示 ==================== -->
+    <g class="scene-think-notice">
+      <text x="20" y="424" class="mono" font-size="12.5" fill="#9DA5A9">Thinking level: high</text>
+    </g>
+
+    <!-- ==================== 3. 第三幕：真实 Pi 聊天视口内容 ==================== -->
+    <!-- 3.1 UserMessageComponent (通栏直角 #213B49，上下 1 行 padding，左缩进 1 列，无提示符) -->
+    <g class="scene-turn-user">
+      <rect x="12" y="104" width="896" height="44" fill="#213B49"/>
+      <text x="20" y="131" class="mono" font-size="13" fill="#DEE0E1">修复 src/auth/session.ts 令牌过期未自动刷新的问题</text>
+    </g>
+
+    <!-- 3.2 AssistantMessageComponent Thinking Block (无背景无边框，纯 thinkingText #96A0A4 斜体) -->
+    <g class="scene-turn-think">
+      <text x="20" y="172" class="mono" font-size="12.5" font-style="italic" fill="#96A0A4">检查 session.ts 中 ensureValidToken 的过期分支，改为调用 refreshSession 自动续期并复用并发刷新锁。</text>
+    </g>
+
+    <!-- 3.3 ToolExecutionComponent: read (通栏直角 Box: toolPendingBg #34383A -> toolSuccessBg #254131) -->
+    <g class="scene-turn-tool1">
+      <rect x="12" y="188" width="896" height="42" fill="#254131"/>
+      <rect class="tool1-pending" x="12" y="188" width="896" height="42" fill="#34383A"/>
+      <text x="20" y="214" class="mono" font-size="12.5">
+        <tspan fill="#DEE0E1" font-weight="700">read</tspan>
+        <tspan fill="#A798D7"> src/auth/session.ts</tspan><tspan fill="#CD9A22">:18-32</tspan>
+      </text>
+    </g>
+
+    <!-- 3.4 ToolExecutionComponent: edit (通栏直角 Box + 真实 renderDiff 行号与词级反色高亮) -->
+    <g class="scene-turn-tool2">
+      <rect x="12" y="242" width="896" height="134" fill="#254131"/>
+      <rect class="tool2-pending" x="12" y="242" width="896" height="134" fill="#34383A"/>
+
+      <text x="20" y="267" class="mono" font-size="12.5">
+        <tspan fill="#DEE0E1" font-weight="700">edit</tspan>
+        <tspan fill="#A798D7"> src/auth/session.ts</tspan>
+      </text>
+
+      <!-- renderDiff: context / -removed / +added / context -->
+      <text x="20" y="302" class="mono" font-size="12.5" fill="#9DA5A9" xml:space="preserve"> 23   export async function ensureValidToken(token: SessionToken) {</text>
+      <text x="20" y="321" class="mono" font-size="12.5" fill="#EA7F81" xml:space="preserve">-24     if (token.isExpired()) <tspan fill="#FF9E9F" font-weight="700">throw new SessionExpiredError()</tspan>;</text>
+      <text x="20" y="340" class="mono" font-size="12.5" fill="#68B78D" xml:space="preserve">+24     if (token.isExpired()) <tspan fill="#85DBA8" font-weight="700">return await refreshSession(token)</tspan>;</text>
+      <text x="20" y="359" class="mono" font-size="12.5" fill="#9DA5A9" xml:space="preserve"> 25     return token.accessToken;</text>
+    </g>
+
+    <!-- 3.5 AssistantMessageComponent Text Reply (无背景 Markdown，mdCode #A798D7 行内代码染色) -->
+    <g class="scene-turn-reply">
+      <text x="20" y="401" class="mono" font-size="13" fill="#DEE0E1">
+        <tspan>已在 </tspan>
+        <tspan fill="#A798D7">src/auth/session.ts</tspan>
+        <tspan> 中接入过期自动续期逻辑，12 项会话单测已全部通过。</tspan>
+      </text>
+      <text x="20" y="421" class="mono" font-size="12.5" fill="#DEE0E1">
+        <tspan fill="#A798D7">- </tspan>
+        <tspan>过期令牌自动经 </tspan>
+        <tspan fill="#A798D7">refreshSession(token)</tspan>
+        <tspan> 刷新并返回最新凭证</tspan>
+      </text>
+    </g>
+
+    <!-- ==================== 4. 第一幕：真实 ModelSelectorComponent (/model) ==================== -->
+    <g class="scene-model-sel">
+      <rect x="12" y="206" width="896" height="278" fill="#18181E"/>
+      <!-- Top DynamicBorder (#5FA8CC) -->
+      <line x1="12" y1="214" x2="908" y2="214" stroke="#5FA8CC" stroke-width="1.3"/>
+
+      <text x="12" y="240" class="mono" font-size="12.5" fill="#CD9A22">Only showing models from configured providers. Use /login to add providers.</text>
+
+      <!-- Search Input -->
+      <text x="12" y="268" class="mono" font-size="12.5" fill="#DEE0E1">
+        <tspan fill="#9DA5A9">&gt; </tspan><tspan>antigravity</tspan>
+      </text>
+      <rect x="110" y="255" width="7.5" height="15" fill="#DEE0E1"/>
+
+      <!-- 列表状态 A (光标在第 0 行 gemini-4-neon，矢量 → 与 ✓ 绝对列对齐) -->
+      <g class="msel-row-0">
+        <path d="M 13 294 H 21 M 18 291 L 21.5 294 L 18 297" stroke="#A798D7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <path d="M 27 294 L 30 297 L 35.5 290.5" stroke="#A798D7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="43" y="298" class="mono" font-size="12.5"><tspan fill="#A798D7">gemini-4-neon</tspan><tspan fill="#9DA5A9"> (Gemini 4 Neon) [antigravity]</tspan></text>
+        <text x="43" y="318" class="mono" font-size="12.5"><tspan fill="#DEE0E1">gemini-4-carbon</tspan><tspan fill="#9DA5A9"> (Gemini 4 Carbon) [antigravity] · default</tspan></text>
+        <text x="43" y="338" class="mono" font-size="12.5"><tspan fill="#DEE0E1">claude-sonnet-5-5</tspan><tspan fill="#9DA5A9"> (Claude Sonnet 5.5) [antigravity]</tspan></text>
+        <text x="43" y="358" class="mono" font-size="12.5"><tspan fill="#DEE0E1">claude-opus-5-5</tspan><tspan fill="#9DA5A9"> (Claude Opus 5.5) [antigravity]</tspan></text>
+        <text x="43" y="378" class="mono" font-size="12.5"><tspan fill="#DEE0E1">gemini-3.8-flash</tspan><tspan fill="#9DA5A9"> (Gemini 3.8 Flash) [antigravity]</tspan></text>
+        <text x="27" y="414" class="mono" font-size="12.5" fill="#9DA5A9">Model Name: Gemini 4 Neon</text>
+      </g>
+
+      <!-- 列表状态 B (光标下移选中第 1 行 gemini-4-carbon) -->
+      <g class="msel-row-1">
+        <path d="M 27 294 L 30 297 L 35.5 290.5" stroke="#A798D7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <path d="M 13 314 H 21 M 18 311 L 21.5 314 L 18 317" stroke="#A798D7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="43" y="298" class="mono" font-size="12.5"><tspan fill="#DEE0E1">gemini-4-neon</tspan><tspan fill="#9DA5A9"> (Gemini 4 Neon) [antigravity]</tspan></text>
+        <text x="43" y="318" class="mono" font-size="12.5"><tspan fill="#A798D7">gemini-4-carbon</tspan><tspan fill="#9DA5A9"> (Gemini 4 Carbon) [antigravity] · default</tspan></text>
+        <text x="43" y="338" class="mono" font-size="12.5"><tspan fill="#DEE0E1">claude-sonnet-5-5</tspan><tspan fill="#9DA5A9"> (Claude Sonnet 5.5) [antigravity]</tspan></text>
+        <text x="43" y="358" class="mono" font-size="12.5"><tspan fill="#DEE0E1">claude-opus-5-5</tspan><tspan fill="#9DA5A9"> (Claude Opus 5.5) [antigravity]</tspan></text>
+        <text x="43" y="378" class="mono" font-size="12.5"><tspan fill="#DEE0E1">gemini-3.8-flash</tspan><tspan fill="#9DA5A9"> (Gemini 3.8 Flash) [antigravity]</tspan></text>
+        <text x="27" y="414" class="mono" font-size="12.5" fill="#9DA5A9">Model Name: Gemini 4 Carbon</text>
+      </g>
+
+      <text x="27" y="448" class="mono" font-size="12.5" fill="#7E888E">enter to select · ctrl+s to set as default · esc to cancel</text>
+
+      <!-- Bottom DynamicBorder (#5FA8CC) -->
+      <line x1="12" y1="476" x2="908" y2="476" stroke="#5FA8CC" stroke-width="1.3"/>
+    </g>
+
+    <!-- ==================== 5. 第二幕：真实 ExtensionSelectorComponent (/agy mode) ==================== -->
+    <g class="scene-mode-sel">
+      <rect x="12" y="274" width="896" height="210" fill="#18181E"/>
+      <!-- Top DynamicBorder (#5FA8CC) -->
+      <line x1="12" y1="282" x2="908" y2="282" stroke="#5FA8CC" stroke-width="1.3"/>
+
+      <text x="20" y="312" class="mono" font-size="13" font-weight="700" fill="#A798D7">切换工具模式（当前：pi-tools）</text>
+
+      <!-- 选项高亮态 0: pi-tools -->
+      <g class="asel-opt-0">
+        <path d="M 21 342 H 29 M 26 339 L 29.5 342 L 26 345" stroke="#A798D7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="36" y="346" class="mono" font-size="12.5" fill="#A798D7">pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流（默认）</text>
+        <text x="36" y="368" class="mono" font-size="12.5" fill="#DEE0E1">agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力</text>
+        <text x="36" y="390" class="mono" font-size="12.5" fill="#DEE0E1">hybrid — AGY 原生工具 + Pi 专属第三方扩展工具</text>
+      </g>
+
+      <!-- 选项高亮态 1: agy-tools -->
+      <g class="asel-opt-1">
+        <path d="M 21 364 H 29 M 26 361 L 29.5 364 L 26 367" stroke="#A798D7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="36" y="346" class="mono" font-size="12.5" fill="#DEE0E1">pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流（默认）</text>
+        <text x="36" y="368" class="mono" font-size="12.5" fill="#A798D7">agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力</text>
+        <text x="36" y="390" class="mono" font-size="12.5" fill="#DEE0E1">hybrid — AGY 原生工具 + Pi 专属第三方扩展工具</text>
+      </g>
+
+      <!-- 选项高亮态 2: hybrid -->
+      <g class="asel-opt-2">
+        <path d="M 21 386 H 29 M 26 383 L 29.5 386 L 26 389" stroke="#A798D7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="36" y="346" class="mono" font-size="12.5" fill="#DEE0E1">pi-tools — 通过 MCP 挂载并使用 Pi 工具集与审批流（默认）</text>
+        <text x="36" y="368" class="mono" font-size="12.5" fill="#DEE0E1">agy-tools — 使用 AGY 原生工具、Subagents 与沙箱能力</text>
+        <text x="36" y="390" class="mono" font-size="12.5" fill="#A798D7">hybrid — AGY 原生工具 + Pi 专属第三方扩展工具</text>
+      </g>
+
+      <g transform="translate(20, 428)">
+        <path d="M 3 -9 V 0 M 0.5 -6.5 L 3 -9.5 L 5.5 -6.5 M 11 -9.5 V -0.5 M 8.5 -3 L 11 0 L 13.5 -3" stroke="#7E888E" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <text x="20" y="0" class="mono" font-size="12.5">
+          <tspan fill="#9DA5A9">navigate  </tspan>
+          <tspan fill="#7E888E">enter</tspan><tspan fill="#9DA5A9"> select  </tspan>
+          <tspan fill="#7E888E">esc</tspan><tspan fill="#9DA5A9"> cancel</tspan>
+        </text>
+      </g>
+
+      <!-- Bottom DynamicBorder (#5FA8CC) -->
+      <line x1="12" y1="458" x2="908" y2="458" stroke="#5FA8CC" stroke-width="1.3"/>
+    </g>
+
+    <!-- ==================== 6. 真实 CustomEditor 边框与输入行 ==================== -->
+    <!-- 6.1 thinkingMedium 边框 (#6185CC) -->
+    <g class="editor-med">
+      <line x1="12" y1="442" x2="908" y2="442" stroke="#6185CC" stroke-width="1.3"/>
+      <line x1="12" y1="480" x2="908" y2="480" stroke="#6185CC" stroke-width="1.3"/>
+    </g>
+
+    <!-- 6.2 thinkingHigh 空闲边框 (#9776E5) -->
+    <g class="editor-high-idle">
+      <line x1="12" y1="442" x2="908" y2="442" stroke="#9776E5" stroke-width="1.3"/>
+      <line x1="12" y1="480" x2="908" y2="480" stroke="#9776E5" stroke-width="1.3"/>
+    </g>
+
+    <!-- 6.3 thinkingHigh 运行态嵌入边框: ── ⠹ Working ────────────────── -->
+    <g class="editor-working">
+      <line x1="12" y1="442" x2="32" y2="442" stroke="#9776E5" stroke-width="1.3"/>
+      <!-- 6 点矢量 Braille 旋转点阵 (2x3 矩阵顺时针环绕: 0左上 1右上 2右中 3右下 4左下 5左中) -->
+      <g transform="translate(39, 436)" fill="#9776E5">
+        <rect class="bdot-0" x="0" y="0" width="2.1" height="2.1" rx="0.6"/>
+        <rect class="bdot-1" x="4.2" y="0" width="2.1" height="2.1" rx="0.6"/>
+        <rect class="bdot-2" x="4.2" y="4.2" width="2.1" height="2.1" rx="0.6"/>
+        <rect class="bdot-3" x="4.2" y="8.4" width="2.1" height="2.1" rx="0.6"/>
+        <rect class="bdot-4" x="0" y="8.4" width="2.1" height="2.1" rx="0.6"/>
+        <rect class="bdot-5" x="0" y="4.2" width="2.1" height="2.1" rx="0.6"/>
+      </g>
+      <text x="52" y="446" class="mono" font-size="12.5" fill="#9776E5">Working</text>
+      <line x1="113" y1="442" x2="908" y2="442" stroke="#9776E5" stroke-width="1.3"/>
+      <line x1="12" y1="480" x2="908" y2="480" stroke="#9776E5" stroke-width="1.3"/>
+    </g>
+
+    <!-- 编辑器内各阶段输入文本 -->
+    <g class="scene-model-cmd" clip-path="url(#clipModelInput)">
+      <text x="20" y="465" class="mono" font-size="13" fill="#DEE0E1">/model</text>
+    </g>
+
+    <g class="scene-mode-cmd" clip-path="url(#clipModeInput)">
+      <text x="20" y="465" class="mono" font-size="13" fill="#DEE0E1">/agy mode</text>
+    </g>
+
+    <g class="scene-prompt-typing" clip-path="url(#clipPromptInput)">
+      <text x="20" y="465" class="mono" font-size="13" fill="#DEE0E1">修复 src/auth/session.ts 令牌过期未自动刷新的问题</text>
+    </g>
+
+    <g class="idle-cursor-wrap">
+      <rect class="cursor-blink" x="20" y="452" width="8" height="16" fill="#DEE0E1"/>
+    </g>
+
+    <!-- ==================== 7. 真实 3 行 FooterComponent ==================== -->
+    <g id="piFooter">
+      <!-- Line 1: pwd (branch) -->
+      <text x="12" y="503" class="mono" font-size="12" fill="#7E888E">~/workspace/auth-service (main)</text>
+
+      <!-- Line 2 Left: token / cache / cost (sub) / context% -->
+      <text class="mono footer-empty" x="12" y="522" font-size="12" fill="#7E888E">0.0%/200k (auto)</text>
+      <text class="mono footer-used" x="12" y="522" font-size="12" fill="#7E888E">↑14k ↓1.1k R13k CH93.8% $0.000 (sub) 7.1%/200k (auto)</text>
+
+      <!-- Line 2 Right: (provider) model • thinkingLevel -->
+      <text class="mono footer-m-neon" x="908" y="522" font-size="12" fill="#7E888E" text-anchor="end">(antigravity) gemini-4-neon • medium</text>
+      <text class="mono footer-m-med"  x="908" y="522" font-size="12" fill="#7E888E" text-anchor="end">(antigravity) gemini-4-carbon • medium</text>
+      <text class="mono footer-m-high" x="908" y="522" font-size="12" fill="#7E888E" text-anchor="end">(antigravity) gemini-4-carbon • high</text>
+
+      <!-- Line 3: Extension Status (updateAntigravityStatusBar) -->
+      <text class="mono status-pi"     x="12" y="541" font-size="12" fill="#DEE0E1">AGY:pi-tools</text>
+      <text class="mono status-native" x="12" y="541" font-size="12" fill="#DEE0E1">AGY:native(accept-edits)</text>
+      <text class="mono status-hybrid" x="12" y="541" font-size="12" fill="#DEE0E1">AGY:hybrid(default)</text>
+    </g>
+  </g>
+
+  <!-- 1px 终端窗口外框描边 -->
+  <rect x="1" y="1" width="918" height="558" rx="8" fill="none" stroke="#2B2E3B" stroke-width="1"/>
+</svg>

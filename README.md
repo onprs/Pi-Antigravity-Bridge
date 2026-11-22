@@ -2,6 +2,10 @@
 
 将 Google Antigravity CLI（`agy`）作为原生模型与 Agent 后端接入 [Pi](https://github.com/earendil-works/pi)（`@earendil-works/pi-coding-agent`），在完整的 Pi TUI 交互界面中直接使用 Antigravity 提供的模型、思考档位与工具生态。
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/onprs/Pi-Antigravity-Bridge/main/assets/tui-demo.svg" alt="Pi Antigravity Bridge TUI 交互演示" width="100%" />
+</p>
+
 ## 功能特性
 
 - **原生模型与思考控制**：通过 `/model` 选择当前账号可用的 Gemini、Claude 等模型，直接联动 Pi 的 Thinking 档位切换与思考块折叠展示。
