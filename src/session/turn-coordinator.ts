@@ -3,9 +3,11 @@ import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
+	type ImageContent,
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
+	type TextContent,
 	type Tool,
 	type ToolResultMessage,
 	type TranscriptContext,
@@ -138,9 +140,59 @@ class AsyncEventQueue<T> {
 		return this.items[0];
 	}
 
+	some(predicate: (item: T) => boolean): boolean {
+		return this.items.some(predicate);
+	}
+
 	drainAll(): T[] {
 		return this.items.splice(0, this.items.length);
 	}
+}
+
+/**
+ * `agy acp` 内部将 `McpToolConfig.MaxOutputBytes`（默认 10,240 字节）复用于 MCP 媒体内联上限，
+ * 超过该阈值的宿主 MCP 返回图片会被 `agy` 丢弃内联像素仅留 offload 文件路径。
+ * 留出安全余量：解码后大于 9,600 字节的 MCP 返回图片在工具边界自动切入同一热会话的 `session/prompt` 多模态块投递。
+ */
+const AGY_MCP_INLINE_IMAGE_SAFE_BYTES = 9_600;
+
+interface DeferredMcpImagePayload {
+	toolCallId: string;
+	toolName: string;
+	isError: boolean;
+	images: ImageContent[];
+}
+
+function getDecodedBase64Bytes(data: string): number {
+	return Buffer.byteLength(data, "base64");
+}
+
+function buildDeferredMcpImagePromptBlocks(
+	payloads: readonly DeferredMcpImagePayload[],
+	includeContinueNote: boolean,
+): AcpPromptBlock[] {
+	const blocks: AcpPromptBlock[] = [];
+	for (const item of payloads) {
+		const status = item.isError ? "error" : "ok";
+		blocks.push({
+			type: "text",
+			text: `<tool_result id="${item.toolCallId}" tool="${item.toolName}" status="${status}">\n[Attached ${item.images.length} image(s) from tool "${item.toolName}" delivered via multimodal prompt]\n</tool_result>`,
+		});
+		for (const img of item.images) {
+			blocks.push({
+				type: "image",
+				data: img.data,
+				mimeType: img.mimeType,
+			});
+		}
+	}
+	if (includeContinueNote && blocks.length > 0) {
+		blocks.push({
+			type: "text",
+			text: "Please inspect the attached tool result image(s) above and continue.",
+		});
+	}
+	return blocks;
 }
 
 interface ActiveTurnPump {
@@ -159,6 +211,8 @@ interface ActiveTurnPump {
 	pendingAnnouncedMcpCount: number;
 	/** 已向 Pi 推理流发出的宿主 MCP `callId` 集合，防止误结算仍在队列中待消费的后续工具请求 */
 	readonly emittedMcpCallIds: Set<string>;
+	/** 本轮宿主 MCP 工具返回中因超过 `agy` 10KB 媒体内联上限而延迟到工具边界多模态 `session/prompt` 投递的图片 */
+	readonly deferredMcpImages: DeferredMcpImagePayload[];
 }
 
 interface PendingGenSlicePool {
@@ -1536,45 +1590,109 @@ export class TurnCoordinator {
 		const entriesToSettle = Array.from(ledger.parkedCalls.entries()).filter(
 			([callId]) => pump.emittedMcpCallIds.has(callId) || recentToolResults.has(callId),
 		);
+		const settlingIdSet = new Set(entriesToSettle.map(([callId]) => callId));
+		const hasRemainingParkedCalls =
+			Array.from(ledger.parkedCalls.keys()).some((id) => !settlingIdSet.has(id)) ||
+			pump.queue.some((item) => item.kind === "mcp_parked" && !settlingIdSet.has(item.call.callId));
 
-		// 若即将执行工具边界切入（用户 steer 或无 SSE 下的动态工具重载），先开启切入保护标志，
-		// 防止 settle 后毫秒级冲入的同批第 2 个 MCP 工具被挂起拖慢收口。
+		// 检测本次结算的宿主 MCP 工具结果是否包含超过 agy 10KB 内联上限的图片，若是则将大图延迟至同会话 session/prompt 投递
+		const settlePayloads: Array<{
+			callId: string;
+			parked: ParkedToolCall;
+			content: Array<TextContent | ImageContent>;
+			isError: boolean;
+		}> = [];
+		let hasDeferredImagesInSettledBatch = false;
+		for (const [callId, parked] of entriesToSettle) {
+			const tr = recentToolResults.get(callId);
+			if (!tr) {
+				settlePayloads.push({
+					callId,
+					parked,
+					content: [{ type: "text", text: "(tool call skipped)" }],
+					isError: true,
+				});
+				continue;
+			}
+			const mcpContent: Array<TextContent | ImageContent> = [];
+			const oversizedImages: ImageContent[] = [];
+			for (const block of tr.content) {
+				if (
+					block.type === "image" &&
+					getDecodedBase64Bytes(block.data) > AGY_MCP_INLINE_IMAGE_SAFE_BYTES
+				) {
+					oversizedImages.push(block);
+				} else {
+					mcpContent.push(block);
+				}
+			}
+			if (oversizedImages.length > 0) {
+				hasDeferredImagesInSettledBatch = true;
+				pump.deferredMcpImages.push({
+					toolCallId: tr.toolCallId,
+					toolName: tr.toolName,
+					isError: tr.isError,
+					images: oversizedImages,
+				});
+				mcpContent.push({
+					type: "text",
+					text: `[${oversizedImages.length} image(s) (>10KB) delivered via follow-up multimodal prompt block.]`,
+				});
+			}
+			settlePayloads.push({
+				callId,
+				parked,
+				content: mcpContent,
+				isError: tr.isError,
+			});
+		}
+
+		// 若即将执行工具边界切入（用户 steer、无 SSE 下的动态工具重载、或同批工具已全数结算且存在待多模态投递的大图），
+		// 先开启切入保护标志，防止 settle 后毫秒级冲入的同批后续 MCP 工具被挂起拖慢收口。
 		const willCutInForSteer = trailingUsers.length > 0;
 		const willCutInForToolsReload =
 			!willCutInForSteer &&
 			needsMidTurnToolsReload &&
 			Boolean(ledger.conn.capabilities?.sessionCapabilities?.resume) &&
 			hasLocalConversationDb(this.currentConfig, ledger.agySessionId);
+		const willCutInForDeferredImages =
+			!willCutInForSteer &&
+			!willCutInForToolsReload &&
+			!hasRemainingParkedCalls &&
+			pump.deferredMcpImages.length > 0;
 
-		if (willCutInForSteer || willCutInForToolsReload) {
+		if (willCutInForSteer || willCutInForToolsReload || willCutInForDeferredImages) {
 			ledger.steeringCutInPending = true;
 		}
 
 		const settledMcpIds: string[] = [];
-		for (const [callId, parked] of entriesToSettle) {
-			const tr = recentToolResults.get(callId);
-			ledger.parkedCalls.delete(callId);
-			pump.emittedMcpCallIds.delete(callId);
-			settledMcpIds.push(callId);
+		for (const item of settlePayloads) {
+			ledger.parkedCalls.delete(item.callId);
+			pump.emittedMcpCallIds.delete(item.callId);
+			settledMcpIds.push(item.callId);
 
-			parked.settle({
-				content: tr ? [...tr.content] : [{ type: "text", text: "(tool call skipped)" }],
-				isError: tr ? tr.isError : true,
+			item.parked.settle({
+				content: item.content,
+				isError: item.isError,
 			});
 		}
 
 		if (options?.onResponse && settledMcpIds.length > 0) {
 			const currentProjection = inspectTrafficOptProjectionState(visibleMessages);
+			const responseHeaders: Record<string, string> = {
+				"x-acp-session-id": ledger.agySessionId,
+				"x-acp-transport": "acp-mcp-result",
+				"x-acp-settled-mcp-ids": settledMcpIds.join(","),
+				"x-acp-projection-synced":
+					currentProjection.projectionDigest === ledger.syncedProjectionDigest ? "1" : "0",
+			};
+			if (hasDeferredImagesInSettledBatch) {
+				responseHeaders["x-acp-mcp-images-deferred"] = String(AGY_MCP_INLINE_IMAGE_SAFE_BYTES);
+			}
 			await options.onResponse(
 				{
 					status: 200,
-					headers: {
-						"x-acp-session-id": ledger.agySessionId,
-						"x-acp-transport": "acp-mcp-result",
-						"x-acp-settled-mcp-ids": settledMcpIds.join(","),
-						"x-acp-projection-synced":
-							currentProjection.projectionDigest === ledger.syncedProjectionDigest ? "1" : "0",
-					},
+					headers: responseHeaders,
 				},
 				model,
 			);
@@ -1583,6 +1701,10 @@ export class TurnCoordinator {
 		// 若用户在工具执行期间按 Enter 发送了转向消息（steer）：
 		// 先等待刚结算的工具输出落盘至本地会话库，随即在当前工具边界收口后台自动循环，立即在同一热缓存会话上以真实用户身份发送转向消息！
 		if (willCutInForSteer) {
+			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
+				pump.deferredMcpImages.splice(0),
+				false,
+			);
 			try {
 				await waitForSqliteToolStepsSettled(
 					this.currentConfig,
@@ -1644,7 +1766,7 @@ export class TurnCoordinator {
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
 			await this.executePromptOnLedger(
 				ledger,
-				convertUserMessagesToPromptBlocks(trailingUsers),
+				[...deferredImgBlocks, ...convertUserMessagesToPromptBlocks(trailingUsers)],
 				visibleMessages,
 				writer,
 				model,
@@ -1656,6 +1778,10 @@ export class TurnCoordinator {
 		// 默认 processPerSession: true（无 SSE 订阅）下工具集动态变化（如 tool_search 解锁新工具）：
 		// 在当前工具落盘后通过原地 close + session/resume 重拉 tools/list，使模型当轮立即可见并调用新解锁工具！
 		if (willCutInForToolsReload) {
+			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
+				pump.deferredMcpImages.splice(0),
+				false,
+			);
 			try {
 				await waitForSqliteToolStepsSettled(
 					this.currentConfig,
@@ -1680,6 +1806,7 @@ export class TurnCoordinator {
 					await this.executePromptOnLedger(
 						ledger,
 						[
+							...deferredImgBlocks,
 							{
 								type: "text",
 								text: "The newly activated tools are now loaded and available. Please continue.",
@@ -1718,6 +1845,75 @@ export class TurnCoordinator {
 			await this.executePromptOnLedger(
 				restored.ledger,
 				restored.initialPromptBlocks,
+				visibleMessages,
+				writer,
+				model,
+				options,
+			);
+			return;
+		}
+
+		// 宿主 MCP 工具返回 > 9.6KB 图片：在当前工具落盘后收口旧后台循环，在同一热缓存会话上以多模态 session/prompt 投递完整图片，
+		// 彻底规避 agy McpToolConfig.MaxOutputBytes (10KB) 导致的图片丢弃盲区，同时保持 100% 热前缀缓存！
+		if (willCutInForDeferredImages) {
+			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
+				pump.deferredMcpImages.splice(0),
+				true,
+			);
+			try {
+				await waitForSqliteToolStepsSettled(
+					this.currentConfig,
+					ledger.agySessionId,
+					160,
+					options?.signal,
+				);
+			} finally {
+				ledger.steeringCutInPending = false;
+			}
+			this.abortLedgerTurnNonBlocking(ledger);
+			const idleOk = await this.waitForInFlightPrompt(ledger, 2_500, options?.signal);
+			if (!idleOk) {
+				if (options?.signal?.aborted) {
+					writer.fail("aborted", "Request aborted by user");
+					return;
+				}
+				await this.discardWedgedLedger(ledger);
+				const cwd = this.activeContext?.cwd ?? process.cwd();
+				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
+				const mountInfo = prepareCustomizationMount(fullContextMessages, this.currentConfig, cwd);
+				const restored = await this.bootstrapOrRestoreLedger({
+					piSessionKey: ledger.piSessionKey,
+					cwd,
+					isProjectTrusted,
+					visibleMessages,
+					hostMcpTools,
+					toolsDigest,
+					mountedPluginPaths: mountInfo.mountedPluginPaths,
+					mountDigest: mountInfo.mountDigest,
+					additionalDirectories: mountInfo.additionalDirectories,
+					workspaceContextBlock: mountInfo.workspaceContextBlock,
+					modelContextWindow: model.contextWindow,
+					signal: options?.signal,
+				});
+				await this.executePromptOnLedger(
+					restored.ledger,
+					restored.initialPromptBlocks,
+					visibleMessages,
+					writer,
+					model,
+					options,
+				);
+				return;
+			}
+
+			ledger.lastConsumedStepIdx = Math.max(
+				ledger.lastConsumedStepIdx,
+				await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
+			);
+			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+			await this.executePromptOnLedger(
+				ledger,
+				deferredImgBlocks,
 				visibleMessages,
 				writer,
 				model,
@@ -2373,6 +2569,7 @@ export class TurnCoordinator {
 			hasSqliteGenTelemetry: false,
 			pendingAnnouncedMcpCount: 0,
 			emittedMcpCallIds: new Set<string>(),
+			deferredMcpImages: [],
 		};
 		ledger.activePump = pump;
 		this.startTrackedSessionPrompt(ledger, pump, {

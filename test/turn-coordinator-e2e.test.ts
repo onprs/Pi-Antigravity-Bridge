@@ -636,6 +636,161 @@ rl.on("line", async (line) => {
       return;
     }
 
+    if (
+      Array.isArray(prompt) &&
+      prompt.some((b) => b?.type === "image") &&
+      prompt.some((b) => b?.type === "text" && typeof b.text === "string" && b.text.includes("<tool_result ")) &&
+      sess
+    ) {
+      sess.inFlightPromptId = msg.id;
+      const imgBlocks = prompt.filter((b) => b?.type === "image");
+      const mimes = imgBlocks.map((b) => b.mimeType || "").join(",");
+      const decodedBytes = imgBlocks
+        .map((b) => Buffer.byteLength(String(b.data || ""), "base64"))
+        .join(",");
+      const summary =
+        "DEFERRED_IMAGES_RECEIVED=" +
+        imgBlocks.length +
+        ";MIMES=" +
+        mimes +
+        ";BYTES=" +
+        decodedBytes +
+        ";MCP_INLINE_IMAGES=" +
+        (sess.lastMcpImageCount ?? -1) +
+        ";TEXT_TOOL=" +
+        (sess.lastTextToolResult || "none") +
+        ";SESSION=" +
+        sessionId;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: summary }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "end_turn", usage: { inputTokens: 1200, cachedReadTokens: 32000, outputTokens: 40 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_MCP_SINGLE_IMAGE" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_img_1", title: "mcp_pi_tools_read" } }
+      });
+      const mcpResp = await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 601,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "sample.png" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+      const contentItems = Array.isArray(mcpResp?.result?.content) ? mcpResp.result.content : [];
+      sess.lastMcpImageCount = contentItems.filter((c) => c?.type === "image").length;
+      sess.lastTextToolResult = "none";
+      await new Promise((r) => setTimeout(r, 120));
+      if (sess.inFlightPromptId !== myPromptId) return;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "INLINE_MCP_IMAGES=" + sess.lastMcpImageCount + ";SESSION=" + sessionId }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      sess.cancelablePromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: { stopReason: "end_turn", usage: { inputTokens: 800, cachedReadTokens: 32000, outputTokens: 20 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_MCP_CONCURRENT_IMAGE_AND_TEXT" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_par_img_1", title: "mcp_pi_tools_read" } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_par_txt_2", title: "mcp_pi_tools_bash" } }
+      });
+      const p1 = fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 611,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "big.png" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+      await new Promise((r) => setTimeout(r, 35));
+      const p2 = fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 612,
+          method: "tools/call",
+          params: { name: "bash", arguments: { command: "echo hi" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+      const [r1, r2] = await Promise.all([p1, p2]);
+      const c1 = Array.isArray(r1?.result?.content) ? r1.result.content : [];
+      const c2 = Array.isArray(r2?.result?.content) ? r2.result.content : [];
+      sess.lastMcpImageCount = c1.filter((c) => c?.type === "image").length;
+      sess.lastTextToolResult = c2.map((c) => c?.text || "").join("");
+      await new Promise((r) => setTimeout(r, 120));
+      if (sess.inFlightPromptId !== myPromptId) return;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "CONCURRENT_INLINE_ONLY" }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      sess.cancelablePromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: { stopReason: "end_turn", usage: { inputTokens: 900, cachedReadTokens: 32000, outputTokens: 20 } }
+      });
+      return;
+    }
+
     if (!isModeA && sess?.mcpHttp) {
       // 模式 B：模拟中间步 usage_update + 思考 + 工具宣告 + HTTP MCP 挂起 + 最终步 usage_update 与累计账单返回
       send({
@@ -2290,6 +2445,358 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			}
 			const newFallbackDbs = fs.readdirSync(convDir).filter((f) => !beforeFallbackDbs.has(f) && f.endsWith(".db"));
 			assert.equal(newFallbackDbs.length, 1, "禁用 enableSqliteFork 时仅应由单次 session/new 生成一个普通会话库");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("宿主 MCP 返回 > 9,600B 图片应延迟至同会话多模态 session/prompt 投递，<= 9,600B 小图直接走 MCP 内联", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-deferred-img-"));
+		const mockBin = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: mockBin,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+			processPerSession: true,
+			enableSqliteFork: false,
+		};
+
+		const processManager = new AcpProcessManager();
+		const mirrorBroker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), processManager, mirrorBroker, cfg);
+
+		try {
+			const readTool = {
+				name: "read",
+				description: "Read file",
+				parameters: { type: "object", properties: { path: { type: "string" } } } as any,
+			};
+
+			// 场景 A：> 9,600 字节图片（12,000 字节 WebP）
+			const bigImageBytes = Buffer.alloc(12_000, 0x5a);
+			const bigImageBase64 = bigImageBytes.toString("base64");
+			const payloadsBig: any[] = [];
+			const headersBig: Array<Record<string, string>> = [];
+
+			const step1 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [readTool],
+						messages: [{ role: "user", content: "TRIGGER_MCP_SINGLE_IMAGE", timestamp: 1 }],
+					}),
+					{
+						sessionId: "pi-sess-img-big",
+						onPayload: (p) => {
+							payloadsBig.push(p);
+						},
+						onResponse: (r) => {
+							headersBig.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(step1.stopReason, "toolUse");
+			const firstSessionId = step1.responseId!;
+			const tc1 = step1.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(tc1, "应发出宿主 MCP read 工具调用");
+
+			const step2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [readTool],
+						messages: [
+							{ role: "user", content: "TRIGGER_MCP_SINGLE_IMAGE", timestamp: 1 },
+							step1,
+							{
+								role: "toolResult",
+								toolCallId: tc1.id,
+								toolName: "read",
+								content: [
+									{ type: "text", text: "Read image file [image/webp]" },
+									{ type: "image", data: bigImageBase64, mimeType: "image/webp" },
+								],
+								isError: false,
+								timestamp: 2,
+							},
+						],
+					}),
+					{
+						sessionId: "pi-sess-img-big",
+						onPayload: (p) => {
+							payloadsBig.push(p);
+						},
+						onResponse: (r) => {
+							headersBig.push(r.headers);
+						},
+					},
+				)
+				.result();
+
+			assert.equal(step2.stopReason, "stop");
+			assert.equal(step2.responseId, firstSessionId, "大图多模态切入必须复用同一个热会话 agySessionId");
+			const finalTextBig = step2.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(
+				finalTextBig.includes("DEFERRED_IMAGES_RECEIVED=1"),
+				`模型应通过同会话多模态 prompt 收到 1 张完整大图，实际回复: ${finalTextBig}`,
+			);
+			assert.ok(finalTextBig.includes("MIMES=image/webp"), `MIME 应保持 image/webp: ${finalTextBig}`);
+			assert.ok(finalTextBig.includes("BYTES=12000"), `解码字节数应精确等于 12000: ${finalTextBig}`);
+			assert.ok(finalTextBig.includes("MCP_INLINE_IMAGES=0"), `HTTP MCP 回传中不得内联 >9.6KB 大图: ${finalTextBig}`);
+			assert.ok(finalTextBig.includes(`SESSION=${firstSessionId}`), `必须仍在同一 agySessionId: ${finalTextBig}`);
+
+			const mcpResultHeader = headersBig.find((h) => h["x-acp-transport"] === "acp-mcp-result");
+			assert.ok(mcpResultHeader, "应发出 acp-mcp-result 观测响应头");
+			assert.equal(mcpResultHeader["x-acp-mcp-images-deferred"], "9600");
+
+			assert.equal(payloadsBig.length, 2, "总计应有首轮 prompt 与工具边界多模态切入 prompt 共 2 次");
+			assert.equal(payloadsBig[1].sessionId, firstSessionId);
+			assert.ok(
+				payloadsBig[1].prompt.some(
+					(b: any) => b.type === "text" && b.text.includes(`<tool_result id="${tc1.id}" tool="read" status="ok">`),
+				),
+				"多模态切入 prompt 应包含对应 tool_result 归属包装块",
+			);
+			assert.ok(
+				payloadsBig[1].prompt.some((b: any) => b.type === "image" && b.data === bigImageBase64 && b.mimeType === "image/webp"),
+				"多模态切入 prompt 应包含完整原图 image block",
+			);
+
+			// 场景 B：<= 9,600 字节小图（512 字节 PNG）直接走 MCP 内联，不触发切入且不带延迟响应头
+			const smallImageBase64 = Buffer.alloc(512, 0x33).toString("base64");
+			const payloadsSmall: any[] = [];
+			const headersSmall: Array<Record<string, string>> = [];
+
+			const smallStep1 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [readTool],
+						messages: [{ role: "user", content: "TRIGGER_MCP_SINGLE_IMAGE", timestamp: 10 }],
+					}),
+					{
+						sessionId: "pi-sess-img-small",
+						onPayload: (p) => {
+							payloadsSmall.push(p);
+						},
+						onResponse: (r) => {
+							headersSmall.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(smallStep1.stopReason, "toolUse");
+			const smallTc = smallStep1.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(smallTc);
+
+			const smallStep2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools: [readTool],
+						messages: [
+							{ role: "user", content: "TRIGGER_MCP_SINGLE_IMAGE", timestamp: 10 },
+							smallStep1,
+							{
+								role: "toolResult",
+								toolCallId: smallTc.id,
+								toolName: "read",
+								content: [{ type: "image", data: smallImageBase64, mimeType: "image/png" }],
+								isError: false,
+								timestamp: 11,
+							},
+						],
+					}),
+					{
+						sessionId: "pi-sess-img-small",
+						onPayload: (p) => {
+							payloadsSmall.push(p);
+						},
+						onResponse: (r) => {
+							headersSmall.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(smallStep2.stopReason, "stop");
+			const finalTextSmall = smallStep2.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(
+				finalTextSmall.includes("INLINE_MCP_IMAGES=1"),
+				`<= 9.6KB 小图应直接经 HTTP MCP 内联回传: ${finalTextSmall}`,
+			);
+			assert.equal(payloadsSmall.length, 1, "小图内联模式不得触发额外 session/prompt 切入");
+			const smallMcpHeader = headersSmall.find((h) => h["x-acp-transport"] === "acp-mcp-result");
+			assert.ok(smallMcpHeader);
+			assert.equal(smallMcpHeader["x-acp-mcp-images-deferred"], undefined, "无大图延迟时不应附加 x-acp-mcp-images-deferred");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("并发双工具中第 1 个返回大图、第 2 个返回纯文本时应待第 2 个工具也结算后再统一切入投递大图", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-concurrent-img-"));
+		const mockBin = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: mockBin,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+			processPerSession: true,
+			enableSqliteFork: false,
+		};
+
+		const processManager = new AcpProcessManager();
+		const mirrorBroker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), processManager, mirrorBroker, cfg);
+
+		try {
+			const tools = [
+				{
+					name: "read",
+					description: "Read file",
+					parameters: { type: "object", properties: { path: { type: "string" } } } as any,
+				},
+				{
+					name: "bash",
+					description: "Run bash",
+					parameters: { type: "object", properties: { command: { type: "string" } } } as any,
+				},
+			];
+			const bigImageBase64 = Buffer.alloc(14_000, 0x6b).toString("base64");
+			const capturedPayloads: any[] = [];
+			const capturedHeaders: Array<Record<string, string>> = [];
+
+			const step1 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [{ role: "user", content: "TRIGGER_MCP_CONCURRENT_IMAGE_AND_TEXT", timestamp: 1 }],
+					}),
+					{
+						sessionId: "pi-sess-img-par",
+						onPayload: (p) => {
+							capturedPayloads.push(p);
+						},
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(step1.stopReason, "toolUse");
+			const sid = step1.responseId!;
+			const step1Calls = step1.content.filter((c): c is ToolCall => c.type === "toolCall");
+			const readCall = step1Calls.find((c) => c.name === "read");
+			assert.ok(readCall, "第 1 步应包含 read 工具调用");
+			let bashCall = step1Calls.find((c) => c.name === "bash");
+
+			const messages: any[] = [
+				{ role: "user", content: "TRIGGER_MCP_CONCURRENT_IMAGE_AND_TEXT", timestamp: 1 },
+				step1,
+			];
+			let finalMsg = step1;
+
+			if (!bashCall) {
+				// 仅先结算第 1 个大图工具时，第 2 个并发工具仍在挂起/排队，不得提前切入中断第 2 个工具
+				messages.push({
+					role: "toolResult",
+					toolCallId: readCall.id,
+					toolName: "read",
+					content: [{ type: "image", data: bigImageBase64, mimeType: "image/jpeg" }],
+					isError: false,
+					timestamp: 2,
+				});
+				const step2 = await coord
+					.streamSimple(TEST_MODEL, normalizeContext({ tools, messages }), {
+						sessionId: "pi-sess-img-par",
+						onPayload: (p) => {
+							capturedPayloads.push(p);
+						},
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					})
+					.result();
+				assert.equal(step2.stopReason, "toolUse", "仍有未结算并发工具时不应提前切入结束轮次");
+				assert.equal(capturedPayloads.length, 1, "第 2 个工具尚未结算前不得提前发出切入 session/prompt");
+				bashCall = step2.content.find((c): c is ToolCall => c.type === "toolCall" && c.name === "bash");
+				assert.ok(bashCall, "应继续向 Pi 发出第 2 个并发工具 bash");
+				messages.push(step2);
+				messages.push({
+					role: "toolResult",
+					toolCallId: bashCall.id,
+					toolName: "bash",
+					content: [{ type: "text", text: "ok_from_bash" }],
+					isError: false,
+					timestamp: 3,
+				});
+				finalMsg = await coord
+					.streamSimple(TEST_MODEL, normalizeContext({ tools, messages }), {
+						sessionId: "pi-sess-img-par",
+						onPayload: (p) => {
+							capturedPayloads.push(p);
+						},
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					})
+					.result();
+			} else {
+				// 两个并发工具在同一批次发出时，一起结算后统一切入投递大图
+				messages.push(
+					{
+						role: "toolResult",
+						toolCallId: readCall.id,
+						toolName: "read",
+						content: [{ type: "image", data: bigImageBase64, mimeType: "image/jpeg" }],
+						isError: false,
+						timestamp: 2,
+					},
+					{
+						role: "toolResult",
+						toolCallId: bashCall.id,
+						toolName: "bash",
+						content: [{ type: "text", text: "ok_from_bash" }],
+						isError: false,
+						timestamp: 3,
+					},
+				);
+				finalMsg = await coord
+					.streamSimple(TEST_MODEL, normalizeContext({ tools, messages }), {
+						sessionId: "pi-sess-img-par",
+						onPayload: (p) => {
+							capturedPayloads.push(p);
+						},
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					})
+					.result();
+			}
+
+			assert.equal(finalMsg.stopReason, "stop");
+			assert.equal(finalMsg.responseId, sid);
+			const text = finalMsg.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(text.includes("DEFERRED_IMAGES_RECEIVED=1"), `应投递 1 张大图: ${text}`);
+			assert.ok(text.includes("BYTES=14000"), `应完整送达 14000 字节图片: ${text}`);
+			assert.ok(text.includes("TEXT_TOOL=ok_from_bash"), `第 2 个并发工具文本输出必须完整结算不被误中断: ${text}`);
+			assert.equal(capturedPayloads.length, 2, "两个并发工具全数结算后应仅触发 1 次切入 session/prompt");
+			const deferredHeaders = capturedHeaders.filter((h) => h["x-acp-mcp-images-deferred"] === "9600");
+			assert.equal(deferredHeaders.length, 1, "仅在包含大图的结算批次标记 x-acp-mcp-images-deferred");
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
