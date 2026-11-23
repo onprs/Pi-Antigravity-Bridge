@@ -43,7 +43,11 @@ import {
 	resolveEffectiveFlags,
 	type ToolMode,
 } from "../config.ts";
-import { LocalHttpMcpBridge, type ParkedToolCall } from "../mcp/http-mcp-bridge.ts";
+import {
+	LocalHttpMcpBridge,
+	type ParkedToolCall,
+	toExposedMcpToolName,
+} from "../mcp/http-mcp-bridge.ts";
 import {
 	computeToolsFingerprint,
 	filterToolsForHostMcpBridge,
@@ -154,16 +158,20 @@ class AsyncEventQueue<T> {
 }
 
 /**
- * `agy acp` 内部将 `McpToolConfig.MaxOutputBytes`（默认 10,240 字节）复用于 MCP 媒体内联上限，
- * 超过该阈值的宿主 MCP 返回图片会被 `agy` 丢弃内联像素仅留 offload 文件路径。
- * 留出安全余量：解码后大于 9,600 字节的 MCP 返回图片在工具边界自动切入同一热会话的 `session/prompt` 多模态块投递。
+ * `agy acp` 内部在 `mcpToolCall.callTool` 中将 `McpToolConfig.MaxOutputBytes` 硬编码为 10,240 字节：
+ * - 解码后超过该阈值的宿主 MCP 返回图片会被丢弃内联像素；
+ * - 超过该阈值的宿主 MCP 返回文本会被掐头去尾截断并转存至外部临时文件，导致大文件读取与结构化输出往返翻倍。
+ * 留出安全余量：大于 9,600 字节的图片或大于 9,200 UTF-8 字节的文本在同批工具结算后自动切入同一热会话 `session/prompt` 完整投递。
  */
 const AGY_MCP_INLINE_IMAGE_SAFE_BYTES = 9_600;
+const AGY_MCP_INLINE_TEXT_SAFE_BYTES = 9_200;
+const MAX_AUTO_CONTINUED_TURN_REQUESTS = 3;
 
-interface DeferredMcpImagePayload {
+interface DeferredMcpToolPayload {
 	toolCallId: string;
 	toolName: string;
 	isError: boolean;
+	texts: string[];
 	images: ImageContent[];
 }
 
@@ -171,18 +179,34 @@ function getDecodedBase64Bytes(data: string): number {
 	return Buffer.byteLength(data, "base64");
 }
 
-function buildDeferredMcpImagePromptBlocks(
-	payloads: readonly DeferredMcpImagePayload[],
+function buildDeferredMcpOutputPromptBlocks(
+	payloads: readonly DeferredMcpToolPayload[],
 	includeContinueNote: boolean,
 ): AcpPromptBlock[] {
 	const blocks: AcpPromptBlock[] = [];
+	let hasAnyText = false;
+	let hasAnyImages = false;
 	for (const item of payloads) {
 		const status = item.isError ? "error" : "ok";
-		blocks.push({
-			type: "text",
-			text: `<tool_result id="${item.toolCallId}" tool="${item.toolName}" status="${status}">\n[Attached ${item.images.length} image(s) from tool "${item.toolName}" delivered via multimodal prompt]\n</tool_result>`,
-		});
+		if (item.texts.length > 0) {
+			hasAnyText = true;
+			const body = item.texts.join("\n");
+			const imageNote =
+				item.images.length > 0
+					? `\n[Attached ${item.images.length} image(s) from tool "${item.toolName}" below]`
+					: "";
+			blocks.push({
+				type: "text",
+				text: `<tool_result id="${item.toolCallId}" tool="${item.toolName}" status="${status}">\n${body}${imageNote}\n</tool_result>`,
+			});
+		} else if (item.images.length > 0) {
+			blocks.push({
+				type: "text",
+				text: `<tool_result id="${item.toolCallId}" tool="${item.toolName}" status="${status}">\n[Attached ${item.images.length} image(s) from tool "${item.toolName}" delivered via multimodal prompt]\n</tool_result>`,
+			});
+		}
 		for (const img of item.images) {
+			hasAnyImages = true;
 			blocks.push({
 				type: "image",
 				data: img.data,
@@ -193,7 +217,10 @@ function buildDeferredMcpImagePromptBlocks(
 	if (includeContinueNote && blocks.length > 0) {
 		blocks.push({
 			type: "text",
-			text: "Please inspect the attached tool result image(s) above and continue.",
+			text:
+				hasAnyImages && !hasAnyText
+					? "Please inspect the attached tool result image(s) above and continue."
+					: "Please continue using the tool output(s) above.",
 		});
 	}
 	return blocks;
@@ -215,8 +242,10 @@ interface ActiveTurnPump {
 	pendingAnnouncedMcpCount: number;
 	/** 已向 Pi 推理流发出的宿主 MCP `callId` 集合，防止误结算仍在队列中待消费的后续工具请求 */
 	readonly emittedMcpCallIds: Set<string>;
-	/** 本轮宿主 MCP 工具返回中因超过 `agy` 10KB 媒体内联上限而延迟到工具边界多模态 `session/prompt` 投递的图片 */
-	readonly deferredMcpImages: DeferredMcpImagePayload[];
+	/** 本轮宿主 MCP 工具返回中因超过 `agy` 10KB 内联上限而延迟到工具边界同会话 `session/prompt` 投递的完整文本与图片 */
+	readonly deferredMcpOutputs: DeferredMcpToolPayload[];
+	/** 单次连续工具循环触及 `max_turn_requests` 后已自动无感续接的次数 */
+	autoContinuedTurnCount: number;
 	/** 本步是否已向观测扩展通告 `x-acp-upstream-pending: 1` 等待上游全量快照 */
 	awaitingUpstreamTelemetry: boolean;
 	/** 本步进入时的归档投影是否与后端会话一致（透传给 `acp-upstream` 响应头） */
@@ -769,6 +798,11 @@ export class TurnCoordinator {
 				return;
 			}
 
+			if (ledger.toolMode === "pi-tools") {
+				// 忽略 pi-tools 模式下非宿主 MCP 的后端内部自执行工具事件，避免污染门控计数或派发未激活的镜像工具
+				return;
+			}
+
 			// 模式 A / Hybrid 下的 AGY 原生工具调用
 			ledger.activePump?.queue.push({ kind: "acp_update", update });
 			return;
@@ -778,7 +812,7 @@ export class TurnCoordinator {
 			const isHostMcp =
 				ledger.hostMcpAnnouncementIds.has(update.toolCallId) ||
 				this.isHostMcpToolEvent(ledger, update.title, update.name);
-			if (!isHostMcp) {
+			if (!isHostMcp && ledger.toolMode !== "pi-tools") {
 				this.mirrorBroker.registerOrUpdateCall(sessionId, update);
 			}
 			return;
@@ -787,14 +821,25 @@ export class TurnCoordinator {
 		ledger.activePump?.queue.push({ kind: "acp_update", update });
 	}
 
+	private getSafeRegisteredTools(): Array<{ name: string; promptGuidelines?: readonly string[] }> {
+		try {
+			return this.pi.getAllTools();
+		} catch {
+			return [];
+		}
+	}
+
+	private computeCustomizationMount(messages: readonly Message[], cwd: string) {
+		return prepareCustomizationMount(messages as Message[], this.currentConfig, cwd, process.env, {
+			registeredTools: this.getSafeRegisteredTools(),
+		});
+	}
+
 	private isHostMcpToolEvent(
 		ledger: ManagedSessionLedger,
 		rawTitle: string | undefined,
 		rawName?: string,
 	): boolean {
-		if (ledger.toolMode === "pi-tools") {
-			return true;
-		}
 		if (ledger.hostMcpTools.length === 0) {
 			return false;
 		}
@@ -803,20 +848,30 @@ export class TurnCoordinator {
 			if (lowerName.startsWith("mcp_pi_tools_")) {
 				return true;
 			}
-			if (ledger.hostMcpTools.some((t) => lowerName === t.name.toLowerCase())) {
+			if (
+				ledger.hostMcpTools.some(
+					(t) =>
+						lowerName === t.name.toLowerCase() ||
+						lowerName === toExposedMcpToolName(t.name).toLowerCase(),
+				)
+			) {
 				return true;
 			}
-			// 若服务端已提供明确的非宿主原生工具名（如 read_file），不再按 title 子串模糊匹配，防止读写含 pi_tools 路径时误吞
+			// 若服务端已提供明确的非宿主原生工具名（如 read_file / list_resources），不再按 title 子串模糊匹配，防止误吞或门控泄漏
 			return false;
 		}
 		if (!rawTitle) {
 			return false;
 		}
-		const lower = rawTitle.toLowerCase();
+		const lower = rawTitle.trim().toLowerCase();
 		if (lower.includes("mcp_pi_tools_")) {
 			return true;
 		}
-		return ledger.hostMcpTools.some((t) => lower === t.name.toLowerCase());
+		return ledger.hostMcpTools.some(
+			(t) =>
+				lower === t.name.toLowerCase() ||
+				lower === toExposedMcpToolName(t.name).toLowerCase(),
+		);
 	}
 
 	private async runStreamStep(
@@ -921,7 +976,7 @@ export class TurnCoordinator {
 		}
 
 		// 进入新用户轮次（2c）或重建路径（3）时才计算最新规则与技能挂载指纹
-		const mountInfo = prepareCustomizationMount(context.messages, this.currentConfig, cwd);
+		const mountInfo = this.computeCustomizationMount(context.messages, cwd);
 
 		// 2c. 连续正常追问：先确认上一轮在途请求已完全收敛；若底层卡死则自动驱逐重建，否则直接复用会话与缓存
 		let skipAnchorRestoreForProjectionSync = false;
@@ -1307,6 +1362,25 @@ export class TurnCoordinator {
 		}
 	}
 
+	/**
+	 * 确保工具边界切入或迟到补发的提示词块严守 `agy` 单步 64k 安全预算：
+	 * 预算内零开销原样直发；超预算时优先通过只读 SQLite 分叉预注入前序分片，不可用时平滑回退单步安全分片。
+	 */
+	private async resolveSafeContinuationBlocksOnLedger(
+		ledger: ManagedSessionLedger,
+		blocks: readonly AcpPromptBlock[],
+		signal?: AbortSignal,
+	): Promise<AcpPromptBlock[]> {
+		if (!exceedsSafeSingleStepBudget(blocks)) {
+			return [...blocks];
+		}
+		const preloaded = await this.tryPreloadOversizedContinuationOnLedger(ledger, blocks, signal);
+		if (preloaded) {
+			return preloaded;
+		}
+		return buildPromptBlocksPreloadPlan(blocks).singleStepFallbackBlocks;
+	}
+
 	private async reloadLedgerSessionForTools(
 		ledger: ManagedSessionLedger,
 		hostMcpTools: Tool[],
@@ -1439,9 +1513,12 @@ export class TurnCoordinator {
 		// 分支 A：若存在因超过 165 秒守护阈值已剥离的调用，等待在途取消收敛后通过新 session/prompt 补发迟到结果
 		if (ledger.detachedCallIds.size > 0) {
 			const detachedResults: ToolResultMessage[] = [];
+			for (const msg of visibleMessages) {
+				if (msg.role === "toolResult" && ledger.detachedCallIds.has(msg.toolCallId)) {
+					detachedResults.push(msg);
+				}
+			}
 			for (const callId of ledger.detachedCallIds) {
-				const found = recentToolResults.get(callId);
-				if (found) detachedResults.push(found);
 				const parked = ledger.parkedCalls.get(callId);
 				parked?.settle({
 					isError: true,
@@ -1461,11 +1538,7 @@ export class TurnCoordinator {
 				await this.discardWedgedLedger(ledger);
 				const cwd = this.activeContext?.cwd ?? process.cwd();
 				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-				const mountInfo = prepareCustomizationMount(
-					fullContextMessages,
-					this.currentConfig,
-					cwd,
-				);
+				const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 				const restored = await this.bootstrapOrRestoreLedger({
 					piSessionKey: ledger.piSessionKey,
 					cwd,
@@ -1493,19 +1566,32 @@ export class TurnCoordinator {
 
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
 
-			const lateBlocks =
-				detachedResults.length > 0
-					? buildPromptBlocksPreloadPlan(
-							buildDetachedToolResultBlocks(detachedResults, trailingUsers),
-						).singleStepFallbackBlocks
-					: buildFreshReplayPlan({
-							visibleMessages,
-							maxContextWindowTokens: model.contextWindow,
-						}).singleStepFallbackBlocks;
+			if (detachedResults.length > 0) {
+				const rawLateBlocks = buildDetachedToolResultBlocks(detachedResults, trailingUsers);
+				const safeLateBlocks = await this.resolveSafeContinuationBlocksOnLedger(
+					ledger,
+					rawLateBlocks,
+					options?.signal,
+				);
+				await this.executePromptOnLedger(
+					ledger,
+					safeLateBlocks,
+					visibleMessages,
+					writer,
+					model,
+					options,
+				);
+				return;
+			}
+
+			const lateFallbackBlocks = buildFreshReplayPlan({
+				visibleMessages,
+				maxContextWindowTokens: model.contextWindow,
+			}).singleStepFallbackBlocks;
 
 			await this.executePromptOnLedger(
 				ledger,
-				lateBlocks,
+				lateFallbackBlocks,
 				visibleMessages,
 				writer,
 				model,
@@ -1533,11 +1619,7 @@ export class TurnCoordinator {
 				await this.discardWedgedLedger(ledger);
 				const cwd = this.activeContext?.cwd ?? process.cwd();
 				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-				const mountInfo = prepareCustomizationMount(
-					fullContextMessages,
-					this.currentConfig,
-					cwd,
-				);
+				const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 				const restored = await this.bootstrapOrRestoreLedger({
 					piSessionKey: ledger.piSessionKey,
 					cwd,
@@ -1570,11 +1652,7 @@ export class TurnCoordinator {
 				await this.teardownLedger(ledger);
 				const cwd = this.activeContext?.cwd ?? process.cwd();
 				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-				const mountInfo = prepareCustomizationMount(
-					fullContextMessages,
-					this.currentConfig,
-					cwd,
-				);
+				const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 				const restored = await this.bootstrapOrRestoreLedger({
 					piSessionKey: ledger.piSessionKey,
 					cwd,
@@ -1627,6 +1705,7 @@ export class TurnCoordinator {
 			isError: boolean;
 		}> = [];
 		let hasDeferredImagesInSettledBatch = false;
+		let hasDeferredTextsInSettledBatch = false;
 		for (const [callId, parked] of entriesToSettle) {
 			const tr = recentToolResults.get(callId);
 			if (!tr) {
@@ -1638,31 +1717,57 @@ export class TurnCoordinator {
 				});
 				continue;
 			}
-			const mcpContent: Array<TextContent | ImageContent> = [];
+			const rawTextBlocks: TextContent[] = [];
+			const inlineImages: ImageContent[] = [];
 			const oversizedImages: ImageContent[] = [];
 			for (const block of tr.content) {
-				if (
-					block.type === "image" &&
-					getDecodedBase64Bytes(block.data) > AGY_MCP_INLINE_IMAGE_SAFE_BYTES
-				) {
-					oversizedImages.push(block);
+				if (block.type === "image") {
+					if (getDecodedBase64Bytes(block.data) > AGY_MCP_INLINE_IMAGE_SAFE_BYTES) {
+						oversizedImages.push(block);
+					} else {
+						inlineImages.push(block);
+					}
 				} else {
-					mcpContent.push(block);
+					rawTextBlocks.push(block);
 				}
 			}
+
+			const joinedText = rawTextBlocks.map((b) => b.text).join("\n");
+			const joinedTextBytes = Buffer.byteLength(joinedText, "utf8");
+			const isOversizedText = joinedTextBytes > AGY_MCP_INLINE_TEXT_SAFE_BYTES;
+
+			const mcpContent: Array<TextContent | ImageContent> = [];
+			if (isOversizedText) {
+				hasDeferredTextsInSettledBatch = true;
+				mcpContent.push({
+					type: "text",
+					text: `[Tool "${tr.toolName}" produced ${joinedTextBytes} bytes of text output; full untruncated content is delivered in the immediately following prompt block.]`,
+				});
+			} else {
+				mcpContent.push(...rawTextBlocks);
+			}
+			mcpContent.push(...inlineImages);
+
 			if (oversizedImages.length > 0) {
 				hasDeferredImagesInSettledBatch = true;
-				pump.deferredMcpImages.push({
+				if (!isOversizedText) {
+					mcpContent.push({
+						type: "text",
+						text: `[${oversizedImages.length} image(s) (>10KB) delivered via follow-up multimodal prompt block.]`,
+					});
+				}
+			}
+
+			if (isOversizedText || oversizedImages.length > 0) {
+				pump.deferredMcpOutputs.push({
 					toolCallId: tr.toolCallId,
 					toolName: tr.toolName,
 					isError: tr.isError,
+					texts: isOversizedText ? rawTextBlocks.map((b) => b.text) : [],
 					images: oversizedImages,
 				});
-				mcpContent.push({
-					type: "text",
-					text: `[${oversizedImages.length} image(s) (>10KB) delivered via follow-up multimodal prompt block.]`,
-				});
 			}
+
 			settlePayloads.push({
 				callId,
 				parked,
@@ -1671,7 +1776,7 @@ export class TurnCoordinator {
 			});
 		}
 
-		// 若即将执行工具边界切入（用户 steer、无 SSE 下的动态工具重载、或同批工具已全数结算且存在待多模态投递的大图），
+		// 若即将执行工具边界切入（用户 steer、无 SSE 下的动态工具重载、或同批工具已全数结算且存在超过 10KB 内联上限的文本/图片），
 		// 先开启切入保护标志，防止 settle 后毫秒级冲入的同批后续 MCP 工具被挂起拖慢收口。
 		const willCutInForSteer = trailingUsers.length > 0;
 		const willCutInForToolsReload =
@@ -1679,13 +1784,13 @@ export class TurnCoordinator {
 			needsMidTurnToolsReload &&
 			Boolean(ledger.conn.capabilities?.sessionCapabilities?.resume) &&
 			hasLocalConversationDb(this.currentConfig, ledger.agySessionId);
-		const willCutInForDeferredImages =
+		const willCutInForDeferredOutputs =
 			!willCutInForSteer &&
 			!willCutInForToolsReload &&
 			!hasRemainingParkedCalls &&
-			pump.deferredMcpImages.length > 0;
+			pump.deferredMcpOutputs.length > 0;
 
-		if (willCutInForSteer || willCutInForToolsReload || willCutInForDeferredImages) {
+		if (willCutInForSteer || willCutInForToolsReload || willCutInForDeferredOutputs) {
 			ledger.steeringCutInPending = true;
 		}
 
@@ -1705,7 +1810,7 @@ export class TurnCoordinator {
 		const isMcpProjectionSynced =
 			currentProjectionForMcp.projectionDigest === ledger.syncedProjectionDigest;
 		const willCutInAny =
-			willCutInForSteer || willCutInForToolsReload || willCutInForDeferredImages;
+			willCutInForSteer || willCutInForToolsReload || willCutInForDeferredOutputs;
 		const hasUpstreamDb = this.isLocalSqliteUpstreamLikelyAvailable(ledger.agySessionId);
 
 		if (options?.onResponse && settledMcpIds.length > 0) {
@@ -1717,6 +1822,9 @@ export class TurnCoordinator {
 			};
 			if (hasDeferredImagesInSettledBatch) {
 				responseHeaders["x-acp-mcp-images-deferred"] = String(AGY_MCP_INLINE_IMAGE_SAFE_BYTES);
+			}
+			if (hasDeferredTextsInSettledBatch) {
+				responseHeaders["x-acp-mcp-text-deferred"] = String(AGY_MCP_INLINE_TEXT_SAFE_BYTES);
 			}
 			if (willCutInAny) {
 				responseHeaders["x-acp-mcp-cutin"] = "1";
@@ -1741,8 +1849,8 @@ export class TurnCoordinator {
 		// 若用户在工具执行期间按 Enter 发送了转向消息（steer）：
 		// 先等待刚结算的工具输出落盘至本地会话库，随即在当前工具边界收口后台自动循环，立即在同一热缓存会话上以真实用户身份发送转向消息！
 		if (willCutInForSteer) {
-			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
-				pump.deferredMcpImages.splice(0),
+			const deferredOutBlocks = buildDeferredMcpOutputPromptBlocks(
+				pump.deferredMcpOutputs.splice(0),
 				false,
 			);
 			try {
@@ -1765,11 +1873,7 @@ export class TurnCoordinator {
 				await this.discardWedgedLedger(ledger);
 				const cwd = this.activeContext?.cwd ?? process.cwd();
 				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-				const mountInfo = prepareCustomizationMount(
-					fullContextMessages,
-					this.currentConfig,
-					cwd,
-				);
+				const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 				const restored = await this.bootstrapOrRestoreLedger({
 					piSessionKey: ledger.piSessionKey,
 					cwd,
@@ -1805,9 +1909,14 @@ export class TurnCoordinator {
 				);
 			}
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+			const steerTargetBlocks = await this.resolveSafeContinuationBlocksOnLedger(
+				ledger,
+				[...deferredOutBlocks, ...convertUserMessagesToPromptBlocks(trailingUsers)],
+				options?.signal,
+			);
 			await this.executePromptOnLedger(
 				ledger,
-				[...deferredImgBlocks, ...convertUserMessagesToPromptBlocks(trailingUsers)],
+				steerTargetBlocks,
 				visibleMessages,
 				writer,
 				model,
@@ -1819,8 +1928,8 @@ export class TurnCoordinator {
 		// 默认 processPerSession: true（无 SSE 订阅）下工具集动态变化（如 tool_search 解锁新工具）：
 		// 在当前工具落盘后通过原地 close + session/resume 重拉 tools/list，使模型当轮立即可见并调用新解锁工具！
 		if (willCutInForToolsReload) {
-			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
-				pump.deferredMcpImages.splice(0),
+			const deferredOutBlocks = buildDeferredMcpOutputPromptBlocks(
+				pump.deferredMcpOutputs.splice(0),
 				false,
 			);
 			try {
@@ -1845,15 +1954,20 @@ export class TurnCoordinator {
 				);
 				if (reloaded) {
 					this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
-					await this.executePromptOnLedger(
+					const reloadBlocks = await this.resolveSafeContinuationBlocksOnLedger(
 						ledger,
 						[
-							...deferredImgBlocks,
+							...deferredOutBlocks,
 							{
 								type: "text",
 								text: "The newly activated tools are now loaded and available. Please continue.",
 							},
 						],
+						options?.signal,
+					);
+					await this.executePromptOnLedger(
+						ledger,
+						reloadBlocks,
 						visibleMessages,
 						writer,
 						model,
@@ -1869,7 +1983,7 @@ export class TurnCoordinator {
 			await this.discardWedgedLedger(ledger);
 			const cwd = this.activeContext?.cwd ?? process.cwd();
 			const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-			const mountInfo = prepareCustomizationMount(fullContextMessages, this.currentConfig, cwd);
+			const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 			const restored = await this.bootstrapOrRestoreLedger({
 				piSessionKey: ledger.piSessionKey,
 				cwd,
@@ -1895,11 +2009,11 @@ export class TurnCoordinator {
 			return;
 		}
 
-		// 宿主 MCP 工具返回 > 9.6KB 图片：在当前工具落盘后收口旧后台循环，在同一热缓存会话上以多模态 session/prompt 投递完整图片，
-		// 彻底规避 agy McpToolConfig.MaxOutputBytes (10KB) 导致的图片丢弃盲区，同时保持 100% 热前缀缓存！
-		if (willCutInForDeferredImages) {
-			const deferredImgBlocks = buildDeferredMcpImagePromptBlocks(
-				pump.deferredMcpImages.splice(0),
+		// 宿主 MCP 工具返回 > 9.2KB 文本或 > 9.6KB 图片：在当前工具落盘后收口旧后台循环，在同一热缓存会话上以 session/prompt 完整投递，
+		// 彻底规避 agy McpToolConfig.MaxOutputBytes (10KB) 造成的文本腰斩与图片丢弃，同时保持 100% 热前缀缓存！
+		if (willCutInForDeferredOutputs) {
+			const deferredOutBlocks = buildDeferredMcpOutputPromptBlocks(
+				pump.deferredMcpOutputs.splice(0),
 				true,
 			);
 			try {
@@ -1922,7 +2036,7 @@ export class TurnCoordinator {
 				await this.discardWedgedLedger(ledger);
 				const cwd = this.activeContext?.cwd ?? process.cwd();
 				const isProjectTrusted = this.activeContext?.isProjectTrusted?.() ?? false;
-				const mountInfo = prepareCustomizationMount(fullContextMessages, this.currentConfig, cwd);
+				const mountInfo = this.computeCustomizationMount(fullContextMessages, cwd);
 				const restored = await this.bootstrapOrRestoreLedger({
 					piSessionKey: ledger.piSessionKey,
 					cwd,
@@ -1954,9 +2068,14 @@ export class TurnCoordinator {
 				await readCurrentMaxSqliteStepIdx(this.currentConfig, ledger.agySessionId),
 			);
 			this.httpMcpBridge.clearSessionCancelled(ledger.agySessionId);
+			const safeDeferredBlocks = await this.resolveSafeContinuationBlocksOnLedger(
+				ledger,
+				deferredOutBlocks,
+				options?.signal,
+			);
 			await this.executePromptOnLedger(
 				ledger,
-				deferredImgBlocks,
+				safeDeferredBlocks,
 				visibleMessages,
 				writer,
 				model,
@@ -2052,6 +2171,9 @@ export class TurnCoordinator {
 				},
 				onClientDisconnect: (callId) => {
 					const fullLedger = ledgerDraft as ManagedSessionLedger;
+					if (fullLedger.activePump?.cancelledByHoldTimeout) {
+						fullLedger.detachedCallIds.add(callId);
+					}
 					fullLedger.parkedCalls.delete(callId);
 					fullLedger.activePump?.emittedMcpCallIds.delete(callId);
 				},
@@ -2060,6 +2182,12 @@ export class TurnCoordinator {
 					fullLedger.detachedCallIds.add(call.callId);
 					if (fullLedger.activePump) {
 						fullLedger.activePump.cancelledByHoldTimeout = true;
+						for (const emittedId of fullLedger.activePump.emittedMcpCallIds) {
+							fullLedger.detachedCallIds.add(emittedId);
+						}
+					}
+					for (const parkedId of fullLedger.parkedCalls.keys()) {
+						fullLedger.detachedCallIds.add(parkedId);
 					}
 					if (fullLedger.agySessionId) {
 						this.httpMcpBridge.markSessionTurnCancelled(fullLedger.agySessionId);
@@ -2622,7 +2750,8 @@ export class TurnCoordinator {
 			hasSqliteGenTelemetry: false,
 			pendingAnnouncedMcpCount: 0,
 			emittedMcpCallIds: new Set<string>(),
-			deferredMcpImages: [],
+			deferredMcpOutputs: [],
+			autoContinuedTurnCount: 0,
 			awaitingUpstreamTelemetry: willReportUpstream,
 			lastStepProjectionSynced: isProjectionSynced,
 			lastStepUsedSlicePool: false,
@@ -2803,9 +2932,9 @@ export class TurnCoordinator {
 						continue;
 					}
 
-					const waitWindowMs = 20;
+					const waitWindowMs = 10;
 					if (pump.pendingAnnouncedMcpCount <= 0) {
-						// 无额外已宣告在途请求时严格仅做 1 次 20ms 微批探测即收口
+						// 无额外已宣告在途请求时严格仅做 1 次 10ms 微批探测即收口
 						await new Promise((r) => setTimeout(r, waitWindowMs));
 						while (pump.queue.peek()?.kind === "mcp_parked") {
 							const nextItem = (await pump.queue.shift()) as {
@@ -2865,7 +2994,34 @@ export class TurnCoordinator {
 					return;
 				}
 
+				// 当单次连续工具循环触及 agy 单轮最大生成次数限制（max_turn_requests）时，在同一热会话上自动无感续接
+				if (
+					ledger.toolMode === "pi-tools" &&
+					item.response.stopReason === "max_turn_requests" &&
+					!signal?.aborted &&
+					pump.autoContinuedTurnCount < MAX_AUTO_CONTINUED_TURN_REQUESTS
+				) {
+					pump.autoContinuedTurnCount++;
+					if (this.isLocalSqliteUpstreamLikelyAvailable(ledger.agySessionId)) {
+						pump.awaitingUpstreamTelemetry = true;
+					}
+					this.startTrackedSessionPrompt(ledger, pump, {
+						sessionId: ledger.agySessionId,
+						prompt: [{ type: "text", text: "Continue from where you left off." }],
+					});
+					continue;
+				}
+
 				ledger.activePump = undefined;
+
+				if (
+					item.response.stopReason === "max_turn_requests" &&
+					!writer.message.content.some((b) => b.type === "text" && b.text.trim().length > 0)
+				) {
+					writer.appendTextDelta(
+						"[Reached maximum consecutive steps for this turn. Send a message to continue.]",
+					);
+				}
 
 				const calibratedUsage = await this.buildFinalStepUsage(
 					ledger,
@@ -2979,7 +3135,11 @@ export class TurnCoordinator {
 		}
 
 		const projectionHeader = pump.lastStepProjectionSynced ? "1" : "0";
-		const retryDelays = pump.lastStepUsedSlicePool ? [] : [20, 40];
+		const retryDelays = pump.lastStepUsedSlicePool
+			? []
+			: pump.hasSqliteGenTelemetry
+				? [15]
+				: [20, 40];
 		const query = hasDb
 			? await readLatestSqliteUpstreamRequestSince(
 					this.currentConfig,

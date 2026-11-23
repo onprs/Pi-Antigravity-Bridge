@@ -193,6 +193,7 @@ function resolveManagedAgentMaterialization(
 				inheritCustomizations: profile.inheritCustomizations,
 				inheritMcp: profile.inheritMcp,
 				mountedPluginPaths: profile.mountedPluginPaths,
+				agentSchemaRev: 2,
 			}),
 		)
 		.digest("hex")
@@ -249,7 +250,13 @@ function resolveManagedAgentMaterialization(
 		];
 
 		if (profile.disableBuiltinTools) {
-			yamlLines.push("tools: []");
+			yamlLines.push(
+				"tools: []",
+				"disabledTools:",
+				"  - list_resources",
+				"  - read_resource",
+				"  - manage_task",
+			);
 		}
 		if (profile.excludeDefaultComponents) {
 			yamlLines.push("excludeDefaultComponents: true");

@@ -32,6 +32,20 @@ export async function runStdioToHttpMcpShim(targetUrl: string, bearerToken: stri
 			});
 
 			const responseText = await response.text();
+			if (!response.ok) {
+				if (hasId) {
+					const errPayload = {
+						jsonrpc: "2.0",
+						id: parsed.id,
+						error: {
+							code: -32000,
+							message: `MCP HTTP ${response.status}: ${responseText.trim().slice(0, 240) || response.statusText}`,
+						},
+					};
+					process.stdout.write(`${JSON.stringify(errPayload)}\n`);
+				}
+				return;
+			}
 			if (hasId && responseText.trim().length > 0) {
 				process.stdout.write(`${responseText.trim()}\n`);
 			}
@@ -148,6 +162,7 @@ export function buildInlineStdioShimCommand(
 		'  try {',
 		'    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token }, body: line });',
 		'    const txt = (await res.text()).trim();',
+		'    if (!res.ok) { if (hasId) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "MCP HTTP " + res.status + (txt ? ": " + txt.slice(0, 240) : "") } }) + "\\n"); return; }',
 		'    if (hasId && txt) process.stdout.write(txt + "\\n");',
 		'  } catch (e) {',
 		'    if (hasId) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e) } }) + "\\n");',

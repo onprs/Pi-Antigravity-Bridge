@@ -1,6 +1,7 @@
 import * as assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
@@ -10,8 +11,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { buildAgySpawnSpec, resolveAgyBinary } from "../src/acp/binary-resolver.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
 import {
+	doesAnnouncementMatchTool,
 	LocalHttpMcpBridge,
+	MAX_MCP_EXPOSED_TOOL_NAME_LEN,
+	normalizeHostToolArguments,
 	sanitizeJsonSchemaForMcp,
+	toExposedMcpToolName,
 	type ParkedToolCall,
 } from "../src/mcp/http-mcp-bridge.ts";
 import { filterToolsForHostMcpBridge } from "../src/mcp/pi-mcp-forwarder.ts";
@@ -819,6 +824,287 @@ describe("官方原生 Plugin 生态挂载、纯净模式上下文与零系统�
 			assert.equal(classifiedRead.arguments.limit, 15);
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("支持跨 TCP 分片多字节中文解码、可选 null 剥离、超长工具短别名还原、精确公告门控及扩展准则与自定义段挂载", async () => {
+		const bridge = new LocalHttpMcpBridge(10_000);
+		try {
+			const longToolName =
+				"mcp__aws_billing_and_cost_management__get_reservation_purchase_recommendation";
+			const exposedLongName = toExposedMcpToolName(longToolName);
+			assert.ok(
+				exposedLongName.length <= MAX_MCP_EXPOSED_TOOL_NAME_LEN,
+				`暴露别名长度应 <= ${MAX_MCP_EXPOSED_TOOL_NAME_LEN}: ${exposedLongName}`,
+			);
+			assert.equal(toExposedMcpToolName("read"), "read");
+
+			// 验证精确公告匹配：read 不应抢占 read_mcp_resource 的前置宣告
+			assert.equal(doesAnnouncementMatchTool("mcp_pi_tools_read_mcp_resource", "read"), false);
+			assert.equal(
+				doesAnnouncementMatchTool("mcp_pi_tools_read_mcp_resource", "read_mcp_resource"),
+				true,
+			);
+			assert.equal(doesAnnouncementMatchTool("list_resources", "read"), false);
+			assert.equal(doesAnnouncementMatchTool(`mcp_pi_tools_${exposedLongName}`, longToolName), true);
+
+			// 验证根自引用 $ref: "#" 校验通过且不重复报错
+			const recursiveSchema = {
+				type: "object",
+				properties: {
+					label: { type: "string" },
+					child: { $ref: "#" },
+				},
+				required: ["label"],
+			};
+			assert.equal(
+				validateToolArguments("tree", { label: "root", child: { label: "leaf" } }, recursiveSchema)
+					.valid,
+				true,
+			);
+			const badTree = validateToolArguments(
+				"tree",
+				{ label: "root", child: { label: 123 } },
+				recursiveSchema,
+			);
+			assert.equal(badTree.valid, false);
+			assert.equal(badTree.issues.length, 1);
+
+			// 验证非 nullable 可选字段上的显式 null 剥离与字符串化数组/对象反序列化
+			const complexTool: Tool = {
+				name: "search_demo",
+				description: "Demo search",
+				parameters: {
+					type: "object",
+					properties: {
+						query: { type: "string" },
+						offset: { type: "integer" },
+						tags: { type: "array", items: { type: "string" } },
+						filter: {
+							type: "object",
+							properties: { lang: { type: "string" }, limit: { type: "integer" } },
+							required: ["lang"],
+						},
+					},
+					required: ["query"],
+					additionalProperties: false,
+				} as never,
+			};
+			const normArgs = normalizeHostToolArguments(
+				"search_demo",
+				{
+					query: "测试",
+					offset: null,
+					tags: '["a", "b"]',
+					filter: '{"lang":"zh","limit":null}',
+				},
+				complexTool,
+			);
+			assert.deepEqual(normArgs, {
+				query: "测试",
+				tags: ["a", "b"],
+				filter: { lang: "zh" },
+			});
+
+			// 验证跨 TCP 分片拆开 3 字节 UTF-8 中文字符 + 超长工具短别名调用还原 + 预校验拒绝消费宣告
+			let capturedCall: ParkedToolCall | undefined;
+			const writeTool: Tool = {
+				name: "write",
+				description: "Write file",
+				parameters: {
+					type: "object",
+					properties: { path: { type: "string" }, content: { type: "string" } },
+					required: ["path", "content"],
+				} as never,
+			};
+			const longTool: Tool = {
+				name: longToolName,
+				description: "AWS recommendation",
+				parameters: {
+					type: "object",
+					properties: { service: { type: "string" }, cursor: { type: "string" } },
+					required: ["service"],
+					additionalProperties: false,
+				} as never,
+			};
+			const token = bridge.registerSessionBinding({
+				agySessionId: "sess-utf8",
+				tools: [writeTool, longTool],
+				onParkedCall: (call) => {
+					capturedCall = call;
+					call.settle({ content: [{ type: "text", text: "ok" }] });
+				},
+				onHoldTimeout: async () => {},
+			});
+			const port = await bridge.ensureListening();
+
+			// 1) tools/list 应暴露短别名并在描述标注原名
+			const listRes = (await fetch(`http://127.0.0.1:${port}/mcp`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+				body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+			}).then((r) => r.json())) as { result: { tools: Array<{ name: string; description: string }> } };
+			const listedLong = listRes.result.tools.find((t) => t.name === exposedLongName);
+			assert.ok(listedLong);
+			assert.ok(listedLong.description.includes(longToolName));
+
+			// 2) 先宣告一次 write 但发一个缺失必填项的非法调用，验证宣告被及时消费不残留
+			bridge.recordAcpToolAnnouncement("sess-utf8", "mcp_pi_tools_write");
+			const badCallRes = (await fetch(`http://127.0.0.1:${port}/mcp`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 2,
+					method: "tools/call",
+					params: { name: "write", arguments: { path: "only-path.txt" } },
+				}),
+			}).then((r) => r.json())) as { result: { isError: boolean } };
+			assert.equal(badCallRes.result.isError, true);
+			bridge.markSessionTurnCancelled("sess-utf8");
+			const cancelledAfterReject = (await fetch(`http://127.0.0.1:${port}/mcp`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 3,
+					method: "tools/call",
+					params: { name: "write", arguments: { path: "a.txt", content: "hi" } },
+				}),
+			}).then((r) => r.json())) as { result: { isError: boolean; content: Array<{ text: string }> } };
+			assert.equal(cancelledAfterReject.result.isError, true);
+			assert.ok(cancelledAfterReject.result.content[0].text.includes("cancelled"));
+			bridge.clearSessionCancelled("sess-utf8");
+
+			// 3) 将多字节中文 JSON 请求体在 3 字节 UTF-8 字符中间强行拆成多帧发送，验证无 U+FFFD 乱码且短别名还原为原工具名
+			bridge.recordAcpToolAnnouncement("sess-utf8", `mcp_pi_tools_${exposedLongName}`);
+			const chinesePayload = JSON.stringify({
+				jsonrpc: "2.0",
+				id: 4,
+				method: "tools/call",
+				params: {
+					name: exposedLongName,
+					arguments: { service: "中文跨分片完整性校验🚀测试", cursor: null },
+				},
+			});
+			const payloadBuf = Buffer.from(chinesePayload, "utf8");
+			const zhOffset = payloadBuf.indexOf(Buffer.from("跨", "utf8"));
+			assert.ok(zhOffset > 0);
+			// 在“跨”字第 1 个字节与第 2 个字节之间切分
+			const part1 = payloadBuf.subarray(0, zhOffset + 1);
+			const part2 = payloadBuf.subarray(zhOffset + 1, zhOffset + 2);
+			const part3 = payloadBuf.subarray(zhOffset + 2);
+
+			const splitResp = await new Promise<{ statusCode?: number; body: string }>((resolve, reject) => {
+				const req = http.request(
+					{
+						hostname: "127.0.0.1",
+						port,
+						path: "/mcp",
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${token}`,
+							"Transfer-Encoding": "chunked",
+						},
+					},
+					(res) => {
+						const chunks: Buffer[] = [];
+						res.on("data", (c: Buffer) => chunks.push(c));
+						res.on("end", () =>
+							resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }),
+						);
+					},
+				);
+				req.on("error", reject);
+				req.write(part1);
+				setTimeout(() => {
+					req.write(part2);
+					setTimeout(() => {
+						req.write(part3);
+						req.end();
+					}, 8);
+				}, 8);
+			});
+			assert.equal(splitResp.statusCode, 200);
+			assert.ok(capturedCall);
+			assert.equal(capturedCall.toolName, longToolName, "短别名调用应自动还原为完整原始工具名");
+			assert.equal(capturedCall.arguments.service, "中文跨分片完整性校验🚀测试");
+			assert.equal("cursor" in capturedCall.arguments, false, "非必填字段上的显式 null 应被自动剥离");
+
+			// 4) 验证 stdio-shim 在收到 401 非 2xx 响应时输出合规 JSON-RPC 错误帧而非裸错误体
+			const badShimSpec = buildInlineStdioShimCommand(`http://127.0.0.1:${port}/mcp`, "invalid-token");
+			const shimEnv: NodeJS.ProcessEnv = { ...process.env };
+			for (const pair of badShimSpec.env) {
+				shimEnv[pair.name] = pair.value;
+			}
+			const shimStdout = await new Promise<string>((resolve, reject) => {
+				const child = spawn(badShimSpec.command, badShimSpec.args, {
+					env: shimEnv,
+					stdio: ["pipe", "pipe", "pipe"],
+				});
+				let out = "";
+				child.stdout.on("data", (c: Buffer) => {
+					out += c.toString("utf8");
+					if (out.includes("\n")) {
+						child.stdin.end();
+					}
+				});
+				child.on("error", reject);
+				child.on("close", () => resolve(out));
+				child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 99, method: "ping", params: {} })}\n`);
+			});
+			const shimOut = JSON.parse(shimStdout.trim()) as {
+				jsonrpc: string;
+				id: number;
+				error?: { code: number; message: string };
+			};
+			assert.equal(shimOut.jsonrpc, "2.0");
+			assert.equal(shimOut.id, 99);
+			assert.ok(shimOut.error?.message.includes("401"));
+
+			// 5) 验证 pi-tools 纯净模式下完整挂载扩展工具 promptGuidelines、<mcp_servers> 指引、addendum 与自定义段
+			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-ext-guidelines-"));
+			try {
+				const sysMsg: SystemMessage = {
+					role: "system",
+					content: "",
+					timestamp: 1,
+					toolsAdded: [
+						{ name: "read", description: "Read", parameters: { type: "object", properties: {} } as never },
+						{ name: "codemode", description: "Codemode", parameters: { type: "object", properties: {} } as never },
+					],
+					sections: {
+						mcp_servers: "<mcp_servers>\n- mcp__demo (codemode): Demo MCP\n</mcp_servers>",
+						addendum: "<addendum>\nAlways verify edge cases.\n</addendum>",
+						custom_memory: "Remember workspace conventions.",
+					},
+				};
+				const mount = prepareCustomizationMount(
+					[sysMsg],
+					{ ...DEFAULT_BRIDGE_CONFIG, toolMode: "pi-tools", geminiDir: path.join(tmpDir, ".gemini") },
+					tmpDir,
+					process.env,
+					{
+						registeredTools: [
+							{
+								name: "codemode",
+								promptGuidelines: [
+									"Use codemode to batch independent tool calls (Promise.allSettled)",
+								],
+							},
+						],
+					},
+				);
+				assert.ok(mount.workspaceContextBlock?.includes("Promise.allSettled"));
+				assert.ok(mount.workspaceContextBlock?.includes("searchTools / describeNamespace"));
+				assert.ok(mount.workspaceContextBlock?.includes("Always verify edge cases."));
+				assert.ok(mount.workspaceContextBlock?.includes("<custom_memory>"));
+			} finally {
+				fs.rmSync(tmpDir, { recursive: true, force: true });
+			}
+		} finally {
+			await bridge.dispose();
 		}
 	});
 });

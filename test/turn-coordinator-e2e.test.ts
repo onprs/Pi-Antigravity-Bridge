@@ -152,6 +152,12 @@ rl.on("line", async (line) => {
   if (msg.method === "session/cancel") {
     const cancelSid = msg.params?.sessionId;
     const sess = cancelSid ? sessions.get(cancelSid) : undefined;
+    if (Array.isArray(sess?.activeFetchAbortControllers)) {
+      for (const ac of sess.activeFetchAbortControllers) {
+        try { ac.abort(); } catch {}
+      }
+      sess.activeFetchAbortControllers = [];
+    }
     if (sess?.cancelablePromptId !== undefined) {
       const pid = sess.cancelablePromptId;
       sess.cancelablePromptId = undefined;
@@ -787,6 +793,187 @@ rl.on("line", async (line) => {
         jsonrpc: "2.0",
         id: myPromptId,
         result: { stopReason: "end_turn", usage: { inputTokens: 900, cachedReadTokens: 32000, outputTokens: 20 } }
+      });
+      return;
+    }
+
+    if (
+      Array.isArray(prompt) &&
+      !prompt.some((b) => b?.type === "image") &&
+      prompt.some((b) => b?.type === "text" && typeof b.text === "string" && b.text.includes("<tool_result ")) &&
+      sess
+    ) {
+      sess.inFlightPromptId = msg.id;
+      const joinedPromptText = prompt
+        .filter((b) => b?.type === "text")
+        .map((b) => String(b.text || ""))
+        .join("\\n");
+      const summary =
+        "TEXT_CUTIN_LEN=" +
+        Buffer.byteLength(joinedPromptText, "utf8") +
+        ";HAS_HEAD=" +
+        joinedPromptText.includes("HEAD_MARKER_ALPHA") +
+        ";HAS_MID=" +
+        joinedPromptText.includes("MIDDLE_MARKER_OMEGA") +
+        ";HAS_TAIL=" +
+        joinedPromptText.includes("TAIL_MARKER_ZETA") +
+        ";HAS_DETACHED_A=" +
+        joinedPromptText.includes("RESULT_SLOW_ALPHA") +
+        ";HAS_DETACHED_B=" +
+        joinedPromptText.includes("RESULT_SLOW_BETA") +
+        ";SESSION=" +
+        sessionId;
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: summary }
+          }
+        }
+      });
+      sess.inFlightPromptId = undefined;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "end_turn", usage: { inputTokens: 1500, cachedReadTokens: 32000, outputTokens: 35 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_MCP_LARGE_TEXT" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_ltxt_1", name: "mcp_pi_tools_read", title: "mcp_pi_tools_read" } }
+      });
+      const mcpResp = await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 701,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "large.ts" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((r) => r.json());
+      const inlineTxt = mcpResp?.result?.content?.[0]?.text || "";
+      sess.lastInlineNoticeLen = Buffer.byteLength(inlineTxt, "utf8");
+      await new Promise((r) => setTimeout(r, 120));
+      if (sess.inFlightPromptId !== myPromptId) return;
+      send({
+        jsonrpc: "2.0",
+        id: myPromptId,
+        result: { stopReason: "end_turn", usage: { inputTokens: 800, cachedReadTokens: 32000, outputTokens: 15 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_MCP_CONCURRENT_HOLD_DETACH" && !isModeA && sess?.mcpHttp) {
+      const myPromptId = msg.id;
+      sess.inFlightPromptId = myPromptId;
+      sess.cancelablePromptId = myPromptId;
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      const ac1 = new AbortController();
+      const ac2 = new AbortController();
+      sess.activeFetchAbortControllers = [ac1, ac2];
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_hd_1", name: "mcp_pi_tools_bash", title: "mcp_pi_tools_bash" } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_hd_2", name: "mcp_pi_tools_read", title: "mcp_pi_tools_read" } }
+      });
+      void fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 711,
+          method: "tools/call",
+          params: { name: "bash", arguments: { command: "sleep 1" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        }),
+        signal: ac1.signal
+      }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 15));
+      void fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 712,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "slow.txt" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        }),
+        signal: ac2.signal
+      }).catch(() => {});
+      return;
+    }
+
+    if (lastBlockText === "TRIGGER_RESIDUAL_BUILTIN_AND_MAX_TURN" && !isModeA && sess?.mcpHttp) {
+      const authHeader = sess.mcpHttp.headers?.[0]?.value || "";
+      // 先模拟后端推送非宿主内置工具调用 list_resources（不发 HTTP /mcp）
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "builtin_lr_1", name: "list_resources", title: "list_resources" } }
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "builtin_lr_1", name: "list_resources", status: "completed" } }
+      });
+      // 再推送真正的宿主 MCP 工具调用
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId, update: { sessionUpdate: "tool_call", toolCallId: "acp_real_1", name: "mcp_pi_tools_read", title: "mcp_pi_tools_read" } }
+      });
+      const r = await fetch(sess.mcpHttp.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 721,
+          method: "tools/call",
+          params: { name: "read", arguments: { path: "ok.txt" }, _meta: { "antigravity.google/root_conversation_id": sessionId } }
+        })
+      }).then((res) => res.json());
+      sess.savedOkText = r?.result?.content?.[0]?.text || "";
+      // 模拟触及单轮生成步数上限返回 max_turn_requests（尚未输出总结正文）
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "max_turn_requests", usage: { inputTokens: 400, cachedReadTokens: 10000, outputTokens: 10 } }
+      });
+      return;
+    }
+
+    if (lastBlockText === "Continue from where you left off." && !isModeA && sess) {
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "AUTO_CONTINUED_OK:" + (sess.savedOkText || "") }
+          }
+        }
+      });
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { stopReason: "end_turn", usage: { inputTokens: 450, cachedReadTokens: 11000, outputTokens: 25 } }
       });
       return;
     }
@@ -2797,6 +2984,215 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(capturedPayloads.length, 2, "两个并发工具全数结算后应仅触发 1 次切入 session/prompt");
 			const deferredHeaders = capturedHeaders.filter((h) => h["x-acp-mcp-images-deferred"] === "9600");
 			assert.equal(deferredHeaders.length, 1, "仅在包含大图的结算批次标记 x-acp-mcp-images-deferred");
+		} finally {
+			await coord.dispose();
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("宿主 MCP 返回 > 9,200B 大文本应切入同会话完整投递、并发超时剥离不丢结果，且隔离残留内置工具并自动续接 max_turn_requests", async () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-e2e-text-cutin-"));
+		const mockBin = writeMockAgyExecutable(tmpRoot);
+		const cfg: BridgeConfig = {
+			...DEFAULT_BRIDGE_CONFIG,
+			toolMode: "pi-tools",
+			agyBin: mockBin,
+			geminiDir: path.join(tmpRoot, ".gemini"),
+		};
+
+		const pm = new AcpProcessManager();
+		const broker = new AgyTurnMirrorBroker();
+		const coord = new TurnCoordinator(createStubPiApi(), pm, broker, cfg);
+
+		const tools = [
+			{
+				name: "read",
+				description: "Read file",
+				parameters: {
+					type: "object",
+					properties: { path: { type: "string" } },
+					required: ["path"],
+				} as never,
+			},
+			{
+				name: "bash",
+				description: "Run bash",
+				parameters: {
+					type: "object",
+					properties: { command: { type: "string" } },
+					required: ["command"],
+				} as never,
+			},
+		];
+
+		try {
+			// 场景 1：单次 read 返回 24KB 文本（远超 agy 10KB MCP 上限），应在同一热会话无截断完整送达首中尾全部标记
+			const capturedHeaders: Array<Record<string, string>> = [];
+			const step1 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [{ role: "user", content: "TRIGGER_MCP_LARGE_TEXT", timestamp: 1 }],
+					}),
+					{
+						sessionId: "pi-sess-large-text",
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(step1.stopReason, "toolUse");
+			const sid1 = step1.responseId;
+			const tc1 = step1.content.find((c): c is ToolCall => c.type === "toolCall");
+			assert.ok(tc1);
+
+			const bigText = `HEAD_MARKER_ALPHA\n${"x".repeat(12_000)}\nMIDDLE_MARKER_OMEGA\n${"y".repeat(12_000)}\nTAIL_MARKER_ZETA`;
+			const step1Final = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [
+							{ role: "user", content: "TRIGGER_MCP_LARGE_TEXT", timestamp: 1 },
+							step1,
+							{
+								role: "toolResult",
+								toolCallId: tc1.id,
+								toolName: "read",
+								content: [{ type: "text", text: bigText }],
+								isError: false,
+								timestamp: 2,
+							},
+						],
+					}),
+					{
+						sessionId: "pi-sess-large-text",
+						onResponse: (r) => {
+							capturedHeaders.push(r.headers);
+						},
+					},
+				)
+				.result();
+			assert.equal(step1Final.stopReason, "stop");
+			assert.equal(step1Final.responseId, sid1, "大文本切入应严格复用同一热会话 ID");
+			const out1 = step1Final.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(out1.includes("HAS_HEAD=true"), out1);
+			assert.ok(out1.includes("HAS_MID=true"), `中间段不得被 10KB 上限挖空: ${out1}`);
+			assert.ok(out1.includes("HAS_TAIL=true"), out1);
+			assert.ok(
+				capturedHeaders.some((h) => h["x-acp-mcp-text-deferred"] === "9200"),
+				"应标记 x-acp-mcp-text-deferred 响应头",
+			);
+
+			// 场景 2：pi-tools 下忽略后端非宿主内置工具宣告（不泄漏门控计数、不派发未激活镜像工具）并在 max_turn_requests 时自动无感续接
+			const tStart = Date.now();
+			const step2 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [{ role: "user", content: "TRIGGER_RESIDUAL_BUILTIN_AND_MAX_TURN", timestamp: 1 }],
+					}),
+					{ sessionId: "pi-sess-max-turn" },
+				)
+				.result();
+			const step2Elapsed = Date.now() - tStart;
+			assert.equal(step2.stopReason, "toolUse");
+			const emittedTools2 = step2.content.filter((c): c is ToolCall => c.type === "toolCall");
+			assert.equal(emittedTools2.length, 1, "不应把 list_resources 作为镜像工具派发给 Pi");
+			assert.equal(emittedTools2[0].name, "read");
+			assert.ok(step2Elapsed < 170, `不应因内置工具门控计数泄漏而卡满 180ms 窗口 (elapsed=${step2Elapsed}ms)`);
+
+			const step2Final = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [
+							{ role: "user", content: "TRIGGER_RESIDUAL_BUILTIN_AND_MAX_TURN", timestamp: 1 },
+							step2,
+							{
+								role: "toolResult",
+								toolCallId: emittedTools2[0].id,
+								toolName: "read",
+								content: [{ type: "text", text: "RESUMED_DATA" }],
+								isError: false,
+								timestamp: 2,
+							},
+						],
+					}),
+					{ sessionId: "pi-sess-max-turn" },
+				)
+				.result();
+			assert.equal(step2Final.stopReason, "stop");
+			const out2 = step2Final.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.equal(out2, "AUTO_CONTINUED_OK:RESUMED_DATA");
+
+			// 场景 3：并发双工具触发 holdTimeout 预取消且后端收到 session/cancel 主动断开第 2 个工具连接时，两个工具结果均完整补发
+			(coord as unknown as { httpMcpBridge: { holdLimitMs: number } }).httpMcpBridge.holdLimitMs = 70;
+			const step3 = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [{ role: "user", content: "TRIGGER_MCP_CONCURRENT_HOLD_DETACH", timestamp: 1 }],
+					}),
+					{ sessionId: "pi-sess-hold-batch" },
+				)
+				.result();
+			assert.equal(step3.stopReason, "toolUse");
+			const batchCalls = step3.content.filter((c): c is ToolCall => c.type === "toolCall");
+			assert.equal(batchCalls.length, 2, "应在同一批聚合收到 bash 与 read 两个并发工具调用");
+
+			// 等待超过 70ms 触发第 1 个工具 holdTimeout 及后端主动断连第 2 个工具
+			await new Promise((r) => setTimeout(r, 120));
+
+			const bashTc = batchCalls.find((c) => c.name === "bash")!;
+			const readTc = batchCalls.find((c) => c.name === "read")!;
+			const step3Final = await coord
+				.streamSimple(
+					TEST_MODEL,
+					normalizeContext({
+						tools,
+						messages: [
+							{ role: "user", content: "TRIGGER_MCP_CONCURRENT_HOLD_DETACH", timestamp: 1 },
+							step3,
+							{
+								role: "toolResult",
+								toolCallId: bashTc.id,
+								toolName: "bash",
+								content: [{ type: "text", text: "RESULT_SLOW_ALPHA" }],
+								isError: false,
+								timestamp: 2,
+							},
+							{
+								role: "toolResult",
+								toolCallId: readTc.id,
+								toolName: "read",
+								content: [{ type: "text", text: "RESULT_SLOW_BETA" }],
+								isError: false,
+								timestamp: 3,
+							},
+						],
+					}),
+					{ sessionId: "pi-sess-hold-batch" },
+				)
+				.result();
+			assert.equal(step3Final.stopReason, "stop");
+			const out3 = step3Final.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("");
+			assert.ok(out3.includes("HAS_DETACHED_A=true"), `第 1 个超时工具结果应完整补发: ${out3}`);
+			assert.ok(out3.includes("HAS_DETACHED_B=true"), `被后端连带断连的第 2 个工具结果不得丢失: ${out3}`);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });

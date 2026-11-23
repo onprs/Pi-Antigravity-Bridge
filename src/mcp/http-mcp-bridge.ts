@@ -1,11 +1,14 @@
 import * as crypto from "node:crypto";
 import * as http from "node:http";
+import { StringDecoder } from "node:string_decoder";
 import type { ImageContent, JsonObject, TextContent, Tool } from "@earendil-works/pi-ai";
 import type { AcpMcpServerSpec } from "../acp/protocol.ts";
-import { validateToolArguments } from "./schema-validator.ts";
+import { resolveLocalSchemaRef, validateToolArguments } from "./schema-validator.ts";
 import { buildInlineStdioShimCommand } from "./stdio-shim.ts";
 
 export const MCP_SERVER_NAME = "pi_tools";
+/** 预留 `mcp_pi_tools_`（13 字符）前缀后，暴露给上游模型函数名的最大安全长度（总长 <= 63 < 64） */
+export const MAX_MCP_EXPOSED_TOOL_NAME_LEN = 50;
 
 export interface McpToolResultPayload {
 	content: Array<TextContent | ImageContent>;
@@ -175,15 +178,50 @@ export function sanitizeJsonSchemaForMcp(rawSchema: unknown): Record<string, unk
 	}
 }
 
+/**
+ * 为超长宿主工具名（如长命名空间的直通 MCP 工具）生成满足上游 64 字符上限的确定性短别名；
+ * 常规长度工具名（`<= 50` 字符）保持原名零改动。
+ */
+export function toExposedMcpToolName(originalName: string): string {
+	if (originalName.length <= MAX_MCP_EXPOSED_TOOL_NAME_LEN) {
+		return originalName;
+	}
+	const sanitized = originalName.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const hash8 = crypto.createHash("sha256").update(originalName).digest("hex").slice(0, 8);
+	const head = sanitized.slice(0, 22).replace(/_+$/, "");
+	const tail = sanitized.slice(-17).replace(/^_+/, "");
+	return `${head}_${tail}_${hash8}`.slice(0, MAX_MCP_EXPOSED_TOOL_NAME_LEN);
+}
+
 function normalizeMatchToken(name: string): string {
 	return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function doesAnnouncementMatchTool(announced: string, toolName: string): boolean {
-	if (!announced) return true;
-	const a = normalizeMatchToken(announced);
-	const t = normalizeMatchToken(toolName);
-	return a.includes(t) || t.includes(a);
+function extractAnnouncedBareToolToken(raw: string): string {
+	const trimmed = raw.trim();
+	if (!trimmed) return "";
+	const prefixedMatch = /\bmcp_pi_tools_([a-zA-Z0-9_.-]+)\b/i.exec(trimmed);
+	if (prefixedMatch?.[1]) {
+		return normalizeMatchToken(prefixedMatch[1]);
+	}
+	const stripped = trimmed
+		.replace(/^mcp_pi_tools_/i, "")
+		.replace(/^pi_tools[:/]/i, "");
+	if (/\s/.test(stripped)) {
+		return "";
+	}
+	return normalizeMatchToken(stripped);
+}
+
+export function doesAnnouncementMatchTool(announced: string, toolName: string): boolean {
+	const trimmed = announced.trim();
+	if (!trimmed) return true;
+	const a = extractAnnouncedBareToolToken(trimmed);
+	if (!a) return false;
+	const origNorm = normalizeMatchToken(toolName);
+	if (a === origNorm) return true;
+	const exposedNorm = normalizeMatchToken(toExposedMcpToolName(toolName));
+	return a === exposedNorm;
 }
 
 function isSingleEditReplacement(value: unknown): value is { oldText: string; newText: string } {
@@ -194,13 +232,134 @@ function isSingleEditReplacement(value: unknown): value is { oldText: string; ne
 	return typeof rec.oldText === "string" && typeof rec.newText === "string";
 }
 
+function schemaAllowsType(
+	propSchema: Record<string, unknown>,
+	targetType: "null" | "string" | "array" | "object",
+	rootSchema: Record<string, unknown>,
+	depth = 0,
+): boolean {
+	if (depth > 8) return false;
+	if (typeof propSchema.$ref === "string") {
+		const resolved = resolveLocalSchemaRef(propSchema.$ref, rootSchema);
+		if (resolved && schemaAllowsType(resolved, targetType, rootSchema, depth + 1)) {
+			return true;
+		}
+	}
+	if (targetType === "null" && propSchema.const === null) return true;
+	if (Array.isArray(propSchema.enum)) {
+		if (targetType === "null" && propSchema.enum.includes(null)) return true;
+		if (targetType === "string" && propSchema.enum.some((v) => typeof v === "string")) return true;
+	}
+	const t = propSchema.type;
+	if (t === targetType) return true;
+	if (Array.isArray(t) && t.includes(targetType)) return true;
+	if (targetType === "object" && !t && propSchema.properties && typeof propSchema.properties === "object") {
+		return true;
+	}
+	for (const key of ["anyOf", "oneOf", "allOf"] as const) {
+		const branches = propSchema[key];
+		if (Array.isArray(branches)) {
+			for (const b of branches) {
+				if (
+					b &&
+					typeof b === "object" &&
+					!Array.isArray(b) &&
+					schemaAllowsType(b as Record<string, unknown>, targetType, rootSchema, depth + 1)
+				) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+function normalizeArgsAgainstSchema(
+	node: unknown,
+	schema: Record<string, unknown>,
+	rootSchema: Record<string, unknown>,
+	depth = 0,
+): unknown {
+	if (depth > 8 || !node || typeof node !== "object" || Array.isArray(node)) {
+		return node;
+	}
+	const targetSchema =
+		typeof schema.$ref === "string"
+			? (resolveLocalSchemaRef(schema.$ref, rootSchema) ?? schema)
+			: schema;
+	const props =
+		targetSchema.properties &&
+		typeof targetSchema.properties === "object" &&
+		!Array.isArray(targetSchema.properties)
+			? (targetSchema.properties as Record<string, unknown>)
+			: undefined;
+	if (!props) return node;
+
+	const requiredSet = new Set(
+		Array.isArray(targetSchema.required)
+			? targetSchema.required.filter((k): k is string => typeof k === "string")
+			: [],
+	);
+
+	const out: Record<string, unknown> = { ...(node as Record<string, unknown>) };
+	for (const [key, val] of Object.entries(out)) {
+		const propSchemaRaw = props[key];
+		if (!propSchemaRaw || typeof propSchemaRaw !== "object" || Array.isArray(propSchemaRaw)) {
+			continue;
+		}
+		const propSchema = propSchemaRaw as Record<string, unknown>;
+
+		// 剥离模型在非必填且非 nullable 字段上误传的显式 null
+		if (
+			val === null &&
+			!requiredSet.has(key) &&
+			!schemaAllowsType(propSchema, "null", rootSchema)
+		) {
+			delete out[key];
+			continue;
+		}
+
+		// 将模型误传为 JSON 字符串的数组或对象参数自动反序列化
+		if (
+			typeof val === "string" &&
+			!schemaAllowsType(propSchema, "string", rootSchema)
+		) {
+			const trimmed = val.trim();
+			const expectsArray = schemaAllowsType(propSchema, "array", rootSchema);
+			const expectsObject = schemaAllowsType(propSchema, "object", rootSchema);
+			if ((expectsArray && trimmed.startsWith("[")) || (expectsObject && trimmed.startsWith("{"))) {
+				try {
+					const parsed: unknown = JSON.parse(trimmed);
+					if (expectsArray && Array.isArray(parsed)) {
+						out[key] = parsed;
+						continue;
+					}
+					if (expectsObject && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+						out[key] = normalizeArgsAgainstSchema(parsed, propSchema, rootSchema, depth + 1);
+						continue;
+					}
+				} catch {
+					// 保留原字符串交由后续校验生成错误反馈
+				}
+			}
+		}
+
+		if (val && typeof val === "object" && !Array.isArray(val)) {
+			out[key] = normalizeArgsAgainstSchema(val, propSchema, rootSchema, depth + 1);
+		}
+	}
+	return out;
+}
+
 /**
- * 在 JSON Schema 预校验前对齐原生 Pi 工具的参数容错归一化（如 `edit` 工具对字符串化 `edits`、单对象 `edits` 或顶层 `oldText/newText` 的兼容转换）。
+ * 在 JSON Schema 预校验前对齐原生 Pi 工具的参数容错归一化
+ *（含可选字段显式 `null` 剥离、字符串化对象/数组解析，以及 `edit` 工具对单对象 `edits` 或顶层 `oldText/newText` 的兼容转换）。
  */
-function normalizeHostToolArguments(
+export function normalizeHostToolArguments(
 	toolName: string,
 	rawArgs: JsonObject,
 	toolDef: Tool,
+	sanitizedSchema?: Record<string, unknown>,
 ): JsonObject {
 	let current: unknown = { ...rawArgs };
 	const maybeWithPrepare = toolDef as Tool & {
@@ -239,6 +398,11 @@ function normalizeHostToolArguments(
 			args.edits = mergedEdits;
 		}
 		current = args;
+	}
+
+	if (current && typeof current === "object" && !Array.isArray(current)) {
+		const schema = sanitizedSchema ?? sanitizeJsonSchemaForMcp(toolDef.parameters);
+		current = normalizeArgsAgainstSchema(current, schema, schema, 0);
 	}
 
 	if (current && typeof current === "object" && !Array.isArray(current)) {
@@ -462,15 +626,7 @@ export class LocalHttpMcpBridge {
 		}
 	}
 
-	private waitForAnnouncementPairing(
-		toolName: string,
-		agySessionId: string | undefined,
-		windowMs = 2_000,
-	): Promise<boolean> {
-		if (agySessionId && this.cancelledSessions.has(agySessionId)) {
-			return Promise.resolve(false);
-		}
-
+	private consumeMatchingAnnouncement(toolName: string, agySessionId: string | undefined): boolean {
 		const now = Date.now();
 		this.pruneExpiredAnnouncements(now);
 		const existingIdx = this.recentAnnouncements.findIndex(
@@ -480,6 +636,21 @@ export class LocalHttpMcpBridge {
 		);
 		if (existingIdx !== -1) {
 			this.recentAnnouncements.splice(existingIdx, 1);
+			return true;
+		}
+		return false;
+	}
+
+	private waitForAnnouncementPairing(
+		toolName: string,
+		agySessionId: string | undefined,
+		windowMs = 2_000,
+	): Promise<boolean> {
+		if (agySessionId && this.cancelledSessions.has(agySessionId)) {
+			return Promise.resolve(false);
+		}
+
+		if (this.consumeMatchingAnnouncement(toolName, agySessionId)) {
 			return Promise.resolve(true);
 		}
 
@@ -567,9 +738,11 @@ export class LocalHttpMcpBridge {
 
 		let rawBody = "";
 		try {
+			const bodyDecoder = new StringDecoder("utf8");
 			for await (const chunk of req) {
-				rawBody += typeof chunk === "string" ? chunk : (chunk as Buffer).toString("utf8");
+				rawBody += typeof chunk === "string" ? chunk : bodyDecoder.write(chunk as Buffer);
 			}
+			rawBody += bodyDecoder.end();
 		} catch {
 			res.writeHead(400);
 			res.end();
@@ -644,11 +817,16 @@ export class LocalHttpMcpBridge {
 		}
 
 		if (method === "tools/list") {
-			const toolsList = binding.tools.map((tool) => ({
-				name: tool.name,
-				description: tool.description || tool.name,
-				inputSchema: sanitizeJsonSchemaForMcp(tool.parameters),
-			}));
+			const toolsList = binding.tools.map((tool) => {
+				const exposedName = toExposedMcpToolName(tool.name);
+				const baseDesc = tool.description || tool.name;
+				return {
+					name: exposedName,
+					description:
+						exposedName !== tool.name ? `[Original tool: ${tool.name}] ${baseDesc}` : baseDesc,
+					inputSchema: sanitizeJsonSchemaForMcp(tool.parameters),
+				};
+			});
 			res.writeHead(200);
 			res.end(
 				JSON.stringify({
@@ -682,7 +860,7 @@ export class LocalHttpMcpBridge {
 		binding: SessionMcpBinding,
 		res: http.ServerResponse,
 	): Promise<void> {
-		const toolName = typeof params.name === "string" ? params.name : "";
+		const incomingName = typeof params.name === "string" ? params.name : "";
 		const rawArgs =
 			params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments)
 				? (params.arguments as JsonObject)
@@ -701,9 +879,12 @@ export class LocalHttpMcpBridge {
 				: undefined) ??
 			binding.agySessionId;
 
-		const toolDef = binding.tools.find((t) => t.name === toolName);
+		const toolDef = binding.tools.find(
+			(t) => t.name === incomingName || toExposedMcpToolName(t.name) === incomingName,
+		);
 		if (!toolDef) {
-			binding.onRejectedCall?.(toolName);
+			this.consumeMatchingAnnouncement(incomingName, rootConvId);
+			binding.onRejectedCall?.(incomingName);
 			res.writeHead(200);
 			res.end(
 				JSON.stringify({
@@ -714,7 +895,7 @@ export class LocalHttpMcpBridge {
 						content: [
 							{
 								type: "text",
-								text: `Unknown tool "${toolName}". Available tools: ${binding.tools.map((t) => t.name).join(", ")}`,
+								text: `Unknown tool "${incomingName}". Available tools: ${binding.tools.map((t) => toExposedMcpToolName(t.name)).join(", ")}`,
 							},
 						],
 					},
@@ -723,14 +904,14 @@ export class LocalHttpMcpBridge {
 			return;
 		}
 
+		const toolName = toolDef.name;
+		const sanitizedSchema = sanitizeJsonSchemaForMcp(toolDef.parameters);
+
 		// 1. 对齐宿主工具的参数预处理与 JSON Schema 参数预校验（与 tools/list 暴露的规整 Schema 保持一致）
-		const normalizedArgs = normalizeHostToolArguments(toolName, rawArgs, toolDef);
-		const validation = validateToolArguments(
-			toolName,
-			normalizedArgs,
-			sanitizeJsonSchemaForMcp(toolDef.parameters),
-		);
+		const normalizedArgs = normalizeHostToolArguments(toolName, rawArgs, toolDef, sanitizedSchema);
+		const validation = validateToolArguments(toolName, normalizedArgs, sanitizedSchema);
 		if (!validation.valid) {
+			this.consumeMatchingAnnouncement(toolName, rootConvId);
 			binding.onRejectedCall?.(toolName);
 			res.writeHead(200);
 			res.end(

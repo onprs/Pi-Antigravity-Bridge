@@ -45,10 +45,13 @@ function deepEqualPrimitiveOrJson(a: unknown, b: unknown): boolean {
 	}
 }
 
-function resolveLocalSchemaRef(
+export function resolveLocalSchemaRef(
 	ref: string,
 	rootSchema: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
+	if (ref === "#") {
+		return rootSchema;
+	}
 	if (!ref.startsWith("#/")) return undefined;
 	const parts = ref
 		.slice(2)
@@ -118,7 +121,17 @@ function validateNode(
 	if (typeof schema.$ref === "string" && refDepth < 8) {
 		const resolved = resolveLocalSchemaRef(schema.$ref, rootSchema);
 		if (resolved) {
+			const issueCountBefore = issues.length;
 			validateNode(value, resolved, currentPath, issues, rootSchema, refDepth + 1);
+			if (issues.length > issueCountBefore) {
+				return;
+			}
+			const hasSiblingConstraint = Object.keys(schema).some(
+				(k) => k !== "$ref" && k !== "description" && k !== "title",
+			);
+			if (!hasSiblingConstraint) {
+				return;
+			}
 		}
 	}
 

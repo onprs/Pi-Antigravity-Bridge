@@ -29,6 +29,7 @@ import {
 	readCurrentMaxSqliteStepIdx,
 	readLatestSqliteUpstreamRequestSince,
 	readSqliteGenerationUsagesSince,
+	waitForSqliteToolStepsSettled,
 } from "../src/session/checkpoint-sync.ts";
 import {
 	buildFreshReplayPlan,
@@ -1181,6 +1182,87 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 			const emptyRes = await readLatestSqliteUpstreamRequestSince(cfg, sid, 1, []);
 			assert.equal(emptyRes.newGenCount, 0);
 			assert.equal(emptyRes.latest, undefined);
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("剥离非 429 瞬时流重试告警行、过滤失败重试步生成记账并等待 status=2 运行中工具步骤落盘", async () => {
+		// 1. QuotaSoftErrorFilter：剥离非 429 瞬时流中断重试行，保留代码块内示例，正常拦截 429
+		const filter = new QuotaSoftErrorFilter();
+		const p1 = filter.push("第一段正常输出\n⚠ API error (attempt 1): stream reading error: ");
+		assert.equal(p1.safeText, "第一段正常输出\n");
+		assert.equal(p1.quotaError, undefined);
+		const p2 = filter.push("unexpected EOF\n重试恢复后的第二段正文\n");
+		assert.equal(p2.safeText, "重试恢复后的第二段正文\n");
+		assert.equal(p2.quotaError, undefined);
+
+		const fenceFilter = new QuotaSoftErrorFilter();
+		const fp = fenceFilter.push("```\n⚠ API error (attempt 1): stream reading error: unexpected EOF\n```\n");
+		assert.ok(fp.safeText.includes("unexpected EOF"), "代码块中的告警示例文本应完整保留");
+
+		// 2. readSqliteGenerationUsagesSince 排除 status=6/7/8 失败或未完结步 & waitForSqliteToolStepsSettled 等待 status=2
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-status2-settled-"));
+		try {
+			const cfg: BridgeConfig = {
+				...DEFAULT_BRIDGE_CONFIG,
+				geminiDir: path.join(tmpRoot, ".gemini"),
+			};
+			const convDir = path.join(cfg.geminiDir, cfg.appDataDirName, "conversations");
+			fs.mkdirSync(convDir, { recursive: true });
+			const sid = "22223333-4444-5555-6666-777788889999";
+			const dbPath = path.join(convDir, `${sid}.db`);
+			const db = new DatabaseSync(dbPath);
+			db.exec(
+				"CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL, status integer NOT NULL, step_payload blob, metadata blob);",
+			);
+
+			const encodeVarint = (n: number): number[] => {
+				const out: number[] = [];
+				let v = n;
+				while (v >= 0x80) {
+					out.push((v & 0x7f) | 0x80);
+					v = Math.floor(v / 128);
+				}
+				out.push(v);
+				return out;
+			};
+			const makeMeta = (inp: number, outp: number) => {
+				const inner = Buffer.from([
+					...encodeVarint((2 << 3) | 0),
+					...encodeVarint(inp),
+					...encodeVarint((3 << 3) | 0),
+					...encodeVarint(outp),
+				]);
+				return Buffer.from([...encodeVarint((9 << 3) | 2), ...encodeVarint(inner.length), ...inner]);
+			};
+
+			// idx=1: 失败的首次尝试 (status=7 ERROR)，idx=2: 重试成功的生成 (status=3 DONE)，idx=3: 运行中的 MCP 工具 (status=2 RUNNING)
+			db.prepare("INSERT INTO steps VALUES (1, 15, 7, NULL, ?)").run(makeMeta(999, 10));
+			db.prepare("INSERT INTO steps VALUES (2, 15, 3, NULL, ?)").run(makeMeta(1200, 85));
+			db.prepare("INSERT INTO steps VALUES (3, 132, 2, X'01', NULL)").run();
+			db.close();
+
+			const gens = await readSqliteGenerationUsagesSince(cfg, sid, 0);
+			assert.equal(gens.length, 1, "应排除 status=7 的失败重试生成步");
+			assert.equal(gens[0].stepIdx, 2);
+			assert.equal(gens[0].inputTokens, 1200);
+			assert.equal(gens[0].outputTokens, 85);
+
+			// 在 55ms 后将 idx=3 的工具步骤状态由 2 (RUNNING) 更新为 3 (DONE)，验证 waitForSqliteToolStepsSettled 会等待该翻转完成
+			const t0 = Date.now();
+			const flipTimer = setTimeout(() => {
+				const writerDb = new DatabaseSync(dbPath);
+				writerDb.prepare("UPDATE steps SET status = 3 WHERE idx = 3").run();
+				writerDb.close();
+			}, 55);
+			try {
+				await waitForSqliteToolStepsSettled(cfg, sid, 300);
+				const elapsed = Date.now() - t0;
+				assert.ok(elapsed >= 45, `应等待 status=2 工具步骤变为终态后再返回 (elapsed=${elapsed}ms)`);
+			} finally {
+				clearTimeout(flipTimer);
+			}
 		} finally {
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}

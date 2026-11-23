@@ -23,6 +23,12 @@ const QUOTA_ERROR_LINE_REGEX =
 const LEGACY_ATTEMPT_QUOTA_REGEX =
 	/^\s*⚠\s*API error\s*\(attempt\s+\d+\):.*(?:RESOURCE_EXHAUSTED|code\s*429|quota|rate[_\s-]?limit)/i;
 
+/**
+ * 匹配 AGY 在上游流瞬断或服务端瞬时波动自动重试时向流中注入的非 429 告警行（如 `⚠ API error (attempt 1): stream reading error: unexpected EOF`）。
+ * 此类重试由后端自动恢复，剥离该提示行避免污染模型正式回复正文与会话历史。
+ */
+const TRANSIENT_API_RETRY_LINE_REGEX = /^\s*⚠\s*API error\s*\(attempt\s+\d+\):\s*.+$/i;
+
 const SUSPICIOUS_LINE_PREFIXES = [
 	"⚠",
 	"⚠ RESOURCE_EXHAUSTED",
@@ -42,6 +48,12 @@ function isQuotaExhaustedLine(line: string): boolean {
 	const trimmed = line.trim();
 	if (!trimmed) return false;
 	return QUOTA_ERROR_LINE_REGEX.test(trimmed) || LEGACY_ATTEMPT_QUOTA_REGEX.test(trimmed);
+}
+
+function isTransientApiRetryLine(line: string): boolean {
+	const trimmed = line.trim();
+	if (!trimmed) return false;
+	return !isQuotaExhaustedLine(trimmed) && TRANSIENT_API_RETRY_LINE_REGEX.test(trimmed);
 }
 
 function mightBecomeFenceOrQuotaLine(lineStartFragment: string, inFenceBlock: boolean): boolean {
@@ -107,6 +119,9 @@ export class QuotaSoftErrorFilter {
 						safeText: safeParts.join(""),
 						quotaError: this.detectedError,
 					};
+				} else if (!this.inFenceBlock && isTransientApiRetryLine(seg)) {
+					this.atLineStart = true;
+					continue;
 				}
 			}
 			safeParts.push(`${seg}\n`);
@@ -150,6 +165,8 @@ export class QuotaSoftErrorFilter {
 			} else if (!this.inFenceBlock && isQuotaExhaustedLine(rem)) {
 				this.detectedError = rem.replace(/^\s*⚠\s*/, "").trim();
 				return { safeText: "", quotaError: this.detectedError };
+			} else if (!this.inFenceBlock && isTransientApiRetryLine(rem)) {
+				return { safeText: "" };
 			}
 		}
 		this.atLineStart = false;

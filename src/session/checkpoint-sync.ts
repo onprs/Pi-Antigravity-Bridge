@@ -473,7 +473,7 @@ export async function readSqliteGenerationUsagesSince(
 		db = openSqliteWithTimeout(sqlite, dbPath, true);
 		const rows = db
 			.prepare(
-				"SELECT idx, metadata, step_payload FROM steps WHERE step_type = 15 AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
+				"SELECT idx, metadata, step_payload FROM steps WHERE step_type = 15 AND status NOT IN (4, 5, 6, 7, 8, 12) AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
 			)
 			.all(afterStepIdx) as Array<{
 			idx: number;
@@ -609,6 +609,36 @@ function stripHostMcpPrefix(rawName: string): string {
 	return rawName.replace(/^mcp_pi_tools_/, "");
 }
 
+const IMAGE_HASH_CACHE_MAX = 128;
+const imageSha256Cache = new Map<string, string>();
+
+function computeCachedImageSha256(rawSub: Uint8Array): string {
+	const len = rawSub.byteLength;
+	if (len < 4_096) {
+		return crypto.createHash("sha256").update(rawSub).digest("hex");
+	}
+	const mid = Math.floor(len / 2);
+	const headHex = Buffer.from(rawSub.subarray(0, 48)).toString("hex");
+	const midHex = Buffer.from(rawSub.subarray(mid - 24, mid + 24)).toString("hex");
+	const tailHex = Buffer.from(rawSub.subarray(len - 48, len)).toString("hex");
+	const cacheKey = `${len}:${headHex}:${midHex}:${tailHex}`;
+	const cached = imageSha256Cache.get(cacheKey);
+	if (cached !== undefined) {
+		imageSha256Cache.delete(cacheKey);
+		imageSha256Cache.set(cacheKey, cached);
+		return cached;
+	}
+	const computed = crypto.createHash("sha256").update(rawSub).digest("hex");
+	if (imageSha256Cache.size >= IMAGE_HASH_CACHE_MAX) {
+		const oldest = imageSha256Cache.keys().next().value;
+		if (oldest !== undefined) {
+			imageSha256Cache.delete(oldest);
+		}
+	}
+	imageSha256Cache.set(cacheKey, computed);
+	return computed;
+}
+
 /**
  * 解析 AGY 本地 SQLite `gen_metadata.data`（最新代次 `field 1` 即完整 `ChatRequest` protobuf），
  * 还原发往上游云端 `streamGenerateContent` 的全量 JSON 请求体积与内容分类（支持 `pi-tools` / `agy-tools` / `hybrid` 及 Gemini/Claude 全模型）。
@@ -730,7 +760,7 @@ export function parseGenMetadataUpstreamRequest(
 			text_content_utf8_bytes += Buffer.byteLength(tail, "utf8");
 			if (
 				tail.trim().length > 0 &&
-				!/Please inspect the attached tool result image/i.test(tail)
+				!/Please (?:inspect the attached tool result|continue using the tool output)/i.test(tail)
 			) {
 				trailingTool = "";
 			}
@@ -845,7 +875,7 @@ export function parseGenMetadataUpstreamRequest(
 					if (rawSub && rawSub.byteLength > 0 && mimeType.startsWith("image/")) {
 						const decodedBytes = rawSub.byteLength;
 						const base64Bytes = Math.ceil(decodedBytes / 3) * 4;
-						const imageHash = crypto.createHash("sha256").update(rawSub).digest("hex");
+						const imageHash = computeCachedImageSha256(rawSub);
 						let toolName = "";
 						let sourceType = "user image";
 						if (role === 4) {
@@ -1060,7 +1090,7 @@ export async function waitForSqliteToolStepsSettled(
 			db = openSqliteWithTimeout(sqlite, dbPath, true, 200);
 			const busy = db
 				.prepare(
-					"SELECT 1 AS busy FROM steps WHERE step_type != 15 AND step_type != 14 AND status = 1 LIMIT 1",
+					"SELECT 1 AS busy FROM steps WHERE step_type != 15 AND step_type != 14 AND status IN (1, 2, 8, 9, 11) LIMIT 1",
 				)
 				.get() as { busy?: number } | undefined;
 			hasRunningTool = busy?.busy === 1;

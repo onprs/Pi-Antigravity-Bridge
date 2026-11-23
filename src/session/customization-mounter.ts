@@ -294,12 +294,48 @@ function writeFileIfChanged(filePath: string, content: string): void {
 	fs.writeFileSync(filePath, content, "utf8");
 }
 
+const BUILTIN_HANDLED_SYSTEM_SECTIONS = new Set<string>([
+	"preamble",
+	"tools",
+	"rules",
+	"docs",
+	"cwd",
+	"project_context",
+	"skills",
+	"mcp_servers",
+]);
+
+export interface RegisteredToolGuidelineSource {
+	name: string;
+	promptGuidelines?: readonly string[];
+}
+
+export interface PrepareCustomizationMountOptions {
+	registeredTools?: readonly RegisteredToolGuidelineSource[];
+}
+
 /**
- * 为 `pi-tools` 纯净模式对齐原生 Pi 的极简工具使用准则。
+ * 为 `pi-tools` 纯净模式对齐原生 Pi 工具与扩展工具的使用准则。
  */
-function buildPureModeToolGuidelines(declaredTools: readonly Tool[]): string[] {
+function buildPureModeToolGuidelines(
+	declaredTools: readonly Tool[],
+	options?: {
+		registeredTools?: readonly RegisteredToolGuidelineSource[];
+		hasMcpServersSection?: boolean;
+	},
+): string[] {
 	const names = new Set(declaredTools.map((t) => t.name));
 	const guidelines: string[] = [];
+	const seen = new Set<string>();
+
+	const addGuideline = (raw: string) => {
+		const trimmed = raw.trim();
+		if (!trimmed) return;
+		const dedupKey = trimmed.replace(/\.+$/, "").toLowerCase();
+		if (seen.has(dedupKey)) return;
+		seen.add(dedupKey);
+		guidelines.push(trimmed.endsWith(".") ? trimmed : `${trimmed}.`);
+	};
 
 	const hasBash = names.has("bash");
 	const hasPowerShell = names.has("powershell");
@@ -307,56 +343,88 @@ function buildPureModeToolGuidelines(declaredTools: readonly Tool[]): string[] {
 
 	if ((hasBash || hasPowerShell) && !hasSearchTools) {
 		if (hasBash && hasPowerShell) {
-			guidelines.push(
+			addGuideline(
 				"Use bash or PowerShell for file operations like listing, searching, and finding files.",
 			);
 		} else if (hasPowerShell) {
-			guidelines.push(
+			addGuideline(
 				"Use PowerShell for file operations like listing, searching, and finding files.",
 			);
 		} else {
-			guidelines.push("Use bash for file operations like ls, rg, find.");
+			addGuideline("Use bash for file operations like ls, rg, find.");
 		}
 	}
 
 	if (names.has("read")) {
-		guidelines.push("Use read to examine files instead of cat or sed.");
+		addGuideline("Use read to examine files instead of cat or sed.");
 	}
 	if (names.has("edit")) {
-		guidelines.push(
+		addGuideline(
 			"Use edit for targeted changes. Batch changes to one file in a single call; each edits[].oldText must exactly and uniquely match the original file.",
 		);
 	}
 	if (names.has("context_recall")) {
-		guidelines.push(
+		addGuideline(
 			"For archived historical tool outputs or images referencing ctx:// handles, prefer context_recall over re-reading files or re-running commands unless current live state is explicitly required.",
 		);
 	}
 
-	guidelines.push("Be concise in your responses.");
-	guidelines.push("Show file paths clearly when working with files without forcing file:// URLs.");
+	if (options?.registeredTools && options.registeredTools.length > 0) {
+		const byName = new Map<string, readonly string[]>();
+		for (const item of options.registeredTools) {
+			if (item.promptGuidelines && item.promptGuidelines.length > 0) {
+				byName.set(item.name, item.promptGuidelines);
+			}
+		}
+		for (const tool of declaredTools) {
+			const extra = byName.get(tool.name);
+			if (!extra) continue;
+			for (const line of extra) {
+				// 跳过与 edit / read 内置多行准则语义重叠的默认项，保留 codemode 及自定义扩展工具专属准则
+				if (tool.name === "read" || tool.name === "edit") continue;
+				addGuideline(line);
+			}
+		}
+	}
+
+	if (options?.hasMcpServersSection) {
+		addGuideline(
+			"Reach servers listed in <mcp_servers> via codemode (searchTools / describeNamespace) or tool_search and read_mcp_resource as indicated.",
+		);
+	}
+
+	addGuideline("Be concise in your responses.");
+	addGuideline("Show file paths clearly when working with files without forcing file:// URLs.");
 	return guidelines;
 }
 
 /**
  * 在 `pi-tools` 纯净模式（`excludeDefaultComponents: true`）下，构建供首条用户消息携带的 `<workspace_context>` 块。
- * 保持系统提示词零触碰，同时完整交付工作目录、工具简明准则、Pi 规则文件（`AGENTS.md`）及按需加载的 `<available_skills>` 索引。
+ * 保持系统提示词零触碰，同时完整交付工作目录、工具与扩展准则、Pi 规则文件（`AGENTS.md`）、`<available_skills>`、`<mcp_servers>` 及扩展自定义上下文段。
  */
 function buildPureModeWorkspaceContextBlock(params: {
 	cwd: string;
 	declaredTools: readonly Tool[];
+	registeredTools?: readonly RegisteredToolGuidelineSource[];
 	rules: readonly ExtractedRuleSource[];
 	rawSkillsSection: string | null | undefined;
 	bridgeSkills: boolean;
 	rawMcpServersSection?: string | null | undefined;
 	bridgeMcp?: boolean;
+	extraSections?: ReadonlyArray<{ name: string; content: string }>;
 }): string {
 	const blocks: string[] = [
 		"<workspace_context>",
 		`<cwd>${params.cwd.replace(/\\/g, "/")}</cwd>`,
 	];
 
-	const guidelines = buildPureModeToolGuidelines(params.declaredTools);
+	const hasMcpServersSection = Boolean(
+		params.bridgeMcp && params.rawMcpServersSection && params.rawMcpServersSection.trim().length > 0,
+	);
+	const guidelines = buildPureModeToolGuidelines(params.declaredTools, {
+		registeredTools: params.registeredTools,
+		hasMcpServersSection,
+	});
 	if (guidelines.length > 0) {
 		blocks.push(
 			"<tool_guidelines>",
@@ -394,6 +462,17 @@ function buildPureModeWorkspaceContextBlock(params: {
 				? trimmedMcp
 				: `<mcp_servers>\n${trimmedMcp}\n</mcp_servers>`;
 			blocks.push(wrappedMcp);
+		}
+	}
+
+	if (params.extraSections && params.extraSections.length > 0) {
+		for (const sec of params.extraSections) {
+			const trimmed = sec.content.trim();
+			if (!trimmed) continue;
+			const openPrefix = `<${sec.name}`;
+			blocks.push(
+				trimmed.startsWith(openPrefix) ? trimmed : `<${sec.name}>\n${trimmed}\n</${sec.name}>`,
+			);
 		}
 	}
 
@@ -442,6 +521,7 @@ export function prepareCustomizationMount(
 	config: BridgeConfig,
 	cwd: string,
 	env: NodeJS.ProcessEnv = process.env,
+	options?: PrepareCustomizationMountOptions,
 ): PreparedCustomizationMount {
 	const flags = resolveEffectiveFlags(config);
 	const sysMsg = getCurrentSystemMessage(messages);
@@ -457,14 +537,24 @@ export function prepareCustomizationMount(
 			? extractPiSkillDirectories(sections.skills, cwd, config.geminiDir, false)
 			: { externalDirs: [] };
 
+		const extraSections: Array<{ name: string; content: string }> = [];
+		for (const [secName, secVal] of Object.entries(sections)) {
+			if (BUILTIN_HANDLED_SYSTEM_SECTIONS.has(secName)) continue;
+			if (typeof secVal === "string" && secVal.trim().length > 0) {
+				extraSections.push({ name: secName, content: secVal });
+			}
+		}
+
 		const workspaceContextBlock = buildPureModeWorkspaceContextBlock({
 			cwd,
 			declaredTools,
+			registeredTools: options?.registeredTools,
 			rules: allPiRules,
 			rawSkillsSection: sections.skills,
 			bridgeSkills: flags.bridgePiSkills,
 			rawMcpServersSection: sections.mcp_servers,
 			bridgeMcp: flags.bridgePiMcp,
+			extraSections,
 		});
 
 		const mountDigest = crypto
