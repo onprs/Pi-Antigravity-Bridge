@@ -740,6 +740,86 @@ describe("会话摘要、历史重放与 SQLite 只读快照分叉", () => {
 		assert.ok(fallbackSingleText.includes("TAIL_MARKER_8888"));
 	});
 
+	for (const { repeats, preloads } of [
+		{ repeats: 200, preloads: false },
+		{ repeats: 4_000, preloads: true },
+	]) {
+		it(`保留预期${preloads ? "多步" : "单步"}回放中的长工具结果、完整参数和历史思考`, () => {
+			const outputSide = "命令输出 🚀 line-0123456789\n".repeat(repeats);
+			const output = `${outputSide}工具输出中间内容\n${outputSide}`;
+			const argSide = "待编辑内容 📝\n".repeat(350);
+			const args = {
+				path: "example.txt",
+				oldText: `${argSide}参数中间内容\n${argSide}`,
+				newText: "更新",
+			};
+			const messages: Array<UserMessage | AssistantMessage | ToolResultMessage> = [
+				{ role: "user", content: "检查并更新文件", timestamp: 1 },
+				{
+					role: "assistant",
+					api: "antigravity-acp",
+					provider: "antigravity",
+					model: "gemini-4-neon",
+					content: [
+						{ type: "thinking", thinking: "先核对原文再修改", thinkingSignature: "PRIVATE_SIGNATURE" },
+						{ type: "thinking", thinking: "REDACTED_VALUE", redacted: true },
+						{ type: "toolCall", id: "c1", name: "edit", arguments: args },
+					],
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "edit",
+					content: [{ type: "text", text: output }],
+					isError: false,
+					timestamp: 3,
+				},
+				{ role: "user", content: "核对本次修改的结果", timestamp: 4 },
+			];
+			const plan = buildFreshReplayPlan({ visibleMessages: messages, maxContextWindowTokens: 1_000_000 });
+			assert.equal(plan.preloadedTurns.length > 0, preloads);
+			assert.equal(plan.omittedMessageCount, 0);
+			const joinCheckpoints = (turns: typeof plan.preloadedTurns) => turns.map(({ userText }) => {
+				assert.ok(!exceedsSafeSingleStepBudget([{ type: "text", text: userText }]));
+				return userText.replace(/^<conversation-checkpoint part="\d+\/\d+">\n|\n<\/conversation-checkpoint>$/g, "");
+			}).join("");
+			const finalText = plan.finalPromptBlocks.map((block) => block.type === "text" ? block.text : "").join("\n");
+			const replayedText = preloads ? joinCheckpoints(plan.preloadedTurns) : finalText;
+			assert.ok(replayedText.includes(output), "工具结果应完整保留");
+			assert.ok(replayedText.includes(JSON.stringify(args)), "工具调用参数应完整保留");
+			assert.match(replayedText, /<thinking>\n先核对原文再修改\n<\/thinking>/);
+			assert.doesNotMatch(replayedText, /PRIVATE_SIGNATURE|REDACTED_VALUE/);
+			assert.match(finalText, /核对本次修改的结果$/);
+			assert.ok(!exceedsSafeSingleStepBudget(plan.finalPromptBlocks));
+			assert.ok(!exceedsSafeSingleStepBudget(plan.singleStepFallbackBlocks));
+
+			if (preloads) {
+				const maxTotalHistoryBytes = 26_000;
+				const maxTotalHistoryTokens = 10_000;
+				const limited = buildFreshReplayPlan({ visibleMessages: messages, maxTotalHistoryBytes, maxTotalHistoryTokens });
+				assert.equal(limited.omittedMessageCount, 2);
+				const limitedReplay = joinCheckpoints(limited.preloadedTurns);
+				assert.match(limitedReplay, /2 earlier historical messages were omitted/);
+				const keptResult = /<tool_result[\s\S]*<\/tool_result>/.exec(limitedReplay)?.[0];
+				assert.ok(keptResult);
+				assert.match(keptResult, /history entry truncated to stay within model context budget/);
+				assert.ok(Buffer.byteLength(keptResult, "utf8") < maxTotalHistoryBytes);
+				assert.ok(estimateStepTokens(keptResult) < maxTotalHistoryTokens);
+				assert.deepEqual(limited.finalPromptBlocks, plan.finalPromptBlocks);
+			}
+		});
+	}
+
 	it("createPreloadedSqliteConversation 与 appendPreloadedTurnsToSqliteConversation 写入合规库结构且不污染统计水位", async () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-preload-db-"));
 		const cfg: BridgeConfig = {

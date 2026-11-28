@@ -2765,6 +2765,32 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 					timestamp: i * 2 + 2,
 				});
 			}
+			const editText = "替换前的多行内容\n".repeat(500);
+			const outputText = "命令输出行，包含文件内容 0123456789\n".repeat(1_200);
+			longHistory.push(
+				{
+					...longHistory.at(-1),
+					content: [
+						{ type: "thinking", thinking: "HISTORICAL_THOUGHT_CHECKPOINT" },
+						{
+							type: "toolCall",
+							id: "historical-edit",
+							name: "edit",
+							arguments: { path: "example.txt", oldText: `${editText}EDIT_ARGUMENT_MIDDLE\n${editText}`, newText: "已更新" },
+						},
+					],
+					stopReason: "toolUse",
+					timestamp: 73,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "historical-edit",
+					toolName: "edit",
+					content: [{ type: "text", text: `${outputText}TOOL_OUTPUT_MIDDLE\n${outputText}` }],
+					isError: false,
+					timestamp: 74,
+				},
+			);
 			const tailUser = {
 				role: "user",
 				content: "FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777",
@@ -2803,16 +2829,19 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			const dbsAfterSeed = fs.readdirSync(convDir).filter((f) => f.endsWith(".db"));
 			assert.deepEqual(dbsAfterSeed, [`${seededId}.db`], "官方空白模板库必须在克隆后立即删除，仅保留预注入会话库");
 			const db = new DatabaseSync(seededDbPath, { readOnly: true });
-			const stepCountRow = db.prepare("SELECT COUNT(*) AS n FROM steps").get() as { n: number };
-			const firstPayload = db.prepare("SELECT step_payload FROM steps WHERE idx = 0").get() as {
+			const stepPayloads = db.prepare("SELECT step_payload FROM steps ORDER BY idx").all() as {
 				step_payload: Uint8Array;
-			};
+			}[];
 			const metaBlobRow = db
 				.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
 				.get() as { data: Uint8Array };
 			db.close();
-			assert.ok(stepCountRow.n >= 4, `预注入库应包含多对交替步，实际 steps=${stepCountRow.n}`);
-			assert.ok(Buffer.from(firstPayload.step_payload).includes("HIST_USER_0:"));
+			assert.ok(stepPayloads.length >= 4, `预注入库应包含多对交替步，实际 steps=${stepPayloads.length}`);
+			assert.ok(Buffer.from(stepPayloads[0].step_payload).includes("HIST_USER_0:"));
+			const persistedHistory = stepPayloads.map(({ step_payload }) => Buffer.from(step_payload).toString("utf8")).join("\n");
+			for (const marker of ["EDIT_ARGUMENT_MIDDLE", "TOOL_OUTPUT_MIDDLE", "HISTORICAL_THOUGHT_CHECKPOINT"]) {
+				assert.ok(persistedHistory.includes(marker), `回放轨迹缺少 ${marker}`);
+			}
 			const metaBlobStr = Buffer.from(metaBlobRow.data).toString("utf8");
 			assert.ok(metaBlobStr.includes("pi-bridge"), "预注入会话库必须完整保留 pi-bridge 规格以禁用内置工具");
 			assert.ok(metaBlobStr.includes(seededId), "预注入会话库元数据中的 UUID 必须更新为新会话 UUID");

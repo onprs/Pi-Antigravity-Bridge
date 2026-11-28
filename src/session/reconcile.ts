@@ -318,11 +318,10 @@ const MAX_PRELOAD_TOTAL_HISTORY_BYTES = 2_400_000;
 const MAX_FRESH_REPLAY_HISTORY_IMAGES = 6;
 /** 每张内联图片在单步预算中预留的保守 token 占位 */
 const ESTIMATED_IMAGE_BLOCK_TOKENS = 1_000;
+// 单步剩余预算装不下完整条目时，保留头尾供公开协议降级使用。
 const MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES = 4_000;
+const MAX_SINGLE_REPLAY_TOOL_ARGS_BYTES = 2_000;
 const MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES = 16_000;
-/** 多步预注入模式下允许保留更完整的单条历史消息与工具输出 */
-const MAX_PRELOAD_SINGLE_TOOL_TEXT_BYTES = 16_000;
-const MAX_PRELOAD_SINGLE_MESSAGE_TEXT_BYTES = 48_000;
 
 /** 写入本地新建 SQLite 会话的一对预注入历史步（严格满足 `user -> assistant` 交替角色约束） */
 export interface PreloadedSqliteTurn {
@@ -552,42 +551,27 @@ export function splitTextToSafeChunks(
 	return chunks;
 }
 
-interface SerializedReplayEntry {
-	blocks: AcpPromptBlock[];
-	textBytes: number;
-	tokens: number;
-}
-
 function serializeReplayHistoryEntry(
 	msg: UserMessage | AssistantMessage | ToolResultMessage,
-	limits: {
-		maxMessageBytes: number;
-		maxToolBytes: number;
-	} = {
-		maxMessageBytes: MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
-		maxToolBytes: MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES,
-	},
-): SerializedReplayEntry {
+	truncateForFallback = false,
+): AcpPromptBlock[] {
 	const entryBlocks: AcpPromptBlock[] = [];
+	const serializeText = (text: string, maxBytes: number, marker: string): string =>
+		truncateForFallback ? truncateUtf8Middle(text, maxBytes, marker) : text;
 
 	if (msg.role === "user") {
+		const serializeUserText = (text: string) => serializeText(
+			text,
+			MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+			"\n...[earlier user text truncated in replay]...\n",
+		);
 		if (typeof msg.content === "string") {
-			const trimmed = truncateUtf8Middle(
-				msg.content,
-				limits.maxMessageBytes,
-				"\n...[earlier user text truncated in replay]...\n",
-			);
-			entryBlocks.push({ type: "text", text: `<user>\n${trimmed}\n</user>` });
+			entryBlocks.push({ type: "text", text: `<user>\n${serializeUserText(msg.content)}\n</user>` });
 		} else {
 			entryBlocks.push({ type: "text", text: "<user>" });
 			for (const part of msg.content) {
 				if (part.type === "text") {
-					const trimmed = truncateUtf8Middle(
-						part.text,
-						limits.maxMessageBytes,
-						"\n...[earlier user text truncated in replay]...\n",
-					);
-					entryBlocks.push({ type: "text", text: trimmed });
+					entryBlocks.push({ type: "text", text: serializeUserText(part.text) });
 				} else if (part.type === "image") {
 					entryBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
 				}
@@ -598,17 +582,21 @@ function serializeReplayHistoryEntry(
 		const segs: string[] = [];
 		for (const part of msg.content) {
 			if (part.type === "text" && part.text.trim()) {
-				segs.push(
-					truncateUtf8Middle(
-						part.text,
-						limits.maxMessageBytes,
-						"\n...[assistant text truncated in replay]...\n",
-					),
+				segs.push(serializeText(
+					part.text,
+					MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+					"\n...[assistant text truncated in replay]...\n",
+				));
+			} else if (part.type === "thinking" && !part.redacted && part.thinking.trim()) {
+				const thinking = serializeText(
+					part.thinking,
+					MAX_SINGLE_REPLAY_MESSAGE_TEXT_BYTES,
+					"\n...[assistant thinking truncated in replay]...\n",
 				);
+				segs.push(`<thinking>\n${thinking}\n</thinking>`);
 			} else if (part.type === "toolCall") {
-				const rawArgs = JSON.stringify(part.arguments);
-				const safeArgs = truncateUtf8Middle(rawArgs, 2_000, "...[truncated]...");
-				segs.push(`<tool_call id="${part.id}" name="${part.name}">${safeArgs}</tool_call>`);
+				const args = serializeText(JSON.stringify(part.arguments), MAX_SINGLE_REPLAY_TOOL_ARGS_BYTES, "...[truncated]...");
+				segs.push(`<tool_call id="${part.id}" name="${part.name}">${args}</tool_call>`);
 			}
 		}
 		if (segs.length > 0) {
@@ -626,9 +614,9 @@ function serializeReplayHistoryEntry(
 		// 对 pi-traffic-optimization 已生成的紧凑 ctx:// 归档占位符保留原文不裁切，确保 handle 与 context_recall 指引完整
 		let cappedTexts = isTrafficOptToolPlaceholder(rawTexts)
 			? rawTexts
-			: truncateUtf8Middle(
+			: serializeText(
 					rawTexts,
-					limits.maxToolBytes,
+					MAX_SINGLE_REPLAY_TOOL_TEXT_BYTES,
 					"\n...[tool output truncated in replay]...\n",
 				);
 		// 若仅单图归档的工具结果因正文过长被截断，补回被裁掉的 ctx://image/ 归档句柄行，避免模型丢失图片引用
@@ -651,15 +639,47 @@ function serializeReplayHistoryEntry(
 		}
 	}
 
-	let textBytes = 0;
-	let tokens = 0;
-	for (const b of entryBlocks) {
-		if (b.type === "text") {
-			textBytes += Buffer.byteLength(b.text, "utf8") + 1;
-			tokens += estimateStepTokens(b.text) + 1;
+	return entryBlocks;
+}
+
+/** 从最近历史开始使用剩余单步预算，优先保留完整条目。 */
+function selectSingleStepReplayHistory(
+	history: readonly (UserMessage | AssistantMessage | ToolResultMessage)[],
+	maxBytes: number,
+	maxTokens: number,
+): { blocks: AcpPromptBlock[]; omittedCount: number; truncated: boolean } {
+	const selected: AcpPromptBlock[][] = [];
+	let usedImages = 0;
+	let omittedCount = 0;
+	let truncated = false;
+	for (let i = history.length - 1; i >= 0; i--) {
+		let fitted = false;
+		for (const truncateEntry of [false, true]) {
+			let entryImages = 0;
+			const blocks = serializeReplayHistoryEntry(history[i], truncateEntry).map((block): AcpPromptBlock => {
+				if (block.type !== "image") return block;
+				if (usedImages + entryImages < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
+					entryImages++;
+					return block;
+				}
+				return { type: "text", text: `[earlier ${block.mimeType} image omitted in replay]` };
+			});
+			const size = measurePromptBlocksSize(blocks);
+			if (size.bytes > maxBytes || size.tokens > maxTokens) continue;
+			selected.push(blocks);
+			maxBytes -= size.bytes;
+			maxTokens -= size.tokens;
+			usedImages += entryImages;
+			truncated ||= truncateEntry;
+			fitted = true;
+			break;
+		}
+		if (!fitted) {
+			omittedCount = i + 1;
+			break;
 		}
 	}
-	return { blocks: entryBlocks, textBytes, tokens };
+	return { blocks: selected.reverse().flat(), omittedCount, truncated };
 }
 
 function splitHistoryAndActiveTail(
@@ -907,75 +927,31 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 		maxStepTokens - fallbackWsTokens - safeTailMeasured.tokens - wrapperTokens,
 	);
 
-	let singleStepOmittedCount = 0;
+	const singleStepHistory = selectSingleStepReplayHistory(
+		tailRequiredShrinkInSingleStep ? [] : historySlice,
+		availSingleHistoryBytes,
+		availSingleHistoryTokens,
+	);
 	const singleStepFallbackBlocks: AcpPromptBlock[] = [];
 	if (fallbackWorkspaceText) {
 		singleStepFallbackBlocks.push({ type: "text", text: fallbackWorkspaceText });
 	}
-
-	if (historySlice.length > 0 && !tailRequiredShrinkInSingleStep) {
-		const selectedReversed: AcpPromptBlock[][] = [];
-		let usedBytes = 0;
-		let usedTokens = 0;
-		let usedImages = 0;
-
-		for (let i = historySlice.length - 1; i >= 0; i--) {
-			const serialized = serializeReplayHistoryEntry(historySlice[i]);
-			if (serialized.blocks.length === 0) continue;
-
-			const imageCountInEntry = serialized.blocks.filter((b) => b.type === "image").length;
-			const keptImagesInEntry = Math.max(
-				0,
-				Math.min(imageCountInEntry, MAX_FRESH_REPLAY_HISTORY_IMAGES - usedImages),
-			);
-			const entryTokens = serialized.tokens + keptImagesInEntry * ESTIMATED_IMAGE_BLOCK_TOKENS;
-
-			if (
-				usedBytes + serialized.textBytes > availSingleHistoryBytes ||
-				usedTokens + entryTokens > availSingleHistoryTokens
-			) {
-				singleStepOmittedCount = i + 1;
-				break;
-			}
-
-			const cappedBlocks: AcpPromptBlock[] = serialized.blocks.map((block) => {
-				if (block.type !== "image") return block;
-				if (usedImages < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
-					usedImages++;
-					return block;
-				}
-				return {
-					type: "text",
-					text: `[earlier ${block.mimeType} image omitted in replay]`,
-				};
+	if (singleStepHistory.blocks.length > 0 || singleStepHistory.omittedCount > 0) {
+		singleStepFallbackBlocks.push({ type: "text", text: headerText });
+		if (singleStepHistory.omittedCount > 0) {
+			singleStepFallbackBlocks.push({
+				type: "text",
+				text: `[Note: ${singleStepHistory.omittedCount} earlier historical messages were omitted to stay within the single-step prompt size budget.]`,
 			});
-			selectedReversed.push(cappedBlocks);
-			usedBytes += serialized.textBytes;
-			usedTokens += entryTokens;
 		}
-
-		if (selectedReversed.length > 0 || singleStepOmittedCount > 0) {
-			singleStepFallbackBlocks.push({ type: "text", text: headerText });
-			if (singleStepOmittedCount > 0) {
-				singleStepFallbackBlocks.push({
-					type: "text",
-					text: `[Note: ${singleStepOmittedCount} earlier historical messages were omitted to stay within the single-step prompt size budget.]`,
-				});
-			}
-			for (let i = selectedReversed.length - 1; i >= 0; i--) {
-				singleStepFallbackBlocks.push(...selectedReversed[i]);
-			}
-			singleStepFallbackBlocks.push({ type: "text", text: footerText });
-		}
-	} else if (historySlice.length > 0) {
-		singleStepOmittedCount = historySlice.length;
+		singleStepFallbackBlocks.push(...singleStepHistory.blocks, { type: "text", text: footerText });
 	}
-
 	singleStepFallbackBlocks.push(...safeSingleStepTailBlocks);
 
-	// 若单步即可无省略装下全部历史与末尾提问，直接返回（零 SQLite 预注入开销）
+	// 只有原文全部放得下时才直接发送。单步降级发生的裁剪也应触发分段计划。
 	if (
-		singleStepOmittedCount === 0 &&
+		singleStepHistory.omittedCount === 0 &&
+		!singleStepHistory.truncated &&
 		!tailRequiredShrinkInSingleStep &&
 		!workspaceRequiredShrinkInSingleStep
 	) {
@@ -1002,7 +978,7 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 		options.maxTotalHistoryBytes ??
 		Math.min(MAX_PRELOAD_TOTAL_HISTORY_BYTES, totalHistoryTokenBudget * 4);
 
-	const preloadEntriesReversed: { text: string; bytes: number; tokens: number }[] = [];
+	const preloadEntriesReversed: string[] = [];
 	const preservedRecentHistoryImages: Array<{
 		block: Extract<AcpPromptBlock, { type: "image" }>;
 		source:
@@ -1015,19 +991,17 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 
 	for (let i = historySlice.length - 1; i >= 0; i--) {
 		const historyMsg = historySlice[i];
-		const serialized = serializeReplayHistoryEntry(historyMsg, {
-			maxMessageBytes: MAX_PRELOAD_SINGLE_MESSAGE_TEXT_BYTES,
-			maxToolBytes: MAX_PRELOAD_SINGLE_TOOL_TEXT_BYTES,
-		});
-		if (serialized.blocks.length === 0) continue;
+		const blocks = serializeReplayHistoryEntry(historyMsg);
+		if (blocks.length === 0) continue;
 
 		const textSegments: string[] = [];
-		for (const block of serialized.blocks) {
+		const entryImages: typeof preservedRecentHistoryImages = [];
+		for (const block of blocks) {
 			if (block.type === "text") {
 				textSegments.push(block.text);
 			} else if (block.type === "image") {
-				if (preservedRecentHistoryImages.length < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
-					preservedRecentHistoryImages.push({
+				if (preservedRecentHistoryImages.length + entryImages.length < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
+					entryImages.push({
 						block,
 						source:
 							historyMsg.role === "toolResult"
@@ -1045,20 +1019,34 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 				}
 			}
 		}
-		const entryText = textSegments.join("\n");
-		const entryBytes = Buffer.byteLength(entryText, "utf8") + 1;
-		const entryTokens = estimateStepTokens(entryText) + 1;
+		let entryText = textSegments.join("\n");
+		let entryBytes = Buffer.byteLength(entryText, "utf8") + 1;
+		let entryTokens = estimateStepTokens(entryText) + 1;
 
+		// 最近一条就超过历史总预算时，尽量保留其首尾，避免整个最近上下文被丢弃。
 		if (
-			preloadEntriesReversed.length > 0 &&
-			(totalUsedHistoryBytes + entryBytes > totalHistoryByteBudget ||
-				totalUsedHistoryTokens + entryTokens > totalHistoryTokenBudget)
+			preloadEntriesReversed.length === 0 &&
+			(entryBytes > totalHistoryByteBudget || entryTokens > totalHistoryTokenBudget)
+		) {
+			entryText = truncateTextMiddleToSafeBudget(
+				entryText,
+				totalHistoryByteBudget - 1,
+				totalHistoryTokenBudget - 1,
+				"\n...[history entry truncated to stay within model context budget]...\n",
+			);
+			entryBytes = Buffer.byteLength(entryText, "utf8") + 1;
+			entryTokens = estimateStepTokens(entryText) + 1;
+		}
+		if (
+			totalUsedHistoryBytes + entryBytes > totalHistoryByteBudget ||
+			totalUsedHistoryTokens + entryTokens > totalHistoryTokenBudget
 		) {
 			omittedMessageCount = i + 1;
 			break;
 		}
 
-		preloadEntriesReversed.push({ text: entryText, bytes: entryBytes, tokens: entryTokens });
+		preloadEntriesReversed.push(entryText);
+		preservedRecentHistoryImages.push(...entryImages);
 		totalUsedHistoryBytes += entryBytes;
 		totalUsedHistoryTokens += entryTokens;
 	}
@@ -1112,7 +1100,7 @@ export function buildFreshReplayPlan(options: FreshReplayPlanOptions): FreshRepl
 		);
 	}
 	for (const entry of chronologicalEntries) {
-		appendAtomicPiece(entry.text);
+		appendAtomicPiece(entry);
 	}
 	flushChunk();
 
@@ -1267,63 +1255,19 @@ export function buildFreshReplayPromptBlocks(
 	const blocks: AcpPromptBlock[] = [];
 
 	if (historySlice.length > 0) {
-		const selectedReversed: AcpPromptBlock[][] = [];
-		let usedHistoryBytes = 0;
-		let usedHistoryTokens = 0;
-		let usedHistoryImages = 0;
-		let omittedCount = 0;
-
-		for (let i = historySlice.length - 1; i >= 0; i--) {
-			const serialized = serializeReplayHistoryEntry(historySlice[i]);
-			if (serialized.blocks.length === 0) {
-				continue;
-			}
-			const imageCountInEntry = serialized.blocks.filter((b) => b.type === "image").length;
-			const keptImagesInEntry = Math.max(
-				0,
-				Math.min(imageCountInEntry, MAX_FRESH_REPLAY_HISTORY_IMAGES - usedHistoryImages),
-			);
-			const entryTokens = serialized.tokens + keptImagesInEntry * ESTIMATED_IMAGE_BLOCK_TOKENS;
-
-			if (
-				selectedReversed.length > 0 &&
-				(usedHistoryBytes + serialized.textBytes > cappedHistoryBytes ||
-					usedHistoryTokens + entryTokens > effectiveMaxHistoryTokens)
-			) {
-				omittedCount = i + 1;
-				break;
-			}
-			const cappedBlocks: AcpPromptBlock[] = serialized.blocks.map((block) => {
-				if (block.type !== "image") return block;
-				if (usedHistoryImages < MAX_FRESH_REPLAY_HISTORY_IMAGES) {
-					usedHistoryImages++;
-					return block;
-				}
-				return {
-					type: "text",
-					text: `[earlier ${block.mimeType} image omitted in replay]`,
-				};
-			});
-			selectedReversed.push(cappedBlocks);
-			usedHistoryBytes += serialized.textBytes;
-			usedHistoryTokens += entryTokens;
-		}
-
+		const selected = selectSingleStepReplayHistory(historySlice, cappedHistoryBytes, effectiveMaxHistoryTokens);
 		blocks.push({
 			type: "text",
 			text: "<conversation-checkpoint>\nThe following is the prior conversation transcript from this session (preserved across model switch, compaction, or branch navigation):",
 		});
 
-		if (omittedCount > 0) {
+		if (selected.omittedCount > 0) {
 			blocks.push({
 				type: "text",
-				text: `[Note: ${omittedCount} earlier historical messages were omitted to stay within the prompt replay size budget.]`,
+				text: `[Note: ${selected.omittedCount} earlier historical messages were omitted to stay within the prompt replay size budget.]`,
 			});
 		}
-
-		for (let i = selectedReversed.length - 1; i >= 0; i--) {
-			blocks.push(...selectedReversed[i]);
-		}
+		blocks.push(...selected.blocks);
 
 		blocks.push({
 			type: "text",
