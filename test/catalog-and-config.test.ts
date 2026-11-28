@@ -451,6 +451,9 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 
 		assert.ok(neon.cost.input > 0 && neon.cost.output > 0 && neon.cost.cacheRead > 0);
 		assert.ok(carbon.cost.input > 0 && carbon.cost.output > 0);
+		assert.equal(neon.contextWindow, 512_000);
+		assert.equal(carbon.contextWindow, 512_000);
+		assert.equal(opus.contextWindow, 1_000_000);
 		assert.deepEqual(orch.cost, carbon.cost);
 		assert.ok(opus.cost.input > 0 && opus.cost.output > 0 && opus.cost.cacheWrite > 0);
 		assert.ok(gptOss.cost.input > 0 && gptOss.cost.output > 0);
@@ -472,7 +475,7 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 			assert.ok(seed.cost.input > 0 && seed.cost.output > 0, `种子模型 ${seed.id} 应具备非零价格`);
 		}
 
-		// 旧版全零价格缓存读出时必须自动补全非零定价
+		// 旧缓存可能同时携带早期的零价格和 1M 窗口。
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-cost-hydrate-"));
 		try {
 			const isolatedEnv: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: tmpRoot };
@@ -483,6 +486,7 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 					models: [
 						{
 							...neon,
+							contextWindow: 1_048_576,
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 						},
 					],
@@ -492,6 +496,7 @@ describe("双轨模型家族聚合与 Thinking 档位解析", () => {
 			);
 			const hydrated = readCachedCatalog(isolatedEnv);
 			assert.ok(hydrated);
+			assert.equal(hydrated.models[0].contextWindow, 512_000);
 			assert.equal(hydrated.models[0].cost.input, neon.cost.input);
 			assert.equal(hydrated.models[0].cost.output, neon.cost.output);
 			assert.equal(hydrated.models[0].cost.cacheRead, neon.cost.cacheRead);

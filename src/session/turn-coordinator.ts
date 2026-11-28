@@ -34,8 +34,10 @@ import type {
 } from "../acp/protocol.ts";
 import {
 	ANTIGRAVITY_PROVIDER_ID,
+	normalizeReportedContextWindow,
 	recordObservedContextWindow,
 	removeEmptyProbeSessionFiles,
+	resolveAgyContextWindow,
 	resolveSessionModelSelection,
 } from "../catalog/model-discovery.ts";
 import {
@@ -734,21 +736,22 @@ export class TurnCoordinator {
 				}
 				ledger.usedTokens = update.used;
 			}
-			if (typeof update.size === "number") {
-				ledger.windowSize = update.size;
+			const reportedSize = normalizeReportedContextWindow(update.size);
+			if (reportedSize !== undefined) {
+				ledger.windowSize = reportedSize;
 				const activeModel = this.activeContext?.model;
 				const targetModelId =
 					ledger.lastSelectedModelId ??
 					(activeModel?.provider === ANTIGRAVITY_PROVIDER_ID ? activeModel.id : undefined);
 				if (targetModelId) {
-					recordObservedContextWindow(targetModelId, update.size);
+					recordObservedContextWindow(targetModelId, reportedSize);
 				}
 				if (
 					activeModel &&
 					activeModel.provider === ANTIGRAVITY_PROVIDER_ID &&
 					(!ledger.lastSelectedModelId || activeModel.id === ledger.lastSelectedModelId)
 				) {
-					activeModel.contextWindow = update.size;
+					activeModel.contextWindow = resolveAgyContextWindow(activeModel.id, reportedSize);
 				}
 			}
 			updateAntigravityStatusBar(
@@ -885,6 +888,8 @@ export class TurnCoordinator {
 		context: TranscriptContext,
 		options?: SimpleStreamOptions,
 	): Promise<void> {
+		// 兼容仍携带旧目录容量的模型对象，在规划重放前应用 Checkpointer 水位。
+		model.contextWindow = resolveAgyContextWindow(model.id, model.contextWindow);
 		const piSessionKey = this.resolveCurrentPiSessionKey(options?.sessionId);
 		const primaryLedger = this.ledgers.get(piSessionKey);
 		const hasBusyPrimary = Boolean(
@@ -3022,9 +3027,9 @@ export class TurnCoordinator {
 			if (item.kind === "prompt_done") {
 				this.mirrorBroker.completePendingCallsImplicitly(ledger.agySessionId);
 
-				if (ledger.windowSize) {
+				if (ledger.windowSize !== undefined) {
 					recordObservedContextWindow(model.id, ledger.windowSize);
-					model.contextWindow = ledger.windowSize;
+					model.contextWindow = resolveAgyContextWindow(model.id, ledger.windowSize);
 				}
 
 				if (item.response.stopReason === "cancelled") {

@@ -13,6 +13,7 @@ import {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AcpProcessManager } from "../src/acp/process-manager.ts";
 import { DEFAULT_BRIDGE_CONFIG, type BridgeConfig } from "../src/config.ts";
+import { estimateStepTokens } from "../src/session/reconcile.ts";
 import { TurnCoordinator } from "../src/session/turn-coordinator.ts";
 import {
 	AgyTurnMirrorBroker,
@@ -1454,7 +1455,8 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 			assert.equal(msg2.usage.totalTokens, 50000);
 			assert.ok(msg2.usage.cacheRead > 35000);
 			assert.ok(msg2.usage.output > 0);
-			assert.equal(TEST_MODEL.contextWindow, 1048576);
+			assert.equal(TEST_MODEL.contextWindow, 512_000);
+			assert.equal(coord.getTelemetrySnapshot("pi-sess-b").windowSize, 1_048_576);
 		} finally {
 			await coord.dispose();
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -2852,6 +2854,32 @@ describe("TurnCoordinator 双模式端到端协议闭环集成测试", () => {
 				.join("\n");
 			assert.ok(sentPromptText.includes("FOLLOWUP_MSG:TAIL_QUESTION_INTACT_777"));
 			assert.ok(Buffer.byteLength(sentPromptText, "utf8") < 10_000, "最终 prompt 应仅发送安全大小内的末尾提问");
+
+			// 从仍缓存 1M 窗口的旧模型对象重建时，历史回放也需给 AGY 的原生 checkpoint 留余量。
+			const oldModel = { ...TEST_MODEL, contextWindow: 1_048_576 };
+			const oldToolText = "早期日志与读取结果 0123456789\n".repeat(3_000);
+			const olderMessages = Array.from({ length: 12 }, (_, i) => ({
+				role: "user" as const,
+				content: `EARLY_TRANSCRIPT_${i}: ${oldToolText}`,
+				timestamp: i,
+			}));
+			let checkpointText = "";
+			const cappedReplay = await coord.streamSimple(
+				oldModel,
+				normalizeContext({ tools: [], messages: [...olderMessages, ...longHistory, tailUser] }),
+				{
+					sessionId: "pi-sess-preload-checkpoint-budget",
+					onPayload: (payload) => {
+						const turns = (payload as { preloadedTurns: Array<{ userText: string }> }).preloadedTurns;
+						checkpointText = turns.map((turn) => turn.userText).join("\n");
+					},
+				},
+			).result();
+			assert.equal(cappedReplay.stopReason, "stop");
+			assert.match(checkpointText, /earlier historical messages were omitted/);
+			assert.match(checkpointText, /TOOL_OUTPUT_MIDDLE/);
+			assert.ok(estimateStepTokens(checkpointText) < 320_000, "恢复时应给后续生成留出空间");
+			assert.equal(oldModel.contextWindow, 512_000);
 
 			// 2. 辅助单轮请求（如 /compact 摘要）面对 > 220 KB 单条超长待压缩对话：预注入后零截断完成、触发 onPayload/onResponse(x-acp-auxiliary=1) 并自动清理临时 .db
 			const beforeCompactDbs = new Set(fs.readdirSync(convDir));

@@ -752,7 +752,7 @@ stateDiagram-v2
 
 1. **按模型独立声明窗口并动态对齐 `usage_update.size`**：
    - 模型目录按各模型家族真实规格分别设置初始 `contextWindow`（如 Gemini 4 系列 512K/1M、Claude 5.5 系列 1M、`gpt-oss-120b-medium` 131K），不设全局一刀切上限。
-   - 会话运行期间收到 `usage_update` 返回权威的 `size` 时，动态更新该模型在当前账号下的真实有效窗口容量；用户也可通过 Pi 原生的 `models.json` `modelOverrides.<modelId>.contextWindow` 或 `settings.json` 的 `compaction.reserveTokens` 按需微调自动压缩水位。
+   - 会话运行期间记录 `usage_update.size` 所报告的后端容量。Gemini 4 Neon 和 Carbon 的回放与 Pi 自动压缩使用该容量和 512,000 tokens 中较小的值，避免恢复时直接接近 AGY 原生 Checkpointer 水位。`/agy status` 仍显示后端实际报告的容量和占用。
 2. **手动 `/compact` 与 Pi 自动压缩触发时的会话轮换**：
    - 无论当前上下文长度是多少，只要用户手动输入 `/compact`（或上下文达到该模型的 `contextWindow - reserveTokens` 触发 Pi 自动压缩），均执行 Pi 原生压缩管线（`session_before_compact` → 生成摘要 → `session_compact`）。
    - 扩展监听到 `session_compact` 后，立即调用 `session/close` 关闭旧 `agySessionId`；下一轮请求自动通过 `session/new` 开启新 ACP 会话并发送 Pi 生成的压缩摘要与保留的近期消息，前后端上下文同步归零轻装继续。

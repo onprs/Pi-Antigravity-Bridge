@@ -183,24 +183,37 @@ export interface DiscoveredCatalogSnapshot {
 	modelEfforts: Record<string, EffortSuffix[]>;
 }
 
-/** 运行时从 usage_update.size 动态观测到的真实窗口上限表 */
+/** 运行时从 usage_update.size 观测到的后端容量，可能大于原生 Checkpointer 水位。 */
 const runtimeObservedWindows = new Map<string, number>();
 
-/** 更新某模型在当前账号下实时回报的真实有效上下文窗口 */
-export function recordObservedContextWindow(modelId: string, size: number | undefined): boolean {
+export function normalizeReportedContextWindow(size: number | undefined): number | undefined {
 	if (typeof size !== "number" || !Number.isFinite(size) || size < 16_000) {
+		return undefined;
+	}
+	return Math.floor(size);
+}
+
+export function recordObservedContextWindow(modelId: string, size: number | undefined): boolean {
+	const window = normalizeReportedContextWindow(size);
+	if (window === undefined || runtimeObservedWindows.get(modelId) === window) {
 		return false;
 	}
-	const rounded = Math.floor(size);
-	if (runtimeObservedWindows.get(modelId) === rounded) {
-		return false;
-	}
-	runtimeObservedWindows.set(modelId, rounded);
+	runtimeObservedWindows.set(modelId, window);
 	return true;
 }
 
 export function getObservedContextWindow(modelId: string): number | undefined {
 	return runtimeObservedWindows.get(modelId);
+}
+
+/** 以已核实的 AGY 原生 Checkpointer 水位规划回放和 Pi 自动压缩。 */
+export function resolveAgyContextWindow(modelId: string, capacity: number): number {
+	const lower = modelId.toLowerCase();
+	const baseId = splitEffortSuffix(lower)?.baseId ?? lower;
+	if (baseId === "gemini-4-neon" || baseId === "gemini-4-carbon") {
+		return Math.min(capacity, 512_000);
+	}
+	return capacity;
 }
 
 /** 按模型家族推断默认上下文窗口与最大输出 Token 规格 */
@@ -232,7 +245,7 @@ export function inferModelSpecs(modelId: string): {
 		lower.includes("orchestrator")
 	) {
 		return {
-			contextWindow: observed ?? 1_048_576,
+			contextWindow: resolveAgyContextWindow(modelId, observed ?? 1_048_576),
 			maxTokens: 65_536,
 			supportsImage: true,
 		};
@@ -426,11 +439,11 @@ export function readCachedCatalog(env: NodeJS.ProcessEnv = process.env): Discove
 		if (!fs.existsSync(cachePath)) return undefined;
 		const raw = JSON.parse(fs.readFileSync(cachePath, "utf8")) as DiscoveredCatalogSnapshot;
 		if (raw?.version === 1 && Array.isArray(raw.models) && raw.models.length > 0) {
-			// 应用最新观测到的窗口校准，并为旧版零费用缓存自动补全 Pi 内置目录参考定价
+			// 应用最新观测的容量与 Checkpointer 水位，并为旧版零费用缓存补全参考定价。
 			const calibrated = raw.models.map((m) => ({
 				...m,
 				cost: hasNonZeroModelCost(m.cost) ? m.cost : resolveBuiltinModelCost(m.id, m.name),
-				contextWindow: getObservedContextWindow(m.id) ?? m.contextWindow,
+				contextWindow: resolveAgyContextWindow(m.id, getObservedContextWindow(m.id) ?? m.contextWindow),
 			}));
 			return { ...raw, models: calibrated };
 		}
